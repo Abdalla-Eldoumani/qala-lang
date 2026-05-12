@@ -1,0 +1,19 @@
+// Pure functions only compute. They cannot print, allocate, or crash.
+fn square(x: i64) -> i64 is pure {
+    return x * x
+}
+
+// IO functions can do anything, including call pure functions.
+fn display(label: str, value: i64) is io {
+    println("{label}: {value}")
+}
+
+// Try uncommenting this -- the compiler catches the violation:
+// fn broken(x: i64) -> i64 is pure {
+//     println("oops")  // ERROR: pure function calls io function
+//     return x
+// }
+
+fn main() is io {
+    display("7 squared", square(7))
+}

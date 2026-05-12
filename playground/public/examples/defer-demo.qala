@@ -1,0 +1,18 @@
+fn process_file(path: str) -> Result<str, str> is io {
+    let f = open(path)
+    defer close(f)
+
+    // No matter how this function exits -- normal return,
+    // early return, or error propagation -- close(f) runs.
+
+    let content = f.read_all()?
+    if len(content) == 0 {
+        return Err("file is empty")
+    }
+    return Ok(content)
+}
+
+fn main() is io {
+    let result = process_file("data.txt") or "no data"
+    println("got: {result}")
+}

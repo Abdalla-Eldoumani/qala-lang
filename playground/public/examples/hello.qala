@@ -1,0 +1,4 @@
+fn main() is io {
+    let name = "world"
+    println("hello, {name}!")
+}
