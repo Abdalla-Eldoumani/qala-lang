@@ -1,0 +1,8 @@
+compiler/target/
+playground/node_modules/
+playground/.next/
+playground/out/
+playground/lib/wasm/
+.DS_Store
+*.log
+.env
