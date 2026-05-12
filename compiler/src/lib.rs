@@ -5,3 +5,4 @@
 //! `wasm-bindgen` exports yet; the browser bridge is added in a later phase.
 
 pub mod span;
+pub mod errors;
