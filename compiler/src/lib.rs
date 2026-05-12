@@ -1,0 +1,7 @@
+//! the Qala compiler and bytecode VM, as a single crate.
+//!
+//! the pipeline is lexer -> parser -> type and effect checker -> codegen -> VM.
+//! this file declares the modules in dependency order. there are no
+//! `wasm-bindgen` exports yet; the browser bridge is added in a later phase.
+
+pub mod span;
