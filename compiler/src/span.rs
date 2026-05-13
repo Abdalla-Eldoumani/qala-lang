@@ -88,7 +88,11 @@ impl LineIndex {
     /// counts as one column, not eight. this is deliberate: the logical column is
     /// character-based, and any tab-expanded display column is the renderer's job
     /// later. an offset at end of file returns a valid pair and never panics.
+    /// an offset beyond `src.len()` is clamped to `src.len()` rather than
+    /// panicking; this keeps WASM alive when a downstream caller (e.g. the
+    /// diagnostics layer) passes a span-derived offset that is slightly wrong.
     pub fn location(&self, src: &str, byte_offset: usize) -> (usize, usize) {
+        let byte_offset = byte_offset.min(src.len());
         let off = byte_offset as u32;
         // index of the last line start that is <= off, i.e. the line containing
         // off. line_starts[0] == 0 and off >= 0, so partition_point returns at
@@ -204,6 +208,21 @@ mod tests {
         let empty = "";
         let eidx = LineIndex::new(empty);
         assert_eq!(eidx.location(empty, 0), (1, 1));
+    }
+
+    #[test]
+    fn location_clamps_out_of_range_offset_instead_of_panicking() {
+        // an offset exactly at src.len() is valid (end-of-file position).
+        let src = "abc\ndef";
+        let idx = LineIndex::new(src);
+        let at_eof = idx.location(src, src.len());
+        // an offset past the end must return the same position, not panic.
+        assert_eq!(idx.location(src, src.len() + 1), at_eof);
+        assert_eq!(idx.location(src, src.len() + 100), at_eof);
+        // empty source: offset 0 and offset 5 both map to (1, 1).
+        let empty = "";
+        let eidx = LineIndex::new(empty);
+        assert_eq!(eidx.location(empty, 5), (1, 1));
     }
 
     #[test]
