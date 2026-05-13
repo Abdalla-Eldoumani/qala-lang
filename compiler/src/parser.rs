@@ -1733,9 +1733,13 @@ impl<'t> Parser<'t> {
     /// token; `x |>` with nothing after (an Eof / closer) does the same --
     /// per CONTEXT.md and success criterion PARSE-06.
     fn parse_pipeline_rhs(&mut self, pipe_span: Span) -> Result<Expr, QalaError> {
-        // if the next token cannot start a callable, error here with the pipe
-        // span (rather than letting expr_bp produce an error pointing at the
-        // wrong place).
+        // fast-reject: if the next token cannot even begin an expression that
+        // might be callable, error now with the pipe span so the diagnostic
+        // points at `|>` rather than something inside the rhs.
+        // LParen is included because `(expr).method()` can be callable-shaped
+        // once postfix operators fold in; a bare `(expr)` that is not callable
+        // reaches the is_callable_shape check below and is rejected there with
+        // the same |> span.
         if !matches!(
             self.peek(),
             TokenKind::Ident(_) | TokenKind::LParen
