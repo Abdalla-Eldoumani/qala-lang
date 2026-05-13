@@ -8,3 +8,4 @@ pub mod span;
 pub mod errors;
 pub mod token;
 pub mod lexer;
+pub mod ast;
