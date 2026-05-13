@@ -815,13 +815,16 @@ impl<'t> Parser<'t> {
                 lhs = self.fold_postfix(lhs, &op)?;
                 continue;
             }
-            // infix? consume the operator and recurse for the rhs.
+            // infix? consume the operator and recurse for the rhs. ctx is
+            // threaded down to the rhs so that an expression like `0..n` in a
+            // no-struct-literal head (the iterable of a `for`, say) does not
+            // pick up a trailing `{` as a struct-literal body for `n`.
             if let Some((lbp, rbp)) = infix_bp(&op) {
                 if lbp < min_bp {
                     break;
                 }
                 let op_tok = self.advance().clone();
-                lhs = self.fold_infix(lhs, op_tok, rbp)?;
+                lhs = self.fold_infix(lhs, op_tok, rbp, ctx)?;
                 continue;
             }
             break;
@@ -1081,14 +1084,29 @@ impl<'t> Parser<'t> {
         Ok(Expr::Block { block, span })
     }
 
-    /// `{ stmt; stmt; ... trailing? }`.
+    /// `{ stmt stmt ... trailing? }`.
     ///
-    /// Plan 03 adds the statement forms `let` / `if` / `while` / `for` /
-    /// `return` / `break` / `continue` / `defer`; for now the only statement
-    /// form a block can hold is an expression-statement (`expr ;`). a block's
-    /// value is the final expression with no trailing `;`, or `None` if there
-    /// is none. mirrors RESEARCH Pitfall 7's "arm body = expr or block".
+    /// statements are NOT `;`-separated in the source -- the lexer emits no
+    /// `Newline` token, so the bundled examples like `let f = open(path)\ndefer
+    /// close(f)\n...` separate statements purely by the next statement-head
+    /// keyword or `}`. resolution: each iteration, if the cursor is on a
+    /// statement-head keyword (`let`/`if`/`while`/`for`/`return`/`break`/
+    /// `continue`/`defer`), dispatch to `parse_stmt`; otherwise parse an
+    /// expression and decide -- a following `;` makes it an expression-statement,
+    /// `}` makes it the block's trailing value, anything else (the start of
+    /// another statement) makes it an expression-statement with its value
+    /// discarded.
+    ///
+    /// the depth guard is wired here so `{ { { { ... } } } }`-style block
+    /// nesting fails cleanly instead of overflowing the call stack.
     fn parse_block(&mut self) -> Result<Block, QalaError> {
+        self.enter()?;
+        let result = self.parse_block_inner();
+        self.exit();
+        result
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Block, QalaError> {
         let open_span = self.expect(&TokenKind::LBrace)?;
         self.open_delims.push((TokenKind::LBrace, open_span));
         let mut stmts: Vec<Stmt> = Vec::new();
@@ -1097,19 +1115,35 @@ impl<'t> Parser<'t> {
             if self.check(&TokenKind::RBrace) {
                 break;
             }
-            // for now, the only statement-form a block parses is `expr ;` (or
-            // a trailing `expr` with no `;`). Plan 03 dispatches on `let` /
-            // `if` / etc here.
+            if is_stmt_head(self.peek()) {
+                // a keyword-headed statement. an optional `;` after it is
+                // harmless (real programs do not use one, but the grammar
+                // accepts it for symmetry with expression-statements).
+                let stmt = self.parse_stmt()?;
+                stmts.push(stmt);
+                self.eat(&TokenKind::Semi);
+                continue;
+            }
+            // no statement-head keyword: an expression. it is either an
+            // expression-statement (value discarded) or the block's trailing
+            // value, distinguished by what follows.
             let expr = self.parse_expr()?;
+            let expr_span = expr.span();
             if self.eat(&TokenKind::Semi) {
-                let span = expr.span();
-                stmts.push(Stmt::Expr { expr, span });
-            } else {
-                // no `;`: this is the trailing-value expression. it must be
-                // the last thing before `}`.
+                // `expr;` -- definitely a statement.
+                stmts.push(Stmt::Expr { expr, span: expr_span });
+                continue;
+            }
+            if self.check(&TokenKind::RBrace) {
+                // last expression with no `;` and no following statement: the
+                // block's trailing value.
                 value = Some(Box::new(expr));
                 break;
             }
+            // the next token starts another statement (a keyword head, or
+            // another expression). discard this expression's value and keep
+            // going.
+            stmts.push(Stmt::Expr { expr, span: expr_span });
         }
         if !self.check(&TokenKind::RBrace) {
             self.open_delims.pop();
@@ -1126,6 +1160,164 @@ impl<'t> Parser<'t> {
             value,
             span: open_span.to(close),
         })
+    }
+
+    // ---- statements ----------------------------------------------------------
+
+    /// parse a keyword-headed statement: `let`, `if`, `while`, `for`,
+    /// `return`, `break`, `continue`, or `defer`. an expression-statement is
+    /// handled by `parse_block` directly (it needs to peek the token after the
+    /// expression to decide between stmt and trailing value).
+    ///
+    /// the depth guard wraps the entire statement parse: `if cond { if cond {
+    /// if cond { ... } } }` nests through `parse_stmt`/`parse_block` calls and
+    /// must error cleanly at the limit, not overflow.
+    fn parse_stmt(&mut self) -> Result<Stmt, QalaError> {
+        self.enter()?;
+        let result = self.parse_stmt_inner();
+        self.exit();
+        result
+    }
+
+    fn parse_stmt_inner(&mut self) -> Result<Stmt, QalaError> {
+        match self.peek() {
+            TokenKind::Let => self.parse_let_stmt(),
+            TokenKind::If => self.parse_if_stmt(),
+            TokenKind::While => self.parse_while_stmt(),
+            TokenKind::For => self.parse_for_stmt(),
+            TokenKind::Return => self.parse_return_stmt(),
+            TokenKind::Break => {
+                let span = self.advance().span;
+                Ok(Stmt::Break { span })
+            }
+            TokenKind::Continue => {
+                let span = self.advance().span;
+                Ok(Stmt::Continue { span })
+            }
+            TokenKind::Defer => self.parse_defer_stmt(),
+            // `parse_block` filters non-statement-heads out before calling
+            // `parse_stmt`, but the dispatch must be exhaustive.
+            _ => Err(self.unexpected(&[
+                TokenKind::Let,
+                TokenKind::If,
+                TokenKind::While,
+                TokenKind::For,
+                TokenKind::Return,
+                TokenKind::Break,
+                TokenKind::Continue,
+                TokenKind::Defer,
+            ])),
+        }
+    }
+
+    /// `let [mut] NAME [: TYPE] = EXPR`. the initializer is required (no
+    /// uninitialised bindings in Qala v1); the type is inferred from `init`
+    /// when omitted.
+    fn parse_let_stmt(&mut self) -> Result<Stmt, QalaError> {
+        let kw_span = self.expect(&TokenKind::Let)?;
+        let is_mut = self.eat(&TokenKind::Mut);
+        let (name, _name_span) = self.expect_ident()?;
+        let ty = if self.eat(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        // `=` is required: `let x: i64` with no `= ...` errors here.
+        self.expect(&TokenKind::Eq)?;
+        let init = self.parse_expr()?;
+        let span = kw_span.to(init.span());
+        Ok(Stmt::Let { is_mut, name, ty, init, span })
+    }
+
+    /// `if COND { ... } [else if COND { ... }]* [else { ... }]`. `if`/`else`
+    /// is a statement in v1, not an expression; there is no `let x = if c { a
+    /// } else { b }`. the head expression is parsed in no-struct-literal mode
+    /// so the trailing `{` is the `then` block, not a struct-literal body.
+    fn parse_if_stmt(&mut self) -> Result<Stmt, QalaError> {
+        let kw_span = self.expect(&TokenKind::If)?;
+        let cond = self.parse_expr_no_struct()?;
+        let then_block = self.parse_block()?;
+        let mut tail_span = then_block.span;
+        let else_branch = if self.eat(&TokenKind::Else) {
+            if self.check(&TokenKind::If) {
+                // `else if ...` -- recurse via `parse_stmt`. the inner stmt is
+                // always another `Stmt::If`, by construction.
+                let inner = self.parse_stmt()?;
+                tail_span = tail_span.to(inner.span());
+                Some(ElseBranch::If(Box::new(inner)))
+            } else {
+                let block = self.parse_block()?;
+                tail_span = tail_span.to(block.span);
+                Some(ElseBranch::Block(block))
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If {
+            cond,
+            then_block,
+            else_branch,
+            span: kw_span.to(tail_span),
+        })
+    }
+
+    /// `while COND { ... }`. the head is parsed in no-struct-literal mode.
+    fn parse_while_stmt(&mut self) -> Result<Stmt, QalaError> {
+        let kw_span = self.expect(&TokenKind::While)?;
+        let cond = self.parse_expr_no_struct()?;
+        let body = self.parse_block()?;
+        let span = kw_span.to(body.span);
+        Ok(Stmt::While { cond, body, span })
+    }
+
+    /// `for IDENT in EXPR { ... }`. `EXPR` is any expression that yields an
+    /// iterable -- a range like `0..15` is just one kind; an identifier like
+    /// `shapes` is another. parsed in no-struct-literal mode for the same
+    /// reason as `if`/`while`.
+    fn parse_for_stmt(&mut self) -> Result<Stmt, QalaError> {
+        let kw_span = self.expect(&TokenKind::For)?;
+        let (var, _) = self.expect_ident()?;
+        self.expect(&TokenKind::In)?;
+        let iter = self.parse_expr_no_struct()?;
+        let body = self.parse_block()?;
+        let span = kw_span.to(body.span);
+        Ok(Stmt::For { var, iter, body, span })
+    }
+
+    /// `return` or `return EXPR`. bare `return` (in a `void` function) is
+    /// legal; the type checker (Phase 3) is responsible for rejecting it in a
+    /// non-`void` function.
+    fn parse_return_stmt(&mut self) -> Result<Stmt, QalaError> {
+        let kw_span = self.expect(&TokenKind::Return)?;
+        // a `return` with no value is followed by `}` (end of block) or the
+        // start of the next statement (a keyword head). otherwise read an
+        // expression.
+        if self.check(&TokenKind::RBrace)
+            || matches!(self.peek(), TokenKind::Eof)
+            || is_stmt_head(self.peek())
+        {
+            return Ok(Stmt::Return { value: None, span: kw_span });
+        }
+        let value = self.parse_expr()?;
+        let span = kw_span.to(value.span());
+        Ok(Stmt::Return { value: Some(value), span })
+    }
+
+    /// `defer EXPR` -- run `EXPR` at scope exit, LIFO with other defers. in
+    /// practice `EXPR` is a call (`close(f)`), but the parser accepts any
+    /// expression and leaves shape-checking to a later phase.
+    fn parse_defer_stmt(&mut self) -> Result<Stmt, QalaError> {
+        let kw_span = self.expect(&TokenKind::Defer)?;
+        let expr = self.parse_expr()?;
+        let span = kw_span.to(expr.span());
+        Ok(Stmt::Defer { expr, span })
+    }
+
+    /// parse an expression in no-struct-literal mode. used at the head of
+    /// `if`/`while`/`for` (and inside `match`) so `if x { ... }` reads `x` as
+    /// the condition rather than `x { ... }` as a struct literal body.
+    fn parse_expr_no_struct(&mut self) -> Result<Expr, QalaError> {
+        self.expr_bp(0, ExprCtx::NoStructLiteral)
     }
 
     /// reassemble an interpolated string `StrStart text0 (InterpStart expr
@@ -1440,12 +1632,16 @@ impl<'t> Parser<'t> {
     }
 
     /// apply one infix operator (already consumed by the Pratt loop) with
-    /// right-binding-power `rbp` to `lhs`.
+    /// right-binding-power `rbp` to `lhs`. `ctx` is the no-struct-literal
+    /// context inherited from the outer loop -- propagated to the rhs so e.g.
+    /// `0..n {` inside a `for ... in HEAD { ... }` head does not consume the
+    /// `{` as a struct-literal body for `n`.
     fn fold_infix(
         &mut self,
         lhs: Expr,
         op_tok: Token,
         rbp: u8,
+        ctx: ExprCtx,
     ) -> Result<Expr, QalaError> {
         match op_tok.kind {
             TokenKind::PipeGt => {
@@ -1463,7 +1659,7 @@ impl<'t> Parser<'t> {
                 })
             }
             TokenKind::Or => {
-                let rhs = self.expr_bp(rbp, ExprCtx::Normal)?;
+                let rhs = self.expr_bp(rbp, ctx)?;
                 let lhs_span = lhs.span();
                 let rhs_span = rhs.span();
                 Ok(Expr::OrElse {
@@ -1474,7 +1670,7 @@ impl<'t> Parser<'t> {
             }
             TokenKind::DotDot | TokenKind::DotDotEq => {
                 let inclusive = matches!(op_tok.kind, TokenKind::DotDotEq);
-                let rhs = self.expr_bp(rbp, ExprCtx::Normal)?;
+                let rhs = self.expr_bp(rbp, ctx)?;
                 let lhs_span = lhs.span();
                 let rhs_span = rhs.span();
                 Ok(Expr::Range {
@@ -1486,7 +1682,7 @@ impl<'t> Parser<'t> {
             }
             ref k if binop_of(k).is_some() => {
                 let bop = binop_of(k).expect("checked by the guard");
-                let rhs = self.expr_bp(rbp, ExprCtx::Normal)?;
+                let rhs = self.expr_bp(rbp, ctx)?;
                 let lhs_span = lhs.span();
                 let rhs_span = rhs.span();
                 Ok(Expr::Binary {
@@ -1654,6 +1850,27 @@ fn is_callable_shape(e: &Expr) -> bool {
             | Expr::Call { .. }
             | Expr::FieldAccess { .. }
             | Expr::MethodCall { .. }
+    )
+}
+
+/// true if `k` is one of the keyword tokens that starts a statement form.
+///
+/// the bundled examples like `fibonacci.qala` have no `;` anywhere -- they
+/// rely on the next statement-head keyword (or `}`) to terminate the previous
+/// statement. `parse_block`'s loop uses this predicate to decide whether to
+/// dispatch to `parse_stmt` or fall through to the expression branch, and
+/// `parse_return_stmt` uses it to decide whether `return` was bare.
+fn is_stmt_head(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Let
+            | TokenKind::If
+            | TokenKind::While
+            | TokenKind::For
+            | TokenKind::Return
+            | TokenKind::Break
+            | TokenKind::Continue
+            | TokenKind::Defer
     )
 }
 
@@ -3054,5 +3271,272 @@ mod tests {
         // runs -- pins the "no hashing-order dependence" claim.
         let src = "1 + 2 * 3 |> f() or g()";
         assert_eq!(expr_of(src), expr_of(src));
+    }
+
+    // ---- statements ---------------------------------------------------------
+    //
+    // helper: parse a statement via a fixture `fn f() { STMT }`, pull the
+    // first statement out. avoids exposing `parse_stmt` directly.
+    fn first_stmt_of(stmt_src: &str) -> Stmt {
+        let program = format!("fn f() {{ {stmt_src} }}");
+        let ast = parse_ok(&program);
+        match ast.into_iter().next().expect("one item") {
+            Item::Fn(d) => d.body.stmts.into_iter().next().expect("a statement"),
+            other => panic!("expected fn item, got {other:?}"),
+        }
+    }
+
+    /// helper: parse the body of `fn f() { ... }` and return it whole.
+    fn body_of(body_src: &str) -> Block {
+        let program = format!("fn f() {{ {body_src} }}");
+        let ast = parse_ok(&program);
+        match ast.into_iter().next().expect("one item") {
+            Item::Fn(d) => d.body,
+            other => panic!("expected fn item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn let_without_mut_or_type_parses() {
+        match first_stmt_of("let x = 5") {
+            Stmt::Let { is_mut, name, ty, init, .. } => {
+                assert!(!is_mut);
+                assert_eq!(name, "x");
+                assert!(ty.is_none());
+                assert!(matches!(init, Expr::Int { value: 5, .. }));
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn let_mut_sets_is_mut_true() {
+        match first_stmt_of("let mut y = 10") {
+            Stmt::Let { is_mut, name, .. } => {
+                assert!(is_mut);
+                assert_eq!(name, "y");
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn let_with_an_explicit_type_records_it() {
+        match first_stmt_of("let z: i64 = 0") {
+            Stmt::Let { ty, init, .. } => {
+                assert!(matches!(
+                    ty,
+                    Some(TypeExpr::Primitive { kind: PrimType::I64, .. })
+                ));
+                assert!(matches!(init, Expr::Int { value: 0, .. }));
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn let_with_no_initializer_is_a_parse_error() {
+        // `let x: i64` with no `= ...` errors at the missing `=`.
+        let err = parse_err("fn f() { let x: i64 }");
+        assert!(matches!(
+            err,
+            QalaError::UnexpectedToken { .. } | QalaError::UnexpectedEof { .. }
+        ));
+        assert!(err.message().contains("`=`"), "message was {}", err.message());
+    }
+
+    #[test]
+    fn if_without_else_parses() {
+        match first_stmt_of("if c { return 1 }") {
+            Stmt::If { else_branch, .. } => assert!(else_branch.is_none()),
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_with_else_block_parses() {
+        match first_stmt_of("if c { 1 } else { 2 }") {
+            Stmt::If { else_branch, .. } => {
+                assert!(matches!(else_branch, Some(ElseBranch::Block(_))));
+            }
+            other => panic!("expected If, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn else_if_chain_parses_as_nested_if() {
+        // `if a { 1 } else if b { 2 } else { 3 }` ->
+        // If { else: If(box If { else: Block }) }.
+        match first_stmt_of("if a { 1 } else if b { 2 } else { 3 }") {
+            Stmt::If { else_branch, .. } => match else_branch {
+                Some(ElseBranch::If(boxed)) => match *boxed {
+                    Stmt::If { else_branch: Some(ElseBranch::Block(_)), .. } => {}
+                    other => panic!("expected If with else-block, got {other:?}"),
+                },
+                other => panic!("expected else-if (ElseBranch::If), got {other:?}"),
+            },
+            other => panic!("expected If at the top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn while_loop_parses() {
+        match first_stmt_of("while c { x }") {
+            Stmt::While { cond, body, .. } => {
+                assert!(matches!(cond, Expr::Ident { .. }));
+                assert!(body.value.is_some());
+            }
+            other => panic!("expected While, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn for_loop_over_a_range_iterable_parses() {
+        match first_stmt_of("for i in 0..n { x }") {
+            Stmt::For { var, iter, .. } => {
+                assert_eq!(var, "i");
+                assert!(matches!(iter, Expr::Range { .. }));
+            }
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn for_loop_over_an_ident_iterable_parses() {
+        // the no-struct-literal head rule keeps `shapes` from being read as a
+        // `shapes { x }` struct literal.
+        match first_stmt_of("for s in shapes { x }") {
+            Stmt::For { var, iter, .. } => {
+                assert_eq!(var, "s");
+                assert!(matches!(iter, Expr::Ident { name, .. } if name == "shapes"));
+            }
+            other => panic!("expected For, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_bare_has_no_value() {
+        match first_stmt_of("return") {
+            Stmt::Return { value, .. } => assert!(value.is_none()),
+            other => panic!("expected Return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_with_an_expression_carries_it() {
+        match first_stmt_of("return n + 1") {
+            Stmt::Return { value, .. } => {
+                assert!(matches!(
+                    value,
+                    Some(Expr::Binary { op: BinOp::Add, .. })
+                ));
+            }
+            other => panic!("expected Return, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_and_continue_have_no_value() {
+        let body = body_of("break continue");
+        // both statements terminated implicitly by the next statement-head.
+        assert_eq!(body.stmts.len(), 2);
+        assert!(matches!(body.stmts[0], Stmt::Break { .. }));
+        assert!(matches!(body.stmts[1], Stmt::Continue { .. }));
+    }
+
+    #[test]
+    fn defer_takes_an_arbitrary_expression() {
+        match first_stmt_of("defer close(f)") {
+            Stmt::Defer { expr, .. } => assert!(matches!(expr, Expr::Call { .. })),
+            other => panic!("expected Defer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_block_with_a_trailing_value_has_some_value() {
+        let body = body_of("let x = 1; x");
+        assert_eq!(body.stmts.len(), 1);
+        assert!(matches!(body.stmts[0], Stmt::Let { .. }));
+        assert!(matches!(body.value.as_deref(), Some(Expr::Ident { .. })));
+    }
+
+    #[test]
+    fn an_empty_block_has_no_stmts_and_no_value() {
+        let body = body_of("");
+        assert!(body.stmts.is_empty());
+        assert!(body.value.is_none());
+    }
+
+    #[test]
+    fn newline_separated_statements_with_no_semi_all_parse() {
+        // the bundled examples use NO `;` -- statements are separated by the
+        // next statement-head keyword or `}`. this fixture mirrors
+        // `defer-demo.qala`'s `let f = open(path) defer close(f) let content
+        // = f.read_all()? ...` shape.
+        let body = body_of("let f = open(path) defer close(f) let g = 1");
+        assert_eq!(body.stmts.len(), 3);
+        assert!(matches!(body.stmts[0], Stmt::Let { .. }));
+        assert!(matches!(body.stmts[1], Stmt::Defer { .. }));
+        assert!(matches!(body.stmts[2], Stmt::Let { .. }));
+    }
+
+    #[test]
+    fn expression_statements_chain_without_semicolons() {
+        // two expressions in a row, no `;` -- mirrors hello.qala's body.
+        // resolution: the first expression is a statement (the next token
+        // starts another expression); the LAST expression with no following
+        // `;` is the block's trailing value. so `println("a") println("b")`
+        // yields one Expr stmt and a Some(value).
+        let body = body_of("println(\"a\") println(\"b\")");
+        assert_eq!(body.stmts.len(), 1);
+        match &body.stmts[0] {
+            Stmt::Expr { expr, .. } => assert!(matches!(expr, Expr::Call { .. })),
+            other => panic!("expected Expr stmt, got {other:?}"),
+        }
+        assert!(matches!(body.value.as_deref(), Some(Expr::Call { .. })));
+    }
+
+    #[test]
+    fn let_x_eq_followed_by_eof_errors_with_a_zero_width_span_at_the_eq() {
+        // KEY PARSE-09 case: the EOF span is zero-width, just past the `=`.
+        let err = parse_err("fn f() { let x =\n");
+        match err {
+            QalaError::UnexpectedEof { span, .. } => {
+                // the `=` ends at byte offset 16 (`fn f() { let x =` -- 0..16).
+                assert_eq!(span.len, 0);
+                // the message says it ran out of input.
+                assert!(err.message().contains("end of input"));
+            }
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mismatched_paren_inside_a_block_blames_the_open_paren() {
+        // `fn f() { let x = ( a + b } }`. the `(` is opened then never closed;
+        // a `}` shows up where `)` or another expr-rhs was expected.
+        let err = parse_err("fn f() { let x = ( a + b } }");
+        match err {
+            QalaError::UnclosedDelimiter { span, opener, .. } => {
+                assert_eq!(opener, TokenKind::LParen);
+                // the `(` starts at byte offset 17.
+                assert_eq!(span.start, 17);
+                assert_eq!(span.len, 1);
+            }
+            other => panic!("expected UnclosedDelimiter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn there_is_no_expr_if_in_the_parser() {
+        // `let x = if c { a } else { b }` is NOT legal in v1 -- `if` cannot
+        // start an expression. the parser should error at the `if` token.
+        let err = parse_err("fn f() { let x = if c { 1 } else { 2 } }");
+        match err {
+            QalaError::UnexpectedToken { found, .. } => {
+                assert_eq!(found, TokenKind::If);
+            }
+            other => panic!("expected UnexpectedToken at `if`, got {other:?}"),
+        }
     }
 }
