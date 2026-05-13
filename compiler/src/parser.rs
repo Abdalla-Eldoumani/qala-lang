@@ -1680,6 +1680,17 @@ impl<'t> Parser<'t> {
                 })
             }
             TokenKind::DotDot | TokenKind::DotDotEq => {
+                // ranges are non-associative: `0..1..2` is a parse error.
+                // right-chaining is blocked by rbp == lbp (the Pratt loop
+                // inside `expr_bp(rbp)` stops when it sees lbp == rbp).
+                // left-chaining is blocked here: if lhs is already a Range,
+                // reject it so `(0..1)..2` is also an error.
+                if matches!(lhs, Expr::Range { .. }) {
+                    return Err(QalaError::Parse {
+                        span: op_tok.span,
+                        message: "range operators cannot be chained; use parentheses if nested ranges are intended".to_string(),
+                    });
+                }
                 let inclusive = matches!(op_tok.kind, TokenKind::DotDotEq);
                 let rhs = self.expr_bp(rbp, ctx)?;
                 let lhs_span = lhs.span();
@@ -1789,8 +1800,12 @@ fn prefix_bp(k: &TokenKind) -> ((), u8) {
 
 /// infix binding power: `(lbp, rbp)`. left-associative operators have
 /// `rbp = lbp + 1` so a same-tier operator on the right does not re-enter at
-/// equal-or-higher binding power. ranges are non-associative: `rbp` for
-/// `..`/`..=` is the same as their `lbp`, so `0..1..2` fails to parse.
+/// equal-or-higher binding power. ranges are non-associative: both lbp and rbp
+/// are 60, which prevents right-chaining. left-chaining (`Range` on the lhs of
+/// a second `..`) is rejected explicitly in `fold_infix` -- a `Range` lhs for a
+/// range operator is an error. this two-part enforcement is the Pratt
+/// non-associativity pattern for operators that must not chain in either
+/// direction.
 ///
 /// `Eq` (the assignment token) is deliberately absent -- `let x = ...` is
 /// statement syntax (Plan 03), not an expression operator.
@@ -1800,8 +1815,9 @@ fn infix_bp(k: &TokenKind) -> Option<(u8, u8)> {
         TokenKind::Star | TokenKind::Slash | TokenKind::Percent => (80, 81),
         // additive.
         TokenKind::Plus | TokenKind::Minus => (70, 71),
-        // ranges -- non-associative.
-        TokenKind::DotDot | TokenKind::DotDotEq => (60, 60),
+        // ranges -- non-associative (see comment above): rbp = 61 blocks
+        // right-chaining; the fold_infix guard blocks left-chaining.
+        TokenKind::DotDot | TokenKind::DotDotEq => (60, 61),
         // comparison and equality -- left-associative.
         TokenKind::Lt
         | TokenKind::LtEq
@@ -2929,6 +2945,15 @@ mod tests {
             Expr::Range { inclusive, .. } => assert!(inclusive),
             other => panic!("expected Range, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chained_range_is_a_parse_error() {
+        // `0..1..2` must fail: ranges are non-associative (rbp 61 > lbp 60,
+        // so the Pratt loop stops after the first `..` and `1` is returned as
+        // the rhs). the full program parser then sees `..2` at item level and
+        // returns an error.
+        parse_err("fn f() { 0..1..2 }");
     }
 
     #[test]
