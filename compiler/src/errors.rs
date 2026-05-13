@@ -3,19 +3,22 @@
 //! point at the exact source text; rich rendering (the source line plus an
 //! underline) is built in a later phase on top of that span.
 //!
-//! only the lexer's variants exist now. parser, type-checker, and runtime
+//! the lexer's and the parser's variants exist now. type-checker and runtime
 //! variants follow the same `{ span, message }` shape and are sketched in
 //! comments below so later phases extend this enum rather than restructure it.
 
 use crate::span::Span;
+use crate::token::TokenKind;
 
 /// every way the compiler can reject a program, with the source span of the
-/// fault. `serde` derives so the diagnostics layer can later serialize a
-/// structured form to the editor without touching this enum; `PartialEq` /
-/// `Eq` so tests can compare errors directly.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// fault. `PartialEq` so tests can compare errors directly; no `Eq` and no
+/// `serde` derives, because the parse variants carry [`TokenKind`], which holds
+/// an `f64` and is therefore neither `Eq` nor (currently) `serde`-derivable.
+/// the diagnostics layer (Phase 3) builds its own structured editor form from
+/// `span()` and `message()` rather than serializing this enum directly.
+#[derive(Debug, Clone, PartialEq)]
 pub enum QalaError {
-    // ---- lex (this phase) ----
+    // ---- lex ----
     /// a string literal reached a raw newline or end of file before its closing
     /// `"`. span = the opening quote, since that is where the reader's attention
     /// belongs, not the place the scanner ran out of input.
@@ -50,10 +53,34 @@ pub enum QalaError {
     /// inside). span = the literal.
     BadByteLiteral { span: Span, message: String },
 
-    // ---- parse / type / runtime: added in later phases, same shape ----
+    // ---- parse ----
+    /// the parser found a token that is not legal at this position. span = the
+    /// offending token, or, when `found` is [`TokenKind::Eof`], a zero-width
+    /// point just after the last real token. `expected` is the set of token
+    /// kinds the parser could have accepted here.
+    UnexpectedToken { span: Span, expected: Vec<TokenKind>, found: TokenKind },
+
+    /// an opening delimiter (`(` / `[` / `{`) was closed by the wrong delimiter
+    /// or never closed at all. span = the *opening* delimiter, not the surprising
+    /// closer, because the opener is where the reader needs to look. `found` is
+    /// the wrong closer, or [`TokenKind::Eof`] if the input ran out first.
+    UnclosedDelimiter { span: Span, opener: TokenKind, found: TokenKind },
+
+    /// the input ended while the parser was still expecting more. span = a
+    /// zero-width point immediately after the last valid token (offset = end of
+    /// that token, length 0), not `src.len()` unless that is where the last
+    /// token ends. `expected` is what would have been legal next.
+    UnexpectedEof { span: Span, expected: Vec<TokenKind> },
+
+    /// a parse failure that does not fit the structured variants above: the
+    /// recursion-depth limit ("expression nests too deeply"), a malformed
+    /// pipeline right-hand side, and similar. span = wherever the failure was
+    /// detected; `message` is the human description.
+    Parse { span: Span, message: String },
+
+    // ---- type / runtime: added in later phases, same shape ----
     // keeping these as comments, not code, means later phases extend the enum
     // and teach `span()` the new arms without changing any existing variant.
-    // Parse   { span: Span, message: String },
     // Type    { span: Span, message: String },
     // Runtime { span: Span, message: String },
 }
@@ -72,7 +99,11 @@ impl QalaError {
             | QalaError::UnexpectedChar { span, .. }
             | QalaError::IntOverflow { span }
             | QalaError::MalformedNumber { span, .. }
-            | QalaError::BadByteLiteral { span, .. } => *span,
+            | QalaError::BadByteLiteral { span, .. }
+            | QalaError::UnexpectedToken { span, .. }
+            | QalaError::UnclosedDelimiter { span, .. }
+            | QalaError::UnexpectedEof { span, .. }
+            | QalaError::Parse { span, .. } => *span,
         }
     }
 
@@ -104,7 +135,121 @@ impl QalaError {
             QalaError::BadByteLiteral { message, .. } => {
                 format!("malformed byte literal: {message}")
             }
+            QalaError::UnexpectedToken { expected, found, .. } => {
+                format!("expected {}, found {}", expected_list(expected), display_kind(found))
+            }
+            QalaError::UnclosedDelimiter { opener, found, .. } => {
+                format!("unclosed {} -- found {}", display_kind(opener), display_kind(found))
+            }
+            QalaError::UnexpectedEof { expected, .. } => {
+                format!("unexpected end of input, expected {}", expected_list(expected))
+            }
+            QalaError::Parse { message, .. } => message.clone(),
         }
+    }
+}
+
+/// the human spelling of a token kind, for error messages: `)` not `RParen`,
+/// `end of input` for [`TokenKind::Eof`], a category name for the
+/// payload-carrying kinds (`an identifier`, `an integer literal`).
+///
+/// this is the one place the mapping lives, so a new token kind is one line
+/// here. the strings are quoted where the token is a literal symbol so a
+/// message reads "expected `,` or `)`", not "expected , or )".
+pub fn display_kind(kind: &TokenKind) -> &'static str {
+    use TokenKind::*;
+    match kind {
+        // literals and identifiers: a category, not the value.
+        Int(_) => "an integer literal",
+        Float(_) => "a float literal",
+        Byte(_) => "a byte literal",
+        Str(_) => "a string literal",
+        StrStart(_) => "the start of a string",
+        StrMid(_) => "more string text",
+        StrEnd(_) => "the end of a string",
+        InterpStart => "`{` (interpolation start)",
+        InterpEnd => "`}` (interpolation end)",
+        Ident(_) => "an identifier",
+        // keywords.
+        Fn => "`fn`",
+        Let => "`let`",
+        Mut => "`mut`",
+        If => "`if`",
+        Else => "`else`",
+        While => "`while`",
+        For => "`for`",
+        In => "`in`",
+        Return => "`return`",
+        Break => "`break`",
+        Continue => "`continue`",
+        Defer => "`defer`",
+        Match => "`match`",
+        Struct => "`struct`",
+        Enum => "`enum`",
+        Interface => "`interface`",
+        Comptime => "`comptime`",
+        Is => "`is`",
+        Pure => "`pure`",
+        Io => "`io`",
+        Alloc => "`alloc`",
+        Panic => "`panic`",
+        Or => "`or`",
+        SelfKw => "`self`",
+        True => "`true`",
+        False => "`false`",
+        // primitive type names.
+        I64Ty => "`i64`",
+        F64Ty => "`f64`",
+        BoolTy => "`bool`",
+        StrTy => "`str`",
+        ByteTy => "`byte`",
+        VoidTy => "`void`",
+        // operators and punctuation.
+        Plus => "`+`",
+        Minus => "`-`",
+        Star => "`*`",
+        Slash => "`/`",
+        Percent => "`%`",
+        EqEq => "`==`",
+        BangEq => "`!=`",
+        Lt => "`<`",
+        LtEq => "`<=`",
+        Gt => "`>`",
+        GtEq => "`>=`",
+        AmpAmp => "`&&`",
+        PipePipe => "`||`",
+        Bang => "`!`",
+        Eq => "`=`",
+        Dot => "`.`",
+        Comma => "`,`",
+        Colon => "`:`",
+        Semi => "`;`",
+        LParen => "`(`",
+        RParen => "`)`",
+        LBracket => "`[`",
+        RBracket => "`]`",
+        LBrace => "`{`",
+        RBrace => "`}`",
+        Arrow => "`->`",
+        FatArrow => "`=>`",
+        PipeGt => "`|>`",
+        Question => "`?`",
+        DotDot => "`..`",
+        DotDotEq => "`..=`",
+        Eof => "end of input",
+    }
+}
+
+/// render an expected-token set for a message: a single item bare, two items
+/// joined with `or`, three or more as a comma list ending in `or`. an empty set
+/// (which should not happen in practice) reads "something else".
+fn expected_list(expected: &[TokenKind]) -> String {
+    let names: Vec<&'static str> = expected.iter().map(display_kind).collect();
+    match names.as_slice() {
+        [] => "something else".to_string(),
+        [only] => only.to_string(),
+        [a, b] => format!("{a} or {b}"),
+        [head @ .., last] => format!("{}, or {}", head.join(", "), last),
     }
 }
 
@@ -145,6 +290,39 @@ mod tests {
     }
 
     #[test]
+    fn span_returns_the_carried_span_for_every_parse_variant() {
+        let cases: Vec<(QalaError, Span)> = vec![
+            (
+                QalaError::UnexpectedToken {
+                    span: sample(1),
+                    expected: vec![TokenKind::RParen],
+                    found: TokenKind::RBracket,
+                },
+                sample(1),
+            ),
+            (
+                QalaError::UnclosedDelimiter {
+                    span: sample(2),
+                    opener: TokenKind::LParen,
+                    found: TokenKind::RBrace,
+                },
+                sample(2),
+            ),
+            (
+                QalaError::UnexpectedEof { span: sample(3), expected: vec![TokenKind::Semi] },
+                sample(3),
+            ),
+            (
+                QalaError::Parse { span: sample(4), message: "expression nests too deeply".to_string() },
+                sample(4),
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.span(), expected, "span() mismatch for {err:?}");
+        }
+    }
+
+    #[test]
     fn errors_are_comparable_and_clonable() {
         let a = QalaError::IntOverflow { span: sample(0) };
         let b = a.clone();
@@ -163,11 +341,92 @@ mod tests {
             QalaError::IntOverflow { span: sample(0) },
             QalaError::MalformedNumber { span: sample(0), message: "1e".to_string() },
             QalaError::BadByteLiteral { span: sample(0), message: "b''".to_string() },
+            QalaError::UnexpectedToken {
+                span: sample(0),
+                expected: vec![TokenKind::Comma, TokenKind::RParen],
+                found: TokenKind::RBracket,
+            },
+            QalaError::UnclosedDelimiter {
+                span: sample(0),
+                opener: TokenKind::LParen,
+                found: TokenKind::Eof,
+            },
+            QalaError::UnexpectedEof { span: sample(0), expected: vec![TokenKind::Ident(String::new())] },
+            QalaError::Parse { span: sample(0), message: "expression nests too deeply".to_string() },
         ];
         for e in &errs {
             let m = e.message();
             assert!(!m.is_empty());
             assert!(!m.contains('\n'), "message should be one line: {m:?}");
         }
+    }
+
+    #[test]
+    fn unexpected_token_message_lists_every_expected_kind_and_the_found_one() {
+        let e = QalaError::UnexpectedToken {
+            span: sample(0),
+            expected: vec![TokenKind::Comma, TokenKind::RParen],
+            found: TokenKind::RBracket,
+        };
+        let m = e.message();
+        // both human spellings appear, and the message says what was actually found.
+        assert!(m.contains("`,`"), "missing first expected kind: {m:?}");
+        assert!(m.contains("`)`"), "missing second expected kind: {m:?}");
+        assert!(m.contains("found"), "missing the word `found`: {m:?}");
+        assert!(m.contains("`]`"), "missing the found kind: {m:?}");
+    }
+
+    #[test]
+    fn unclosed_delimiter_message_names_the_opener_and_the_surprise() {
+        // a wrong closer.
+        let e = QalaError::UnclosedDelimiter {
+            span: sample(0),
+            opener: TokenKind::LParen,
+            found: TokenKind::RBrace,
+        };
+        let m = e.message();
+        assert!(m.contains("`(`"), "missing the opener: {m:?}");
+        assert!(m.contains("`}`"), "missing the surprising token: {m:?}");
+        // running into end of input names it as such, not as `Eof`.
+        let e = QalaError::UnclosedDelimiter {
+            span: sample(0),
+            opener: TokenKind::LBracket,
+            found: TokenKind::Eof,
+        };
+        let m = e.message();
+        assert!(m.contains("`[`"));
+        assert!(m.contains("end of input"));
+        assert!(!m.contains("Eof"));
+    }
+
+    #[test]
+    fn eof_is_named_end_of_input_in_messages() {
+        let e = QalaError::UnexpectedEof { span: sample(0), expected: vec![TokenKind::Semi] };
+        let m = e.message();
+        assert!(m.contains("end of input"), "{m:?}");
+        assert!(m.contains("`;`"), "{m:?}");
+    }
+
+    #[test]
+    fn display_kind_spells_symbols_and_categories() {
+        assert_eq!(display_kind(&TokenKind::RParen), "`)`");
+        assert_eq!(display_kind(&TokenKind::LBrace), "`{`");
+        assert_eq!(display_kind(&TokenKind::Plus), "`+`");
+        assert_eq!(display_kind(&TokenKind::Eof), "end of input");
+        assert_eq!(display_kind(&TokenKind::Ident("x".to_string())), "an identifier");
+        assert_eq!(display_kind(&TokenKind::Int(7)), "an integer literal");
+        assert_eq!(display_kind(&TokenKind::Fn), "`fn`");
+    }
+
+    #[test]
+    fn expected_list_joins_one_two_or_many() {
+        assert_eq!(expected_list(&[TokenKind::RParen]), "`)`");
+        assert_eq!(expected_list(&[TokenKind::Comma, TokenKind::RParen]), "`,` or `)`");
+        assert_eq!(
+            expected_list(&[TokenKind::Comma, TokenKind::RParen, TokenKind::RBracket]),
+            "`,`, `)`, or `]`"
+        );
+        // an empty set should not occur, but it must not panic.
+        assert_eq!(expected_list(&[]), "something else");
     }
 }
