@@ -1684,10 +1684,11 @@ impl<'t> Parser<'t> {
             }
             TokenKind::DotDot | TokenKind::DotDotEq => {
                 // ranges are non-associative: `0..1..2` is a parse error.
-                // right-chaining is blocked by rbp == lbp (the Pratt loop
-                // inside `expr_bp(rbp)` stops when it sees lbp == rbp).
+                // right-chaining is blocked by rbp > lbp (the Pratt loop in
+                // `expr_bp(rbp)` stops on the next `..` because its lbp=60
+                // is below the new min_bp=61, so it doesn't fold further).
                 // left-chaining is blocked here: if lhs is already a Range,
-                // reject it so `(0..1)..2` is also an error.
+                // reject it so the user can't pre-parenthesise around the rule.
                 if matches!(lhs, Expr::Range { .. }) {
                     return Err(QalaError::Parse {
                         span: op_tok.span,
