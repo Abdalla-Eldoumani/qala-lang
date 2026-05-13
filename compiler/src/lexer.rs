@@ -1227,7 +1227,9 @@ mod tests {
 
     #[test]
     fn malformed_numbers_span_the_literal() {
-        for src in ["1_", "1__0", "0x", "0xG", "0b2", "1_.0", "1._5", "1e_5", "1e", "0b"] {
+        for src in ["1_", "1__0", "0x", "0xG", "0b2", "1_.0", "1._5", "1e_5", "1e",
+                    "1e+", "1e-", "0b",
+                    "0x_FF", "0b_1", "0xFF_"] {
             match Lexer::tokenize(src) {
                 Err(QalaError::MalformedNumber { span, .. }) => {
                     assert_eq!(
