@@ -529,7 +529,7 @@ impl<'t> Parser<'t> {
         } else {
             None
         };
-        let effect = self.parse_optional_effect()?;
+        let effect = self.parse_optional_effect()?.map(|(e, _span)| e);
         let body = self.parse_block()?;
         let span = fn_span.to(body.span);
         Ok(Item::Fn(FnDecl {
@@ -625,7 +625,9 @@ impl<'t> Parser<'t> {
 
     /// `is pure|io|alloc|panic`, or nothing. consumed only when `is` is
     /// present; if `is` is followed by a non-effect keyword, that is an error.
-    fn parse_optional_effect(&mut self) -> Result<Option<Effect>, QalaError> {
+    /// returns the effect and the span of the effect keyword so callers can
+    /// compute a span that covers the full signature including the annotation.
+    fn parse_optional_effect(&mut self) -> Result<Option<(Effect, Span)>, QalaError> {
         if !self.eat(&TokenKind::Is) {
             return Ok(None);
         }
@@ -643,8 +645,8 @@ impl<'t> Parser<'t> {
                 ]));
             }
         };
-        self.advance();
-        Ok(Some(effect))
+        let kw_span = self.advance().span;
+        Ok(Some((effect, kw_span)))
     }
 
     /// `struct NAME { (name: TYPE,)* }`. trailing comma in the field list is
@@ -736,14 +738,16 @@ impl<'t> Parser<'t> {
                 } else {
                     None
                 };
-                let effect = p.parse_optional_effect()?;
-                // span: `fn` keyword to the end of whatever last bit was
-                // consumed (return type, or just past the params).
-                let end = match (&ret_ty, &effect) {
+                let effect_with_span = p.parse_optional_effect()?;
+                // span: `fn` keyword to the end of the last consumed token.
+                // priority: return type > effect keyword > fn keyword (fallback
+                // when the signature has only params and no return or effect).
+                let end = match (&ret_ty, &effect_with_span) {
                     (Some(ret), _) => ret.span(),
-                    _ => fn_span, // approximate -- best-effort if a wider span is not available
+                    (None, Some((_e, effect_span))) => *effect_span,
+                    (None, None) => fn_span,
                 };
-                let _ = effect.as_ref();
+                let effect = effect_with_span.map(|(e, _span)| e);
                 Ok(MethodSig {
                     name: mname,
                     params,
@@ -2338,6 +2342,38 @@ mod tests {
         let ast = parse_ok("interface I { fn m(self) -> str, }");
         match &ast[0] {
             Item::Interface(d) => assert_eq!(d.methods.len(), 1),
+            other => panic!("expected Interface, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interface_method_sig_span_covers_effect_when_no_return_type() {
+        // regression: when a method has `is io` but no `-> T`, the span was
+        // collapsing to just the `fn` keyword. the span must cover the full
+        // signature including the effect keyword.
+        let src = "interface I { fn m(self) is io }";
+        let ast = parse_ok(src);
+        match &ast[0] {
+            Item::Interface(d) => {
+                let sig = &d.methods[0];
+                assert_eq!(sig.effect, Some(Effect::Io));
+                assert!(sig.ret_ty.is_none());
+                // span must start at `fn` and end at or after `io`.
+                // "fn m(self) is io" is 16 bytes wide; the `fn` starts at
+                // byte 14 (after "interface I { "). the span must be wider
+                // than a single token (fn = 2 bytes).
+                assert!(
+                    sig.span.len > 2,
+                    "span covers only the fn keyword (len={}), expected full sig",
+                    sig.span.len
+                );
+                // the span text should cover at least up to `io`.
+                let sig_text = sig.span.slice(src);
+                assert!(
+                    sig_text.ends_with("io"),
+                    "sig span text should end with 'io', got {sig_text:?}"
+                );
+            }
             other => panic!("expected Interface, got {other:?}"),
         }
     }
