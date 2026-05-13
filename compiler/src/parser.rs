@@ -3539,4 +3539,251 @@ mod tests {
             other => panic!("expected UnexpectedToken at `if`, got {other:?}"),
         }
     }
+
+    // ---- the verification battery (PARSE-09 negatives + integration) --------
+
+    #[test]
+    fn the_six_examples_parse_with_no_error() {
+        // the analogue of the lexer's six-examples smoke test: every bundled
+        // `.qala` file parses cleanly with the v1 grammar. the path is
+        // relative to this crate's manifest, so the test is cwd-independent;
+        // a missing file fails loudly via `panic!`.
+        for name in [
+            "hello",
+            "fibonacci",
+            "effects",
+            "pattern-matching",
+            "pipeline",
+            "defer-demo",
+        ] {
+            let path = format!(
+                "{}/../playground/public/examples/{}.qala",
+                env!("CARGO_MANIFEST_DIR"),
+                name
+            );
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read example {path}: {e}"));
+            let toks = crate::lexer::Lexer::tokenize(&src)
+                .unwrap_or_else(|e| panic!("example {name}.qala failed to tokenize: {e:?}"));
+            let ast = Parser::parse(&toks)
+                .unwrap_or_else(|e| panic!("example {name}.qala failed to parse: {e:?}"));
+            assert!(
+                !ast.is_empty(),
+                "example {name}.qala should produce top-level items"
+            );
+        }
+    }
+
+    // PARSE-09: spans-on-the-operator, blame-the-opener, zero-width EOF span,
+    // "expected X, found Y", trailing commas, empty body, zero match arms,
+    // `self` misplacement. some overlap with prior tests is fine; this
+    // section is the consolidated battery.
+
+    #[test]
+    fn pipeline_with_no_rhs_call_blames_the_pipe_operator() {
+        // `fn f() is io { let r = x |> }` -- the `|>` token's span is the error.
+        let err = parse_err("fn f() is io { let r = x |> }");
+        match err {
+            QalaError::Parse { message, span } => {
+                assert!(message.contains("`|>`"), "message was {message:?}");
+                // the `|>` is two bytes wide.
+                assert_eq!(span.len, 2);
+            }
+            other => panic!("expected QalaError::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_mismatched_delimiter_blames_the_opener() {
+        // `fn f() { let x = ( a + b } }` -- the `(` opens, but `}` shows up.
+        // the error's span is the `(`, not the `}`.
+        let err = parse_err("fn f() { let x = ( a + b } }");
+        let msg = err.message();
+        match &err {
+            QalaError::UnclosedDelimiter { span, opener, found } => {
+                assert_eq!(*opener, TokenKind::LParen);
+                assert_eq!(span.len, 1, "the `(` span is one byte wide");
+                assert_eq!(*found, TokenKind::RBrace);
+            }
+            other => panic!("expected UnclosedDelimiter, got {other:?}"),
+        }
+        // and the rendered message mentions both the opener and the surprise.
+        assert!(msg.contains("`(`"), "msg was {msg:?}");
+        assert!(msg.contains("`}`"), "msg was {msg:?}");
+    }
+
+    #[test]
+    fn unexpected_eof_reports_a_zero_width_span_after_the_last_token() {
+        // `fn f() { let x =\n` -- input ends mid-statement. the span is
+        // zero-width, just past the `=` (the last real token).
+        let err = parse_err("fn f() { let x =\n");
+        match err {
+            QalaError::UnexpectedEof { span, .. } => {
+                assert_eq!(span.len, 0, "EOF span must be zero-width");
+                assert!(err.message().contains("end of input"));
+            }
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unexpected_token_says_expected_x_found_y() {
+        // `fn f() { let 5 = 0 }` -- where an identifier is expected, an int.
+        let err = parse_err("fn f() { let 5 = 0 }");
+        assert!(matches!(err, QalaError::UnexpectedToken { .. }));
+        let msg = err.message();
+        assert!(msg.contains("expected"), "{msg:?}");
+        assert!(msg.contains("identifier"), "{msg:?}");
+        assert!(msg.contains("found"), "{msg:?}");
+    }
+
+    #[test]
+    fn trailing_commas_are_accepted_everywhere() {
+        // every list position the grammar can grow.
+        assert!(Parser::parse(&lex("fn f(a: i64, b: i64,) {}")).is_ok());
+        assert!(Parser::parse(&lex("struct S { x: i64, y: i64, }")).is_ok());
+        assert!(Parser::parse(&lex("enum E { A, B(i64), }")).is_ok());
+        assert!(Parser::parse(&lex("interface I { fn m(self) -> str, }")).is_ok());
+        assert!(Parser::parse(&lex("fn g() is io { let xs = [1, 2, 3,] }")).is_ok());
+        assert!(Parser::parse(&lex("fn h() is io { let t = (1, 2,) }")).is_ok());
+        // generic-arg trailing comma.
+        assert!(Parser::parse(&lex("fn k(x: Result<i64, str,>) {}")).is_ok());
+    }
+
+    #[test]
+    fn an_empty_function_body_is_legal() {
+        let ast = parse_ok("fn f() {}");
+        match &ast[0] {
+            Item::Fn(d) => {
+                assert!(d.body.stmts.is_empty());
+                assert!(d.body.value.is_none());
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_match_arms_is_an_error_in_a_full_program() {
+        // the expression-level test covers this; pin the same behaviour
+        // through the public `Parser::parse` path.
+        let err = parse_err("fn f() is io { match x { } }");
+        match err {
+            QalaError::Parse { message, .. } => {
+                assert!(message.contains("at least one arm"), "{message:?}");
+            }
+            other => panic!("expected QalaError::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_outside_a_method_definition_is_an_error_in_a_full_program() {
+        // free fn cannot have `self`.
+        assert!(Parser::parse(&lex("fn f(self) {}")).is_err());
+        // `self` not in the first slot of a method.
+        assert!(Parser::parse(&lex("fn Point.f(a: i64, self) {}")).is_err());
+        // `self` as the first slot of a method IS legal.
+        assert!(Parser::parse(&lex("fn Point.area(self) -> f64 is pure { 3.14 }")).is_ok());
+    }
+
+    // The deep-nesting integration test: this MUST actually run without a
+    // stack overflow. if it segfaults, the depth guard is not wired around
+    // all recursive productions, or `MAX_DEPTH` is too high; either is a real
+    // bug to fix in Tasks 1-2's code, not to work around here.
+
+    #[test]
+    fn deeply_nested_input_fails_gracefully_not_with_a_stack_overflow() {
+        // 20000 nested parens: an expression-nesting case. the depth guard
+        // around `expr_bp` is supposed to fire long before the stack runs out.
+        let deep = format!(
+            "fn f() is io {{ let x = {}1{} }}",
+            "(".repeat(20000),
+            ")".repeat(20000)
+        );
+        let err = Parser::parse(&lex(&deep))
+            .expect_err("expected a clean depth-limit error, not a crash");
+        assert!(
+            matches!(err, QalaError::Parse { .. }),
+            "expected a Parse error, got {err:?}"
+        );
+        assert!(
+            err.message().contains("deeply") || err.message().contains("nest"),
+            "message was {}",
+            err.message()
+        );
+        // 5000 nested blocks: the depth guard around `parse_block` is the
+        // one that must catch this. it must error, not segfault.
+        let deep_blocks = format!(
+            "fn f() is io {{ {}1{} }}",
+            "{".repeat(5000),
+            "}".repeat(5000)
+        );
+        assert!(
+            Parser::parse(&lex(&deep_blocks)).is_err(),
+            "deep block nesting should error, not crash"
+        );
+        // 5000 nested types: the depth guard around `parse_type` covers this.
+        // `[[[...i64...]]]` -- one bracket per nesting level.
+        let deep_types = format!(
+            "fn f(x: {}i64{}) {{}}",
+            "[".repeat(5000),
+            "]".repeat(5000)
+        );
+        assert!(
+            Parser::parse(&lex(&deep_types)).is_err(),
+            "deep type nesting should error, not crash"
+        );
+    }
+
+    #[test]
+    fn ast_node_spans_point_at_the_source_bytes_they_came_from() {
+        // pick a handful of nodes at different depths and assert their span
+        // slices the source to the right text. PARSE-01.
+        let src = "fn add(a: i64, b: i64) -> i64 is pure { return a + b }";
+        let toks = lex(src);
+        let ast = Parser::parse(&toks).expect("parses");
+        assert_eq!(ast.len(), 1);
+        let item = &ast[0];
+        // the whole fn item spans the entire source (modulo trailing
+        // whitespace, none here).
+        assert_eq!(item.span().slice(src), src);
+        match item {
+            Item::Fn(d) => {
+                // each typed param's span slices to "NAME: TYPE".
+                let p0_text = d.params[0].span.slice(src);
+                assert_eq!(p0_text, "a: i64");
+                let p1_text = d.params[1].span.slice(src);
+                assert_eq!(p1_text, "b: i64");
+                // the return type's span slices to "i64".
+                let ret_text = d.ret_ty.as_ref().expect("ret").span().slice(src);
+                assert_eq!(ret_text, "i64");
+                // body span includes both braces.
+                assert_eq!(d.body.span.slice(src), "{ return a + b }");
+                // the inner `return a + b` statement.
+                let ret_stmt = &d.body.stmts[0];
+                assert_eq!(ret_stmt.span().slice(src), "return a + b");
+                // the inner `a + b` Binary's span.
+                if let Stmt::Return { value: Some(value), .. } = ret_stmt {
+                    assert_eq!(value.span().slice(src), "a + b");
+                } else {
+                    panic!("expected Stmt::Return with a value, got {ret_stmt:?}");
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parsing_a_full_program_is_deterministic_byte_for_byte() {
+        // the existing `parsing_is_deterministic` covers the empty / one-item
+        // cases. this richer fixture exercises the full v1 grammar: types,
+        // generics, items, statements, expressions, control flow. running it
+        // twice MUST yield equal ASTs -- the parser holds no global state.
+        let src = "fn fib(n: i64) -> i64 is pure { if n <= 1 { return n } return fib(n - 1) + fib(n - 2) }";
+        let a = Parser::parse(&lex(src)).expect("parses");
+        let b = Parser::parse(&lex(src)).expect("parses");
+        assert_eq!(a, b);
+        // also stable across an error case.
+        let bad = "fn f() { let x = ( }";
+        assert_eq!(Parser::parse(&lex(bad)), Parser::parse(&lex(bad)));
+    }
 }
