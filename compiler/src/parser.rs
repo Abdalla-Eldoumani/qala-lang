@@ -2702,8 +2702,10 @@ mod tests {
         let a = Parser::parse(&lex(src));
         let b = Parser::parse(&lex(src));
         assert_eq!(a, b);
-        // and stable across an error case (a program with an item).
-        let bad = "fn f() {}";
+        // also stable across a genuine error case: two runs on the same bad
+        // input must produce byte-equal errors (no pointer addresses, no OS
+        // state, no random salt leaking into the error value).
+        let bad = "fn f(";  // unclosed paren -- a real parse error
         assert_eq!(Parser::parse(&lex(bad)), Parser::parse(&lex(bad)));
     }
 
