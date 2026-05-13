@@ -11,8 +11,9 @@
 //! panic aborts the module.
 //!
 //! the lexer is fail-fast: it returns `Result<Vec<Token>, QalaError>` and stops
-//! at the first error. multi-error reporting is deferred to Phase 2's parser,
-//! which has resync points; the lexer does not.
+//! at the first error. the parser is fail-fast for the same reason -- the first
+//! error wins and parsing stops; multi-error reporting and resync points are
+//! deferred (per CONTEXT.md).
 
 use std::num::IntErrorKind;
 
