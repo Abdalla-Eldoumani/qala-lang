@@ -679,45 +679,175 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    // ---- string literals (Task 3) ---------------------------------------------
+    // ---- string literals and interpolation ------------------------------------
 
-    /// scan a string literal's body once `StrText` is the top mode. Task 3 owns
-    /// the real implementation (escapes, `\u{...}`, interpolation grouping); this
-    /// Task 1 stub copies raw bytes to the next `"` and emits a single `Str`, so
-    /// the skeleton does not hang and a simple `"abc"` round-trips. it does not
-    /// decode escapes and treats `{` literally -- Task 3 replaces it wholesale.
+    /// scan a run of string-literal text once `StrText` is the top mode. the
+    /// opening `"` (or, on a resumed call, the closing `}` of the preceding
+    /// interpolation) has already been consumed, so `self.pos` is at the first
+    /// content byte.
+    ///
+    /// it decodes escapes into a buffer and stops at one of:
+    /// - the closing `"` -- pushes [`TokenKind::Str`] (no interpolation seen) or
+    ///   [`TokenKind::StrEnd`] (resuming after the last interpolation), pops the
+    ///   `StrText`. the `Str` span runs from the opening quote through the closing
+    ///   quote inclusive; the `StrEnd` span runs from just after the preceding `}`
+    ///   through the closing quote.
+    /// - an unescaped `{` -- pushes [`TokenKind::StrStart`] (first interpolation)
+    ///   or [`TokenKind::StrMid`] (a later one) for the text so far, then
+    ///   [`TokenKind::InterpStart`] for the `{`, then a [`Mode::Interp`] so the
+    ///   main loop scans the embedded expression. a literal `{` in a string is
+    ///   written `\{`, handled in the escape path, so a bare `{` always opens an
+    ///   interpolation.
+    /// - a backslash -- decodes `\n \t \r \0 \\ \" \{ \}` or `\u{1..6 hex}` into
+    ///   the buffer; anything else is [`QalaError::InvalidEscape`] whose span is
+    ///   the backslash (not the bad character after it).
+    /// - a raw newline or EOF -- [`QalaError::UnterminatedString`] whose span is
+    ///   the opening quote (no multi-line strings in v1).
     fn scan_string_body(&mut self, out: &mut Vec<Token>) -> Result<(), QalaError> {
-        let open_quote = match self.mode_stack.last() {
-            Some(Mode::StrText { open_quote, .. }) => *open_quote,
+        // pull the opening-quote offset and whether this string has already had an
+        // interpolation. `open_quote` is needed for the `Str` span and the
+        // unterminated-string span; `saw_interp` decides Str-vs-StrEnd and
+        // StrStart-vs-StrMid.
+        let (open_quote, saw_interp) = match self.mode_stack.last() {
+            Some(Mode::StrText { open_quote, saw_interp }) => (*open_quote, *saw_interp),
             _ => return Ok(()), // not in a string; nothing to do
         };
         let text_start = self.pos;
-        while let Some(b) = self.peek() {
-            if b == b'"' {
-                let text = self.src[text_start..self.pos].to_string();
-                self.pos += 1; // consume the closing quote
-                self.mode_stack.pop(); // leave StrText
-                // span: opening quote through closing quote inclusive.
-                let span = Span::new(open_quote, self.pos - open_quote);
-                out.push(Token::new(TokenKind::Str(text), span));
-                return Ok(());
+        let mut buf = String::new();
+        loop {
+            match self.peek() {
+                // closing quote: the string ends here.
+                Some(b'"') => {
+                    self.pos += 1; // consume the closing quote
+                    self.mode_stack.pop(); // leave StrText
+                    if saw_interp {
+                        // span: just after the preceding `}` through the closing
+                        // quote.
+                        let span = Span::new(text_start, self.pos - text_start);
+                        out.push(Token::new(TokenKind::StrEnd(buf), span));
+                    } else {
+                        // span: opening quote through closing quote inclusive.
+                        let span = Span::new(open_quote, self.pos - open_quote);
+                        out.push(Token::new(TokenKind::Str(buf), span));
+                    }
+                    return Ok(());
+                }
+                // unescaped `{`: opens an interpolation.
+                Some(b'{') => {
+                    let brace_pos = self.pos;
+                    // emit the literal text so far.
+                    if saw_interp {
+                        // a StrMid spans just the text between the previous `}`
+                        // and this `{`.
+                        let span = Span::new(text_start, brace_pos - text_start);
+                        out.push(Token::new(TokenKind::StrMid(buf), span));
+                    } else {
+                        // a StrStart spans the opening quote through the text
+                        // before this `{`.
+                        let span = Span::new(open_quote, brace_pos - open_quote);
+                        out.push(Token::new(TokenKind::StrStart(buf), span));
+                    }
+                    // mark the enclosing StrText so the next text run closes with
+                    // StrEnd / opens with StrMid.
+                    if let Some(Mode::StrText { saw_interp, .. }) = self.mode_stack.last_mut() {
+                        *saw_interp = true;
+                    }
+                    // emit the InterpStart for the `{` and enter Interp mode.
+                    self.pos += 1; // consume the `{`
+                    out.push(Token::new(TokenKind::InterpStart, Span::new(brace_pos, 1)));
+                    self.mode_stack.push(Mode::Interp { brace_depth: 0, open_brace: brace_pos });
+                    return Ok(());
+                }
+                // backslash: an escape sequence.
+                Some(b'\\') => {
+                    let backslash_pos = self.pos;
+                    self.pos += 1; // consume the `\`
+                    match self.bump() {
+                        Some(b'n') => buf.push('\n'),
+                        Some(b't') => buf.push('\t'),
+                        Some(b'r') => buf.push('\r'),
+                        Some(b'0') => buf.push('\0'),
+                        Some(b'\\') => buf.push('\\'),
+                        Some(b'"') => buf.push('"'),
+                        Some(b'{') => buf.push('{'),
+                        Some(b'}') => buf.push('}'),
+                        Some(b'u') => {
+                            let ch = self.scan_unicode_escape(backslash_pos)?;
+                            buf.push(ch);
+                        }
+                        _ => {
+                            return Err(QalaError::InvalidEscape {
+                                span: Span::new(backslash_pos, 1),
+                                message: "unknown escape sequence".to_string(),
+                            });
+                        }
+                    }
+                }
+                // a raw newline before the close: no multi-line strings.
+                Some(b'\n') | None => {
+                    return Err(QalaError::UnterminatedString {
+                        span: Span::new(open_quote, 1),
+                    });
+                }
+                // any other byte (ASCII or the lead of a multi-byte char) is
+                // literal content. decode the whole char so a multi-byte char
+                // (a non-ASCII char inside a string is fine) lands in the buffer
+                // intact and the cursor advances by the right number of bytes.
+                Some(_) => {
+                    let ch = self.src[self.pos..].chars().next().unwrap_or('\u{FFFD}');
+                    self.pos += ch.len_utf8();
+                    buf.push(ch);
+                }
             }
-            if b == b'\n' {
-                break; // no multi-line strings; fall through to the error
-            }
-            self.pos += 1;
         }
-        // hit EOF or a newline before the closing quote.
-        Err(QalaError::UnterminatedString { span: Span::new(open_quote, 1) })
     }
 
-    /// if EOF was reached with a string or interpolation still open, return the
-    /// matching unterminated error pointing at where it opened.
+    /// decode a `\u{1..6 hex}` escape. the cursor is just past the `u`; this
+    /// expects `{`, 1..=6 hex digits, then `}`, and validates the codepoint with
+    /// [`char::from_u32`] (which rejects surrogates `D800..DFFF` and values above
+    /// `10FFFF`). any malformation -- no `{`, no digits, too many digits, no `}`,
+    /// or a bad codepoint -- is [`QalaError::InvalidEscape`] whose span is the
+    /// backslash at `backslash_pos`.
+    fn scan_unicode_escape(&mut self, backslash_pos: usize) -> Result<char, QalaError> {
+        let bad = |message: &str| QalaError::InvalidEscape {
+            span: Span::new(backslash_pos, 1),
+            message: message.to_string(),
+        };
+        if self.peek() != Some(b'{') {
+            return Err(bad("expected `{` after `\\u`"));
+        }
+        self.pos += 1; // consume `{`
+        let hex_start = self.pos;
+        let mut count = 0usize;
+        while let Some(b) = self.peek() {
+            if b.is_ascii_hexdigit() && count < 6 {
+                count += 1;
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if count == 0 {
+            return Err(bad("expected 1 to 6 hex digits in `\\u{...}`"));
+        }
+        if self.peek() != Some(b'}') {
+            return Err(bad("expected `}` to close `\\u{...}`"));
+        }
+        let hex = &self.src[hex_start..self.pos];
+        self.pos += 1; // consume `}`
+        // count <= 6 hex digits fit in u32; from_str_radix only errors on an
+        // empty string here, which count == 0 already ruled out.
+        let code = u32::from_str_radix(hex, 16).map_err(|_| bad("invalid `\\u{...}` codepoint"))?;
+        char::from_u32(code).ok_or_else(|| bad("invalid Unicode codepoint in `\\u{...}`"))
+    }
+
+    /// if EOF was reached with a string or interpolation still open on the mode
+    /// stack, return the matching unterminated error pointing at where it opened.
     ///
-    /// in Task 1 a string is fully consumed (or errored) inside `scan_string_body`
-    /// before this is reached, and interpolations are not yet opened, so any mode
-    /// above the bottom `Normal` here means an unterminated form. Task 3 keeps
-    /// this contract.
+    /// a string body is always fully consumed (or errored) inside
+    /// `scan_string_body` before control returns here, so in practice this fires
+    /// for an [`Mode::Interp`] that never saw its closing `}` (`"x{y"`), reporting
+    /// at the `{`. the `StrText` arm is a defensive backstop.
     fn unterminated_at_eof(&self) -> Option<QalaError> {
         match self.mode_stack.last() {
             Some(Mode::StrText { open_quote, .. }) => {
@@ -1123,7 +1253,7 @@ mod tests {
         assert_eq!(one("1e10"), TokenKind::Float(1e10));
         assert_eq!(one("2.0e-3"), TokenKind::Float(2.0e-3));
         assert_eq!(one("1.5E+2"), TokenKind::Float(150.0));
-        assert_eq!(one("3.14159"), TokenKind::Float(3.14159));
+        assert_eq!(one("7.25"), TokenKind::Float(7.25));
         // a non-round-tripping float is NOT an error.
         assert_eq!(one("0.1"), TokenKind::Float(0.1));
         // underscores inside a float are stripped.
@@ -1250,5 +1380,338 @@ mod tests {
         let f = &toks2[2];
         assert_eq!(f.kind, TokenKind::Float(1.5e10));
         assert_eq!(f.span.slice(src2), "1.5e10");
+    }
+
+    // ---- Task 3: strings, escapes, interpolation ------------------------------
+    //
+    // these tests are written against Qala source, so a `"` in the source is `\"`
+    // in the Rust string literal and a `\` in the source is `\\`.
+
+    /// shorthand for `TokenKind::Str(s.to_string())` and friends, to keep the
+    /// expected streams readable.
+    fn s(text: &str) -> TokenKind { TokenKind::Str(text.to_string()) }
+    fn id(text: &str) -> TokenKind { TokenKind::Ident(text.to_string()) }
+
+    #[test]
+    fn interpolation_free_strings() {
+        assert_eq!(one("\"abc\""), s("abc"));
+        assert_eq!(one("\"\""), s(""));
+        assert_eq!(one("\"hello, world\""), s("hello, world"));
+        // a non-ASCII char inside a string is fine and lands in the payload.
+        assert_eq!(one("\"café\""), s("café"));
+        // the Str span covers the opening quote through the closing quote.
+        let src = "x = \"hi\"";
+        let toks = Lexer::tokenize(src).unwrap();
+        assert_eq!(toks[2].kind, s("hi"));
+        assert_eq!(toks[2].span.slice(src), "\"hi\"");
+    }
+
+    #[test]
+    fn escapes_are_decoded_into_the_payload() {
+        assert_eq!(one("\"a\\nb\""), s("a\nb"));
+        assert_eq!(one("\"\\t\""), s("\t"));
+        assert_eq!(one("\"\\r\""), s("\r"));
+        assert_eq!(one("\"\\0\""), s("\0"));
+        assert_eq!(one("\"\\\\\""), s("\\"));
+        assert_eq!(one("\"\\\"\""), s("\""));
+        assert_eq!(one("\"\\{\""), s("{"));
+        assert_eq!(one("\"\\}\""), s("}"));
+        assert_eq!(one("\"\\u{41}\""), s("A"));
+        assert_eq!(one("\"\\u{1F600}\""), s("\u{1F600}"));
+        // a mix: "line1\nline2 \u{2764}" -> "line1", newline, "line2 ", heart.
+        assert_eq!(one("\"line1\\nline2 \\u{2764}\""), s("line1\nline2 \u{2764}"));
+        // escaped braces do NOT open an interpolation.
+        assert_eq!(one("\"a \\{not interp\\} b\""), s("a {not interp} b"));
+    }
+
+    #[test]
+    fn bad_escapes_error_at_the_backslash() {
+        // "a\qb": the `\` is byte 2 (after the `"` and `a`).
+        match err("\"a\\qb\"") {
+            QalaError::InvalidEscape { span, .. } => {
+                assert_eq!(span, Span::new(2, 1), "span should be the backslash byte");
+            }
+            other => panic!("expected InvalidEscape, got {other:?}"),
+        }
+        // bad \u{...} forms: empty, out of range, surrogate, no closing brace.
+        for src in ["\"\\u{}\"", "\"\\u{110000}\"", "\"\\u{D800}\"", "\"\\u{41\"", "\"\\uABCD\""] {
+            assert!(
+                matches!(Lexer::tokenize(src), Err(QalaError::InvalidEscape { .. })),
+                "expected InvalidEscape for {src:?}"
+            );
+        }
+        // the backslash position is reported even mid-string.
+        match err("\"hello \\x world\"") {
+            QalaError::InvalidEscape { span, .. } => {
+                assert_eq!(span.slice("\"hello \\x world\""), "\\");
+            }
+            other => panic!("expected InvalidEscape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unterminated_string_errors_at_the_opening_quote() {
+        // "abc with EOF before the close.
+        match err("\"abc") {
+            QalaError::UnterminatedString { span } => {
+                assert_eq!(span, Span::new(0, 1), "span should be the opening quote");
+            }
+            other => panic!("expected UnterminatedString, got {other:?}"),
+        }
+        // a real newline before the close: no multi-line strings.
+        match err("\"abc\ndef\"") {
+            QalaError::UnterminatedString { span } => assert_eq!(span, Span::new(0, 1)),
+            other => panic!("expected UnterminatedString, got {other:?}"),
+        }
+        // the opening quote is found even when the string starts mid-source.
+        match err("let x = \"oops") {
+            QalaError::UnterminatedString { span } => {
+                assert_eq!(span.slice("let x = \"oops"), "\"");
+            }
+            other => panic!("expected UnterminatedString, got {other:?}"),
+        }
+        // an empty unterminated string `"` at EOF.
+        assert!(matches!(err("\""), QalaError::UnterminatedString { .. }));
+    }
+
+    #[test]
+    fn simple_interpolation() {
+        // "hi {name}!"
+        assert_eq!(
+            kinds("\"hi {name}!\""),
+            vec![
+                TokenKind::StrStart("hi ".to_string()),
+                TokenKind::InterpStart,
+                id("name"),
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd("!".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+        // the hello.qala interpolation: println("hello, {name}!").
+        assert_eq!(
+            kinds("println(\"hello, {name}!\")"),
+            vec![
+                id("println"),
+                TokenKind::LParen,
+                TokenKind::StrStart("hello, ".to_string()),
+                TokenKind::InterpStart,
+                id("name"),
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd("!".to_string()),
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_and_empty_fragment_interpolations() {
+        // "{a}{b}"
+        assert_eq!(
+            kinds("\"{a}{b}\""),
+            vec![
+                TokenKind::StrStart(String::new()),
+                TokenKind::InterpStart,
+                id("a"),
+                TokenKind::InterpEnd,
+                TokenKind::StrMid(String::new()),
+                TokenKind::InterpStart,
+                id("b"),
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd(String::new()),
+                TokenKind::Eof,
+            ]
+        );
+        // "a{x}b{y}c"
+        assert_eq!(
+            kinds("\"a{x}b{y}c\""),
+            vec![
+                TokenKind::StrStart("a".to_string()),
+                TokenKind::InterpStart,
+                id("x"),
+                TokenKind::InterpEnd,
+                TokenKind::StrMid("b".to_string()),
+                TokenKind::InterpStart,
+                id("y"),
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd("c".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn interpolation_with_nested_braces() {
+        // "{ {a: 1}.a }" -- the interpolation ends at the matching depth-0 `}`,
+        // not the struct literal's `}`. the inner braces appear as LBrace/RBrace.
+        assert_eq!(
+            kinds("\"{ {a: 1}.a }\""),
+            vec![
+                TokenKind::StrStart(String::new()),
+                TokenKind::InterpStart,
+                TokenKind::LBrace,
+                id("a"),
+                TokenKind::Colon,
+                TokenKind::Int(1),
+                TokenKind::RBrace,
+                TokenKind::Dot,
+                id("a"),
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd(String::new()),
+                TokenKind::Eof,
+            ]
+        );
+        // "{ if x { 1 } else { 2 } }" -- the if/else block braces are handled by
+        // depth; the interpolation closes at the final `}`.
+        assert_eq!(
+            kinds("\"{ if x { 1 } else { 2 } }\""),
+            vec![
+                TokenKind::StrStart(String::new()),
+                TokenKind::InterpStart,
+                TokenKind::If,
+                id("x"),
+                TokenKind::LBrace,
+                TokenKind::Int(1),
+                TokenKind::RBrace,
+                TokenKind::Else,
+                TokenKind::LBrace,
+                TokenKind::Int(2),
+                TokenKind::RBrace,
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd(String::new()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn interpolation_with_a_nested_string() {
+        // "{ "{inner}" }" -- a string inside an interpolation inside a string.
+        // entering the nested `"..."` makes its braces string-rules, not
+        // brace-depth-rules, so the outer interpolation still closes at the right
+        // `}`.
+        assert_eq!(
+            kinds("\"{ \"{inner}\" }\""),
+            vec![
+                TokenKind::StrStart(String::new()),
+                TokenKind::InterpStart,
+                // the nested string:
+                TokenKind::StrStart(String::new()),
+                TokenKind::InterpStart,
+                id("inner"),
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd(String::new()),
+                // back in the outer interpolation:
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd(String::new()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fibonacci_interpolation() {
+        // "fib({i}) = {fibonacci(i)}" -- `fib(` and `) = ` are literal text; the
+        // `(i)` inside `{fibonacci(i)}` is a normal call sequence (LParen/RParen
+        // do not affect brace depth, only `{`/`}` do).
+        assert_eq!(
+            kinds("\"fib({i}) = {fibonacci(i)}\""),
+            vec![
+                TokenKind::StrStart("fib(".to_string()),
+                TokenKind::InterpStart,
+                id("i"),
+                TokenKind::InterpEnd,
+                TokenKind::StrMid(") = ".to_string()),
+                TokenKind::InterpStart,
+                id("fibonacci"),
+                TokenKind::LParen,
+                id("i"),
+                TokenKind::RParen,
+                TokenKind::InterpEnd,
+                TokenKind::StrEnd(String::new()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_interpolation_errors_at_the_brace() {
+        // "x{y" -- EOF before the `}`. the `{` is byte 2.
+        match err("\"x{y") {
+            QalaError::UnterminatedInterpolation { span } => {
+                assert_eq!(span, Span::new(2, 1), "span should be the `{{` byte");
+            }
+            other => panic!("expected UnterminatedInterpolation, got {other:?}"),
+        }
+        // the `{` is found even when the string starts mid-source.
+        match err("let s = \"a{b") {
+            QalaError::UnterminatedInterpolation { span } => {
+                assert_eq!(span.slice("let s = \"a{b"), "{");
+            }
+            other => panic!("expected UnterminatedInterpolation, got {other:?}"),
+        }
+        // a nested-brace interpolation that never closes the outermost `}`.
+        assert!(matches!(
+            err("\"{ {a: 1}.a "),
+            QalaError::UnterminatedInterpolation { .. }
+        ));
+    }
+
+    #[test]
+    fn interpolation_fragment_spans_partition_the_source() {
+        // "hi {x}!" -- StrStart covers `"hi `, InterpStart the `{`, InterpEnd the
+        // `}`, StrEnd `!"`. every byte is covered exactly once.
+        let src = "\"hi {x}!\"";
+        let toks = Lexer::tokenize(src).unwrap();
+        // toks: [StrStart, InterpStart, Ident, InterpEnd, StrEnd, Eof]
+        assert_eq!(toks[0].kind, TokenKind::StrStart("hi ".to_string()));
+        assert_eq!(toks[0].span.slice(src), "\"hi ");
+        assert_eq!(toks[1].kind, TokenKind::InterpStart);
+        assert_eq!(toks[1].span.slice(src), "{");
+        assert_eq!(toks[2].kind, id("x"));
+        assert_eq!(toks[2].span.slice(src), "x");
+        assert_eq!(toks[3].kind, TokenKind::InterpEnd);
+        assert_eq!(toks[3].span.slice(src), "}");
+        assert_eq!(toks[4].kind, TokenKind::StrEnd("!".to_string()));
+        assert_eq!(toks[4].span.slice(src), "!\"");
+        assert_eq!(toks[5].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn the_six_examples_tokenize_to_eof_with_no_error() {
+        // a smoke test that the token set is complete: every bundled example
+        // lexes cleanly. the path is relative to this crate's manifest, so it
+        // works regardless of the test runner's cwd; a missing file fails loudly.
+        for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
+            let path = format!(
+                "{}/../playground/public/examples/{}.qala",
+                env!("CARGO_MANIFEST_DIR"),
+                name
+            );
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("could not read example {path}: {e}"));
+            let toks = Lexer::tokenize(&src)
+                .unwrap_or_else(|e| panic!("example {name}.qala failed to tokenize: {e:?}"));
+            assert_eq!(
+                toks.last().map(|t| &t.kind),
+                Some(&TokenKind::Eof),
+                "example {name}.qala should end in Eof"
+            );
+            assert!(toks.len() > 1, "example {name}.qala should produce real tokens");
+        }
+    }
+
+    #[test]
+    fn tokenizing_is_deterministic() {
+        // the lexer holds no global mutable state, so the same source always
+        // produces the same token vector.
+        let src = "fn main() is io {\n  let name = \"world\"\n  println(\"hello, {name}!\")\n}\n";
+        let a = Lexer::tokenize(src).unwrap();
+        let b = Lexer::tokenize(src).unwrap();
+        assert_eq!(a, b);
+        // also stable across an error case.
+        let bad = "let x = \"unterminated";
+        assert_eq!(Lexer::tokenize(bad), Lexer::tokenize(bad));
     }
 }
