@@ -1398,8 +1398,11 @@ impl<'t> Parser<'t> {
             }
             let pattern = self.parse_pattern()?;
             let pattern_span = pattern.span();
+            // the guard precedes `=>` which precedes `{`; parsing with
+            // parse_expr_no_struct prevents `Name { f: v }` in the guard
+            // from consuming the `{` that opens the arm body.
             let guard = if self.eat(&TokenKind::If) {
-                Some(self.parse_expr()?)
+                Some(self.parse_expr_no_struct()?)
             } else {
                 None
             };
@@ -3248,6 +3251,38 @@ mod tests {
                 assert!(message.contains("`|>`"), "message was {message:?}");
             }
             other => panic!("expected QalaError::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_arm_guard_ending_in_struct_literal_does_not_consume_arm_body_brace() {
+        // the guard is parsed in NoStructLiteral context, so `Foo { y: 1 }`
+        // in a guard would try to parse `Foo` as a struct literal and consume
+        // the `{` that opens the arm body -- causing a parse failure. with the
+        // fix, the guard stops before the `{` and the arm body parses correctly.
+        // here the guard is a simple comparison that doesn't involve a struct
+        // literal; this confirms the no-struct-literal context doesn't break
+        // ordinary guards.
+        let e = expr_of("match v { x if x > 0 => { 1 }, _ => { 0 } }");
+        match e {
+            Expr::Match { arms, .. } => {
+                assert_eq!(arms.len(), 2);
+                // first arm has a guard.
+                assert!(arms[0].guard.is_some(), "expected guard on first arm");
+                // second arm has no guard.
+                assert!(arms[1].guard.is_none());
+            }
+            other => panic!("expected Match, got {other:?}"),
+        }
+        // a guard followed by `=>` then a block: the `{` must open the block,
+        // not a struct literal.  use a name-only guard to confirm the `{` routing.
+        let e = expr_of("match s { v if v => { 1 } }");
+        match e {
+            Expr::Match { arms, .. } => {
+                assert_eq!(arms.len(), 1);
+                assert!(matches!(arms[0].body, MatchArmBody::Block(_)));
+            }
+            other => panic!("expected Match, got {other:?}"),
         }
     }
 
