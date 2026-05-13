@@ -880,6 +880,13 @@ impl<'t> Parser<'t> {
             TokenKind::StrStart(_) => self.parse_interpolation(),
             // match expression.
             TokenKind::Match => self.parse_match(),
+            // `self` in expression position: produces `Expr::Ident { name: "self" }`.
+            // the resolver (Phase 3) checks that it only occurs inside a method body;
+            // the parser just needs to not reject it with UnexpectedToken.
+            TokenKind::SelfKw => {
+                let span = self.advance().span;
+                Ok(Expr::Ident { name: "self".to_string(), span })
+            }
             // unary prefixes: `!`, `-`, `comptime`.
             TokenKind::Bang | TokenKind::Minus | TokenKind::Comptime => self.parse_prefix(),
             // anything else is not a valid start of an expression.
@@ -2196,6 +2203,53 @@ mod tests {
                 assert!(message.contains("self"), "message was {message:?}");
             }
             other => panic!("expected QalaError::Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_in_method_body_parses_as_ident() {
+        // `self` in expression position inside a method body must produce
+        // Expr::Ident { name: "self" } -- the same node the type checker uses.
+        // Phase 3 is responsible for rejecting `self` outside a method body.
+        let ast = parse_ok("fn Point.area(self) -> f64 is pure { self.x }");
+        match &ast[0] {
+            Item::Fn(d) => {
+                // the body's trailing value is a FieldAccess on Ident("self").
+                match d.body.value.as_deref() {
+                    Some(Expr::FieldAccess { obj, name, .. }) => {
+                        assert!(
+                            matches!(**obj, Expr::Ident { ref name, .. } if name == "self"),
+                            "expected Ident(\"self\"), got {:?}",
+                            obj
+                        );
+                        assert_eq!(name, "x");
+                    }
+                    other => panic!("expected FieldAccess on self, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_method_call_in_body_parses() {
+        // `self.foo()` without a trailing `;` is the block's trailing value,
+        // not a statement. MethodCall whose receiver is Expr::Ident { name: "self" }.
+        let ast = parse_ok("fn Point.go(self) { self.foo() }");
+        match &ast[0] {
+            Item::Fn(d) => {
+                match d.body.value.as_deref() {
+                    Some(Expr::MethodCall { receiver, name, .. }) => {
+                        assert!(
+                            matches!(**receiver, Expr::Ident { ref name, .. } if name == "self"),
+                            "expected Ident(\"self\") as receiver, got {receiver:?}"
+                        );
+                        assert_eq!(name, "foo");
+                    }
+                    other => panic!("expected MethodCall trailing value, got {other:?}"),
+                }
+            }
+            other => panic!("expected Fn, got {other:?}"),
         }
     }
 
