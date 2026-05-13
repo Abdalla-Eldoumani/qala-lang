@@ -1,0 +1,5 @@
+[toolchain]
+# pin to rustup's stable toolchain so cargo, rustc, and rustdoc all come from
+# the same place. without this, a stray standalone rust install earlier in PATH
+# can shadow rustdoc and break `cargo test` doctests with E0514.
+channel = "stable"
