@@ -322,6 +322,16 @@ mod tests {
         Diagnostic::from(errors[0].clone())
     }
 
+    /// build a Diagnostic for the first warning produced by a small
+    /// program. the unused_var snapshot case uses this.
+    fn warn_diag_for(src: &str) -> Diagnostic {
+        let tokens = lexer::Lexer::tokenize(src).expect("lex");
+        let ast = parser::Parser::parse(&tokens).expect("parse");
+        let (_, _errors, warnings) = typechecker::check_program(&ast, src);
+        assert!(!warnings.is_empty(), "expected a warning for: {src}");
+        Diagnostic::from(&warnings[0])
+    }
+
     #[test]
     fn diagnostic_builds_and_round_trips_through_debug_clone() {
         let d = Diagnostic {
@@ -834,5 +844,55 @@ mod tests {
         assert!(out.ends_with("   |\n"), "unexpected tail: {out:?}");
         assert!(!out.contains("= note:"), "no notes expected: {out:?}");
         assert!(!out.contains("= hint:"), "no hints expected: {out:?}");
+    }
+
+    #[test]
+    fn renderer_is_byte_deterministic_against_snapshot() {
+        // cross-process determinism: this test re-runs the renderer
+        // over four fixed bad programs and asserts byte-equality
+        // against the frozen snapshot in
+        // `compiler/tests/snapshots/diagnostics_basic.txt`. if the
+        // renderer's format ever drifts -- a column-width change, an
+        // emoji, a stray colour code, a trailing space -- this test
+        // fails and the snapshot must be deliberately regenerated.
+        //
+        // the four cases lock the four diagnostic shapes the
+        // playground will hit hardest: a type-mismatch, a
+        // non-exhaustive match, an effect violation, and an
+        // unused_var warning. they cover error vs warning headers,
+        // single-line vs multi-token underlines, the `add an arm
+        // for:` note, and the `is pure` hint.
+        let cases: [String; 4] = [
+            diag_for("fn f() -> i64 { return \"x\" }").render("fn f() -> i64 { return \"x\" }"),
+            {
+                let src = "enum Shape { Circle(i64), Rect(i64), Triangle(i64) }\nfn f(s: Shape) -> i64 { match s { Circle(r) => r, Rect(w) => w } }";
+                diag_for(src).render(src)
+            },
+            diag_for("fn f() is pure { println(\"hi\") }")
+                .render("fn f() is pure { println(\"hi\") }"),
+            {
+                let src = "fn main() is io {\n  let x = 1\n  println(\"hi\")\n}";
+                warn_diag_for(src).render(src)
+            },
+        ];
+        let combined = cases.join("\n===\n");
+
+        let snapshot_path = format!(
+            "{}/tests/snapshots/diagnostics_basic.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        // normalize CRLF -> LF on read: on Windows with core.autocrlf
+        // true, a checked-out snapshot file has CRLF line endings even
+        // though the in-repo blob is LF; the renderer always emits LF;
+        // stripping carriage returns makes the comparison
+        // platform-stable. the snapshot blob itself stays LF.
+        let snapshot = std::fs::read_to_string(&snapshot_path)
+            .unwrap_or_else(|e| panic!("read {snapshot_path}: {e}"))
+            .replace("\r\n", "\n");
+
+        assert_eq!(
+            combined, snapshot,
+            "renderer output drifted from snapshot at {snapshot_path}"
+        );
     }
 }
