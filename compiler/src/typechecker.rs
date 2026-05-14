@@ -292,6 +292,10 @@ struct Checker<'src> {
     /// recursive-depth counter for [`Checker::infer_expr`]. mirrors the
     /// parser's [`MAX_DEPTH`] guard.
     depth: u32,
+    /// per-function record (intrinsic body effect, called fns, candidate
+    /// call sites). populated during pass 2's `check_fn_decl`; consumed by
+    /// pass 3's `resolve_function_effects` in task 3.
+    body_records: HashMap<FnKey, BodyEffectRecord>,
 }
 
 impl<'src> Checker<'src> {
@@ -311,6 +315,7 @@ impl<'src> Checker<'src> {
             scopes: Vec::new(),
             fn_ctx: None,
             depth: 0,
+            body_records: HashMap::new(),
         }
     }
 }
@@ -842,57 +847,20 @@ fn tarjan_scc(nodes: &[String], adj: &HashMap<String, Vec<String>>) -> Vec<Vec<S
     sccs
 }
 
-// ---- pass 2 placeholder ----------------------------------------------------
+// ---- pass 2: bidirectional type checking -----------------------------------
 
 impl<'src> Checker<'src> {
-    /// translate an untyped item into a typed one.
+    /// translate an untyped item into a typed one, fully checking bodies.
     ///
-    /// task 1 produces minimal typed shells: every fn returns Void with
-    /// pure effect, every struct / enum / interface forwards its resolved
-    /// fields. tasks 2-3 replace this with the real bidirectional pass that
-    /// walks bodies and types every expression.
+    /// for an `Item::Fn`, this opens a fresh scope, binds each parameter as
+    /// a `LocalInfo`, checks the body against the declared return type,
+    /// closes the scope (firing any per-scope warnings), and constructs the
+    /// `TypedFnDecl` with a placeholder effect that pass 3 finalises.
+    /// for the data-only item kinds (struct / enum / interface), the typed
+    /// shape is constructed directly from the resolved symbol-table entries.
     fn check_item(&mut self, item: &ast::Item) -> typed_ast::TypedItem {
         match item {
-            ast::Item::Fn(d) => typed_ast::TypedItem::Fn(typed_ast::TypedFnDecl {
-                type_name: d.type_name.clone(),
-                name: d.name.clone(),
-                params: d
-                    .params
-                    .iter()
-                    .map(|p| typed_ast::TypedParam {
-                        is_self: p.is_self,
-                        name: p.name.clone(),
-                        ty: if p.is_self {
-                            match &d.type_name {
-                                Some(t) => QalaType::Named(Symbol(t.clone())),
-                                None => QalaType::Unknown,
-                            }
-                        } else if let Some(t) = &p.ty {
-                            // re-resolve (cheap; doesn't error twice because
-                            // collect_fn already populated the symbol table
-                            // and any UnknownType errors fired during collect).
-                            resolve_type_silent(t, &self.symbols)
-                        } else {
-                            QalaType::Unknown
-                        },
-                        default: None,
-                        span: p.span,
-                    })
-                    .collect(),
-                ret_ty: d
-                    .ret_ty
-                    .as_ref()
-                    .map(|t| resolve_type_silent(t, &self.symbols))
-                    .unwrap_or(QalaType::Void),
-                effect: d.effect.as_ref().map(effect_set_from_ast).unwrap_or(EffectSet::pure()),
-                body: typed_ast::TypedBlock {
-                    stmts: vec![],
-                    value: None,
-                    ty: QalaType::Void,
-                    span: d.body.span,
-                },
-                span: d.span,
-            }),
+            ast::Item::Fn(d) => self.check_fn_decl(d),
             ast::Item::Struct(d) => typed_ast::TypedItem::Struct(typed_ast::TypedStructDecl {
                 name: d.name.clone(),
                 fields: d
@@ -963,13 +931,1880 @@ impl<'src> Checker<'src> {
         }
     }
 
+    /// check a single fn declaration: open a scope, bind params, walk the
+    /// body, close the scope, build the `TypedFnDecl`.
+    fn check_fn_decl(&mut self, d: &ast::FnDecl) -> typed_ast::TypedItem {
+        let ret_ty = d
+            .ret_ty
+            .as_ref()
+            .map(|t| resolve_type_silent(t, &self.symbols))
+            .unwrap_or(QalaType::Void);
+        let annotated_effect = d.effect.as_ref().map(effect_set_from_ast);
+        // typed-params: resolve each type and bind it as a LocalInfo with
+        // is_param=true so the `unused_var` rule never fires on a param.
+        let mut typed_params: Vec<typed_ast::TypedParam> = Vec::with_capacity(d.params.len());
+        let mut param_locals: Vec<(String, LocalInfo)> = Vec::with_capacity(d.params.len());
+        for p in &d.params {
+            let ty = if p.is_self {
+                match &d.type_name {
+                    Some(t) => QalaType::Named(Symbol(t.clone())),
+                    None => QalaType::Unknown,
+                }
+            } else if let Some(t) = &p.ty {
+                resolve_type_silent(t, &self.symbols)
+            } else {
+                QalaType::Unknown
+            };
+            typed_params.push(typed_ast::TypedParam {
+                is_self: p.is_self,
+                name: p.name.clone(),
+                ty: ty.clone(),
+                default: None,
+                span: p.span,
+            });
+            param_locals.push((
+                p.name.clone(),
+                LocalInfo {
+                    ty,
+                    span: p.span,
+                    is_mut: false,
+                    used: false,
+                    is_param: true,
+                },
+            ));
+        }
+        // open the function-body scope, bind parameters.
+        self.fn_ctx = Some(FnCtx {
+            name: d.name.clone(),
+            type_name: d.type_name.clone(),
+            ret_ty: ret_ty.clone(),
+            annotated_effect,
+            body_intrinsic: EffectSet::pure(),
+            called_fns: Vec::new(),
+            callsites_to_check: Vec::new(),
+        });
+        let mut scope: HashMap<String, LocalInfo> = HashMap::new();
+        for (name, info) in param_locals {
+            scope.insert(name, info);
+        }
+        self.scopes.push(scope);
+
+        // check the body against the declared return type.
+        let body = self.check_block(&d.body, Some(&ret_ty));
+
+        // missing-return check: a function declared to return a non-Void type
+        // must produce a value (a trailing block expression or a return
+        // statement on every path). v1's check is simple: if ret_ty != Void
+        // and the body's trailing value is None AND the body does not end
+        // with a Return statement, emit MissingReturn.
+        if !ret_ty.types_match(&QalaType::Void) && body.value.is_none() {
+            let ends_in_return = d.body.stmts.last().map(|s| matches!(s, ast::Stmt::Return { .. })).unwrap_or(false);
+            // also accept an if-with-returns or a while-with-returns -- v1
+            // does not do dataflow, so any non-Return tail with a Void
+            // trailing value triggers the warning. picking up the trailing
+            // brace as the span: the closing token is the body's span.end.
+            if !ends_in_return {
+                let span = Span::new(
+                    d.body.span.end().saturating_sub(1),
+                    1,
+                );
+                self.errors.push(QalaError::MissingReturn {
+                    span,
+                    fn_name: d.name.clone(),
+                    expected: ret_ty.display(),
+                });
+            }
+        }
+
+        // pop the function scope; fire any unused_var warnings.
+        if let Some(scope) = self.scopes.pop() {
+            for (name, info) in scope {
+                if !info.is_param
+                    && !info.used
+                    && !name.starts_with('_')
+                {
+                    let w = QalaWarning {
+                        category: "unused_var".to_string(),
+                        message: format!("unused variable `{name}`"),
+                        span: info.span,
+                        note: None,
+                    };
+                    self.emit_warning(w);
+                }
+            }
+        }
+
+        // pull the FnCtx; pass 3 will read body_intrinsic / called_fns /
+        // callsites_to_check to settle effect inference.
+        let ctx = self.fn_ctx.take();
+        if let Some(ctx) = ctx {
+            // record the per-fn body-effect record for pass 3.
+            let key = FnKey {
+                type_name: d.type_name.clone(),
+                name: d.name.clone(),
+            };
+            self.body_records.insert(
+                key,
+                BodyEffectRecord {
+                    intrinsic: ctx.body_intrinsic,
+                    called: ctx.called_fns,
+                    callsites_to_check: ctx.callsites_to_check,
+                },
+            );
+        }
+
+        typed_ast::TypedItem::Fn(typed_ast::TypedFnDecl {
+            type_name: d.type_name.clone(),
+            name: d.name.clone(),
+            params: typed_params,
+            ret_ty,
+            effect: annotated_effect.unwrap_or(EffectSet::pure()),
+            body,
+            span: d.span,
+        })
+    }
+
+    /// check a block: open a scope, walk each statement, then either check
+    /// or infer the trailing value. fire unreachable-code warnings inside
+    /// the loop; fire unused-var warnings when the scope is popped.
+    fn check_block(&mut self, block: &ast::Block, expected: Option<&QalaType>) -> typed_ast::TypedBlock {
+        // a top-level fn body's scope is already on the stack (with params);
+        // for any nested block we push a fresh scope so name resolution and
+        // unused_var fire correctly.
+        let pushed_scope = !self.scopes.is_empty();
+        if pushed_scope {
+            self.scopes.push(HashMap::new());
+        }
+        let mut typed_stmts: Vec<typed_ast::TypedStmt> = Vec::with_capacity(block.stmts.len());
+        let mut terminator: Option<Span> = None;
+        let mut warned_unreachable = false;
+        for stmt in &block.stmts {
+            if terminator.is_some() && !warned_unreachable {
+                let w = QalaWarning {
+                    category: "unreachable_code".to_string(),
+                    message: "unreachable statement after `return`, `break`, or `continue`"
+                        .to_string(),
+                    span: stmt.span(),
+                    note: None,
+                };
+                self.emit_warning(w);
+                warned_unreachable = true;
+                // still walk the stmt so types resolve; the warning fires
+                // exactly once per block.
+            }
+            let typed_stmt = self.check_stmt(stmt);
+            let is_terminator = matches!(
+                stmt,
+                ast::Stmt::Return { .. } | ast::Stmt::Break { .. } | ast::Stmt::Continue { .. }
+            );
+            if is_terminator && terminator.is_none() {
+                terminator = Some(stmt.span());
+            }
+            typed_stmts.push(typed_stmt);
+        }
+        let (typed_value, value_ty) = match &block.value {
+            Some(v) => {
+                let typed = match expected {
+                    Some(ty) => self.check_expr(v, ty),
+                    None => self.infer_expr(v),
+                };
+                let ty = typed.ty().clone();
+                (Some(Box::new(typed)), ty)
+            }
+            None => (None, QalaType::Void),
+        };
+        // pop the nested scope, fire unused_var.
+        if pushed_scope && let Some(scope) = self.scopes.pop() {
+            for (name, info) in scope {
+                if !info.is_param
+                    && !info.used
+                    && !name.starts_with('_')
+                {
+                    let w = QalaWarning {
+                        category: "unused_var".to_string(),
+                        message: format!("unused variable `{name}`"),
+                        span: info.span,
+                        note: None,
+                    };
+                    self.emit_warning(w);
+                }
+            }
+        }
+        typed_ast::TypedBlock {
+            stmts: typed_stmts,
+            value: typed_value,
+            ty: value_ty,
+            span: block.span,
+        }
+    }
+
+    /// check a single statement.
+    fn check_stmt(&mut self, stmt: &ast::Stmt) -> typed_ast::TypedStmt {
+        match stmt {
+            ast::Stmt::Let { is_mut, name, ty, init, span } => {
+                let (typed_init, decl_ty) = match ty {
+                    Some(t) => {
+                        let expected = resolve_type_silent(t, &self.symbols);
+                        let typed_init = self.check_expr(init, &expected);
+                        // redundant_annotation: fire iff the inferred type
+                        // strictly equals the declared type (not via the
+                        // Unknown wildcard, which would let typos slip).
+                        if types_strictly_equal(typed_init.ty(), &expected) {
+                            let w = QalaWarning {
+                                category: "redundant_annotation".to_string(),
+                                message: format!(
+                                    "redundant type annotation: `{}` matches the inferred type",
+                                    expected.display()
+                                ),
+                                span: t.span(),
+                                note: None,
+                            };
+                            self.emit_warning(w);
+                        }
+                        (typed_init, expected)
+                    }
+                    None => {
+                        let typed_init = self.infer_expr(init);
+                        let ty = typed_init.ty().clone();
+                        (typed_init, ty)
+                    }
+                };
+                // shadowed_var: if any outer scope (not the topmost) has a
+                // binding with the same name, warn.
+                let topmost = self.scopes.len().saturating_sub(1);
+                let mut prior_span: Option<Span> = None;
+                for (idx, scope) in self.scopes.iter().enumerate() {
+                    if idx == topmost {
+                        break;
+                    }
+                    if let Some(prior) = scope.get(name) {
+                        prior_span = Some(prior.span);
+                        break;
+                    }
+                }
+                if let Some(prior) = prior_span {
+                    let (l, c) = self.line_index.location(self.src, prior.start as usize);
+                    let w = QalaWarning {
+                        category: "shadowed_var".to_string(),
+                        message: format!("`{name}` shadows a binding from an outer scope"),
+                        span: *span,
+                        note: Some(format!("the prior binding is at line {l}:{c}")),
+                    };
+                    self.emit_warning(w);
+                }
+                // bind in the topmost scope.
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.insert(
+                        name.clone(),
+                        LocalInfo {
+                            ty: decl_ty.clone(),
+                            span: *span,
+                            is_mut: *is_mut,
+                            used: false,
+                            is_param: false,
+                        },
+                    );
+                }
+                typed_ast::TypedStmt::Let {
+                    is_mut: *is_mut,
+                    name: name.clone(),
+                    ty: decl_ty,
+                    init: typed_init,
+                    span: *span,
+                }
+            }
+            ast::Stmt::If { cond, then_block, else_branch, span } => {
+                let typed_cond = self.check_expr(cond, &QalaType::Bool);
+                let typed_then = self.check_block(then_block, None);
+                let typed_else = match else_branch {
+                    Some(ast::ElseBranch::Block(b)) => {
+                        Some(typed_ast::TypedElseBranch::Block(self.check_block(b, None)))
+                    }
+                    Some(ast::ElseBranch::If(b)) => {
+                        let inner = self.check_stmt(b);
+                        Some(typed_ast::TypedElseBranch::If(Box::new(inner)))
+                    }
+                    None => None,
+                };
+                typed_ast::TypedStmt::If {
+                    cond: typed_cond,
+                    then_block: typed_then,
+                    else_branch: typed_else,
+                    span: *span,
+                }
+            }
+            ast::Stmt::While { cond, body, span } => {
+                let typed_cond = self.check_expr(cond, &QalaType::Bool);
+                let typed_body = self.check_block(body, None);
+                typed_ast::TypedStmt::While {
+                    cond: typed_cond,
+                    body: typed_body,
+                    span: *span,
+                }
+            }
+            ast::Stmt::For { var, iter, body, span } => {
+                let typed_iter = self.infer_expr(iter);
+                // element type: an Array's elem, or i64 for a Range
+                // (Range expressions resolve their ty to Array(elem=I64, None)
+                // per the convention chosen below in infer_expr).
+                let var_ty = match typed_iter.ty() {
+                    QalaType::Array(elem, _) => (**elem).clone(),
+                    QalaType::Unknown => QalaType::Unknown,
+                    _ => {
+                        self.errors.push(QalaError::Type {
+                            span: iter.span(),
+                            message: "for loop expects an array or range".to_string(),
+                        });
+                        QalaType::Unknown
+                    }
+                };
+                // open a one-binding scope holding the loop variable.
+                let mut scope: HashMap<String, LocalInfo> = HashMap::new();
+                scope.insert(
+                    var.clone(),
+                    LocalInfo {
+                        ty: var_ty.clone(),
+                        span: *span,
+                        is_mut: false,
+                        // the loop variable is treated like a parameter
+                        // (open question 4 style) -- never fires unused_var.
+                        used: false,
+                        is_param: true,
+                    },
+                );
+                self.scopes.push(scope);
+                let typed_body = self.check_block(body, None);
+                self.scopes.pop();
+                typed_ast::TypedStmt::For {
+                    var: var.clone(),
+                    var_ty,
+                    iter: typed_iter,
+                    body: typed_body,
+                    span: *span,
+                }
+            }
+            ast::Stmt::Return { value, span } => {
+                let typed_value = match value {
+                    Some(v) => {
+                        let expected = self.fn_ctx.as_ref().map(|c| c.ret_ty.clone());
+                        let typed = match expected {
+                            Some(ty) => self.check_expr(v, &ty),
+                            None => self.infer_expr(v),
+                        };
+                        Some(typed)
+                    }
+                    None => {
+                        // bare `return` is legal iff ret_ty is Void.
+                        if let Some(ctx) = &self.fn_ctx
+                            && !ctx.ret_ty.types_match(&QalaType::Void)
+                        {
+                            self.errors.push(QalaError::TypeMismatch {
+                                span: *span,
+                                expected: ctx.ret_ty.display(),
+                                found: "void".to_string(),
+                            });
+                        }
+                        None
+                    }
+                };
+                typed_ast::TypedStmt::Return { value: typed_value, span: *span }
+            }
+            ast::Stmt::Break { span } => typed_ast::TypedStmt::Break { span: *span },
+            ast::Stmt::Continue { span } => typed_ast::TypedStmt::Continue { span: *span },
+            ast::Stmt::Defer { expr, span } => {
+                let typed_expr = self.infer_expr(expr);
+                typed_ast::TypedStmt::Defer { expr: typed_expr, span: *span }
+            }
+            ast::Stmt::Expr { expr, span } => {
+                let typed_expr = self.infer_expr(expr);
+                typed_ast::TypedStmt::Expr { expr: typed_expr, span: *span }
+            }
+        }
+    }
+
+    /// look a name up in the active scope chain (top -> outer); on a hit,
+    /// mark the LocalInfo as used and return its type. on a miss in scopes,
+    /// fall back to the user fn table; on a miss there, fall back to the
+    /// stdlib signatures table. returns `None` if nothing matched.
+    fn lookup(&mut self, name: &str) -> Option<QalaType> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.get_mut(name) {
+                info.used = true;
+                return Some(info.ty.clone());
+            }
+        }
+        // user-defined free function?
+        let key = FnKey { type_name: None, name: name.to_string() };
+        if let Some(info) = self.symbols.fns.get(&key) {
+            let params: Vec<QalaType> = info.params.iter().map(|(_, ty, _)| ty.clone()).collect();
+            return Some(QalaType::Function {
+                params,
+                returns: Box::new(info.ret_ty.clone()),
+            });
+        }
+        // stdlib?
+        let stdlib = stdlib_signatures();
+        if let Some(entry) = stdlib.iter().find(|e| e.type_name.is_none() && e.name == name) {
+            return Some(QalaType::Function {
+                params: entry.params.clone(),
+                returns: Box::new(entry.ret_ty.clone()),
+            });
+        }
+        None
+    }
+
+    /// infer the type of an expression, producing a typed node.
+    ///
+    /// every variant of `ast::Expr` is dispatched; type errors emit a
+    /// `QalaError` and the result carries `QalaType::Unknown` so subsequent
+    /// `types_match` calls don't cascade. recursion is capped at
+    /// [`MAX_DEPTH`] -- past the cap, a `QalaError::Type` is emitted and a
+    /// poison-typed `Int` placeholder returned so the walk unwinds cleanly.
+    fn infer_expr(&mut self, expr: &ast::Expr) -> typed_ast::TypedExpr {
+        self.depth = self.depth.saturating_add(1);
+        if self.depth > MAX_DEPTH {
+            self.errors.push(QalaError::Type {
+                span: expr.span(),
+                message: "expression nests too deeply".to_string(),
+            });
+            self.depth = self.depth.saturating_sub(1);
+            return typed_ast::TypedExpr::Int {
+                value: 0,
+                ty: QalaType::Unknown,
+                span: expr.span(),
+            };
+        }
+        let out = self.infer_expr_inner(expr);
+        self.depth = self.depth.saturating_sub(1);
+        out
+    }
+
+    /// the body of [`Self::infer_expr`]; split so the depth guard is exactly
+    /// once at the top.
+    fn infer_expr_inner(&mut self, expr: &ast::Expr) -> typed_ast::TypedExpr {
+        match expr {
+            ast::Expr::Int { value, span } => typed_ast::TypedExpr::Int {
+                value: *value,
+                ty: QalaType::I64,
+                span: *span,
+            },
+            ast::Expr::Float { value, span } => typed_ast::TypedExpr::Float {
+                value: *value,
+                ty: QalaType::F64,
+                span: *span,
+            },
+            ast::Expr::Byte { value, span } => typed_ast::TypedExpr::Byte {
+                value: *value,
+                ty: QalaType::Byte,
+                span: *span,
+            },
+            ast::Expr::Str { value, span } => typed_ast::TypedExpr::Str {
+                value: value.clone(),
+                ty: QalaType::Str,
+                span: *span,
+            },
+            ast::Expr::Bool { value, span } => typed_ast::TypedExpr::Bool {
+                value: *value,
+                ty: QalaType::Bool,
+                span: *span,
+            },
+            ast::Expr::Ident { name, span } => {
+                // Some/None/Ok/Err names that appear bare (no call) are
+                // also legal -- they look like idents to the parser. handle
+                // None/Triangle-like constructors specially: lookup misses
+                // are an UndefinedName unless the name is a known
+                // zero-arg constructor.
+                if let Some(ty) = self.lookup(name) {
+                    return typed_ast::TypedExpr::Ident {
+                        name: name.clone(),
+                        ty,
+                        span: *span,
+                    };
+                }
+                // is this a zero-data enum variant from any known enum?
+                let mut variant_match: Option<String> = None;
+                for (enum_name, info) in &self.symbols.enums {
+                    if info.variants.iter().any(|(vn, fields)| vn == name && fields.is_empty()) {
+                        variant_match = Some(enum_name.clone());
+                        break;
+                    }
+                }
+                if let Some(enum_name) = variant_match {
+                    return typed_ast::TypedExpr::Ident {
+                        name: name.clone(),
+                        ty: QalaType::Named(Symbol(enum_name)),
+                        span: *span,
+                    };
+                }
+                self.errors.push(QalaError::UndefinedName {
+                    span: *span,
+                    name: name.clone(),
+                });
+                typed_ast::TypedExpr::Ident {
+                    name: name.clone(),
+                    ty: QalaType::Unknown,
+                    span: *span,
+                }
+            }
+            ast::Expr::Paren { inner, span } => {
+                let typed_inner = self.infer_expr(inner);
+                let ty = typed_inner.ty().clone();
+                typed_ast::TypedExpr::Paren {
+                    inner: Box::new(typed_inner),
+                    ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Tuple { elems, span } => {
+                let typed_elems: Vec<typed_ast::TypedExpr> = elems
+                    .iter()
+                    .map(|e| self.infer_expr(e))
+                    .collect();
+                let ty = QalaType::Tuple(typed_elems.iter().map(|e| e.ty().clone()).collect());
+                typed_ast::TypedExpr::Tuple { elems: typed_elems, ty, span: *span }
+            }
+            ast::Expr::ArrayLit { elems, span } => {
+                if elems.is_empty() {
+                    self.errors.push(QalaError::Type {
+                        span: *span,
+                        message: "cannot infer element type of empty array".to_string(),
+                    });
+                    return typed_ast::TypedExpr::ArrayLit {
+                        elems: Vec::new(),
+                        ty: QalaType::Array(Box::new(QalaType::Unknown), Some(0)),
+                        span: *span,
+                    };
+                }
+                let first = self.infer_expr(&elems[0]);
+                let elem_ty = first.ty().clone();
+                let mut typed_elems = vec![first];
+                for e in &elems[1..] {
+                    let typed = self.check_expr(e, &elem_ty);
+                    typed_elems.push(typed);
+                }
+                let len = typed_elems.len();
+                typed_ast::TypedExpr::ArrayLit {
+                    elems: typed_elems,
+                    ty: QalaType::Array(Box::new(elem_ty), Some(len)),
+                    span: *span,
+                }
+            }
+            ast::Expr::ArrayRepeat { value, count, span } => {
+                let typed_value = self.infer_expr(value);
+                let typed_count = self.check_expr(count, &QalaType::I64);
+                let elem_ty = typed_value.ty().clone();
+                typed_ast::TypedExpr::ArrayRepeat {
+                    value: Box::new(typed_value),
+                    count: Box::new(typed_count),
+                    ty: QalaType::Array(Box::new(elem_ty), None),
+                    span: *span,
+                }
+            }
+            ast::Expr::StructLit { name, fields, span } => {
+                // check_struct_lit handles the field-set comparison.
+                self.check_struct_lit(name, fields, *span)
+            }
+            ast::Expr::FieldAccess { obj, name, span } => {
+                let typed_obj = self.infer_expr(obj);
+                let obj_ty = typed_obj.ty().clone();
+                let field_ty = match &obj_ty {
+                    QalaType::Named(Symbol(s)) => {
+                        if let Some(info) = self.symbols.structs.get(s) {
+                            match info.fields.iter().find(|(fn_, _)| fn_ == name) {
+                                Some((_, t)) => t.clone(),
+                                None => {
+                                    self.errors.push(QalaError::Type {
+                                        span: *span,
+                                        message: format!(
+                                            "no field `{name}` on type `{}`",
+                                            obj_ty.display()
+                                        ),
+                                    });
+                                    QalaType::Unknown
+                                }
+                            }
+                        } else {
+                            self.errors.push(QalaError::Type {
+                                span: *span,
+                                message: format!("no field `{name}` on type `{}`", obj_ty.display()),
+                            });
+                            QalaType::Unknown
+                        }
+                    }
+                    QalaType::Unknown => QalaType::Unknown,
+                    _ => {
+                        self.errors.push(QalaError::Type {
+                            span: *span,
+                            message: format!("no field `{name}` on type `{}`", obj_ty.display()),
+                        });
+                        QalaType::Unknown
+                    }
+                };
+                typed_ast::TypedExpr::FieldAccess {
+                    obj: Box::new(typed_obj),
+                    name: name.clone(),
+                    ty: field_ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::MethodCall { receiver, name, args, span } => {
+                self.check_method_call(receiver, name, args, *span)
+            }
+            ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
+            ast::Expr::Index { obj, index, span } => {
+                let typed_obj = self.infer_expr(obj);
+                let typed_index = self.check_expr(index, &QalaType::I64);
+                let elem_ty = match typed_obj.ty() {
+                    QalaType::Array(elem, _) => (**elem).clone(),
+                    QalaType::Unknown => QalaType::Unknown,
+                    other => {
+                        self.errors.push(QalaError::Type {
+                            span: *span,
+                            message: format!("cannot index `{}`", other.display()),
+                        });
+                        QalaType::Unknown
+                    }
+                };
+                typed_ast::TypedExpr::Index {
+                    obj: Box::new(typed_obj),
+                    index: Box::new(typed_index),
+                    ty: elem_ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Try { expr: inner, span } => {
+                let typed_inner = self.infer_expr(inner);
+                let (success_ty, ok_for_fn) = match typed_inner.ty() {
+                    QalaType::Result(ok, _) => ((**ok).clone(), true),
+                    QalaType::Option(t) => ((**t).clone(), true),
+                    QalaType::Unknown => (QalaType::Unknown, true),
+                    _ => {
+                        self.errors.push(QalaError::Type {
+                            span: *span,
+                            message: format!(
+                                "`?` operand must be Result or Option, found `{}`",
+                                typed_inner.ty().display()
+                            ),
+                        });
+                        (QalaType::Unknown, false)
+                    }
+                };
+                // also require the enclosing function's ret_ty to be a
+                // Result/Option. emit one error per the locked policy.
+                if ok_for_fn && let Some(ctx) = &self.fn_ctx {
+                    let ok = matches!(
+                        &ctx.ret_ty,
+                        QalaType::Result(_, _) | QalaType::Option(_) | QalaType::Unknown
+                    );
+                    if !ok {
+                        self.errors.push(QalaError::RedundantQuestionOperator {
+                            span: *span,
+                            message: format!(
+                                "`?` outside a Result-returning or Option-returning function (return type is `{}`); change the return type to `Result<_, _>` or `Option<_>`",
+                                ctx.ret_ty.display()
+                            ),
+                        });
+                    }
+                }
+                typed_ast::TypedExpr::Try {
+                    expr: Box::new(typed_inner),
+                    ty: success_ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Unary { op, operand, span } => {
+                use ast::UnaryOp;
+                let typed_operand = self.infer_expr(operand);
+                let op_ty = typed_operand.ty().clone();
+                let ty = match op {
+                    UnaryOp::Not => {
+                        if !op_ty.types_match(&QalaType::Bool) {
+                            self.errors.push(QalaError::TypeMismatch {
+                                span: operand.span(),
+                                expected: "bool".to_string(),
+                                found: op_ty.display(),
+                            });
+                        }
+                        QalaType::Bool
+                    }
+                    UnaryOp::Neg => {
+                        if op_ty.types_match(&QalaType::I64) {
+                            QalaType::I64
+                        } else if op_ty.types_match(&QalaType::F64) {
+                            QalaType::F64
+                        } else if matches!(op_ty, QalaType::Unknown) {
+                            QalaType::Unknown
+                        } else {
+                            self.errors.push(QalaError::TypeMismatch {
+                                span: operand.span(),
+                                expected: "i64 or f64".to_string(),
+                                found: op_ty.display(),
+                            });
+                            QalaType::Unknown
+                        }
+                    }
+                };
+                typed_ast::TypedExpr::Unary {
+                    op: op.clone(),
+                    operand: Box::new(typed_operand),
+                    ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Binary { op, lhs, rhs, span } => self.check_binary(op, lhs, rhs, *span),
+            ast::Expr::Range { start, end, inclusive, span } => {
+                let typed_start = start.as_ref().map(|e| self.check_expr(e, &QalaType::I64));
+                let typed_end = end.as_ref().map(|e| self.check_expr(e, &QalaType::I64));
+                // ranges iterate as `[i64]` so for-loops bind the element to i64.
+                typed_ast::TypedExpr::Range {
+                    start: typed_start.map(Box::new),
+                    end: typed_end.map(Box::new),
+                    inclusive: *inclusive,
+                    ty: QalaType::Array(Box::new(QalaType::I64), None),
+                    span: *span,
+                }
+            }
+            ast::Expr::Pipeline { lhs, call, span } => {
+                // type as if the lhs were prepended to the call's arg list.
+                // implementation: infer lhs, then build a virtual call AST
+                // node and recurse. but we want to keep the typed Pipeline
+                // node faithful, so we manually re-implement the lookup.
+                let typed_lhs = self.infer_expr(lhs);
+                let lhs_ty = typed_lhs.ty().clone();
+                // resolve the call target: either Call{callee: Ident, args}
+                // or Ident (zero-extra-args).
+                let (typed_call, result_ty) = self.check_pipeline_call(call, &lhs_ty);
+                typed_ast::TypedExpr::Pipeline {
+                    lhs: Box::new(typed_lhs),
+                    call: Box::new(typed_call),
+                    ty: result_ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Comptime { body, span } => {
+                let typed_body = self.infer_expr(body);
+                let ty = typed_body.ty().clone();
+                typed_ast::TypedExpr::Comptime {
+                    body: Box::new(typed_body),
+                    ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Block { block, span } => {
+                let typed_block = self.check_block(block, None);
+                let ty = typed_block.ty.clone();
+                typed_ast::TypedExpr::Block {
+                    block: typed_block,
+                    ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Match { scrutinee, arms, span } => {
+                self.check_match(scrutinee, arms, *span)
+            }
+            ast::Expr::OrElse { expr: e, fallback, span } => {
+                let typed_e = self.infer_expr(e);
+                let success_ty = match typed_e.ty() {
+                    QalaType::Result(ok, _) => (**ok).clone(),
+                    QalaType::Option(t) => (**t).clone(),
+                    QalaType::Unknown => QalaType::Unknown,
+                    other => {
+                        self.errors.push(QalaError::Type {
+                            span: e.span(),
+                            message: format!(
+                                "`or` left operand must be Result or Option, found `{}`",
+                                other.display()
+                            ),
+                        });
+                        QalaType::Unknown
+                    }
+                };
+                let typed_fallback = self.check_expr(fallback, &success_ty);
+                typed_ast::TypedExpr::OrElse {
+                    expr: Box::new(typed_e),
+                    fallback: Box::new(typed_fallback),
+                    ty: success_ty,
+                    span: *span,
+                }
+            }
+            ast::Expr::Interpolation { parts, span } => {
+                let typed_parts: Vec<typed_ast::TypedInterpPart> = parts
+                    .iter()
+                    .map(|p| match p {
+                        ast::InterpPart::Literal(s) => typed_ast::TypedInterpPart::Literal(s.clone()),
+                        ast::InterpPart::Expr(e) => {
+                            typed_ast::TypedInterpPart::Expr(self.infer_expr(e))
+                        }
+                    })
+                    .collect();
+                typed_ast::TypedExpr::Interpolation {
+                    parts: typed_parts,
+                    ty: QalaType::Str,
+                    span: *span,
+                }
+            }
+        }
+    }
+
+    /// check an expression against an expected type, emitting `TypeMismatch`
+    /// when they disagree. unknown-poison is a wildcard, so a chain of
+    /// expressions after the first error does not cascade.
+    fn check_expr(&mut self, expr: &ast::Expr, expected: &QalaType) -> typed_ast::TypedExpr {
+        let typed = self.infer_expr(expr);
+        if !typed.ty().types_match(expected) {
+            self.errors.push(QalaError::TypeMismatch {
+                span: typed.span(),
+                expected: expected.display(),
+                found: typed.ty().display(),
+            });
+        }
+        typed
+    }
+
+    /// type-check a struct literal: look up the struct, check declared and
+    /// provided field sets match (missing fields named in one error, excess
+    /// fields named individually), check each provided value against the
+    /// declared field type.
+    fn check_struct_lit(
+        &mut self,
+        name: &str,
+        fields: &[ast::FieldInit],
+        span: Span,
+    ) -> typed_ast::TypedExpr {
+        // capture declared fields as (name, type) so we can iterate without
+        // re-borrowing self.
+        let declared: Option<Vec<(String, QalaType)>> = self
+            .symbols
+            .structs
+            .get(name)
+            .map(|s| s.fields.clone());
+        let Some(declared) = declared else {
+            self.errors.push(QalaError::UndefinedName {
+                span,
+                name: name.to_string(),
+            });
+            return typed_ast::TypedExpr::StructLit {
+                name: name.to_string(),
+                fields: Vec::new(),
+                ty: QalaType::Unknown,
+                span,
+            };
+        };
+        let mut typed_fields: Vec<typed_ast::TypedFieldInit> = Vec::new();
+        // missing-field detection.
+        let provided_names: BTreeSet<String> =
+            fields.iter().map(|f| f.name.clone()).collect();
+        let missing: Vec<String> = declared
+            .iter()
+            .filter(|(dn, _)| !provided_names.contains(dn))
+            .map(|(dn, _)| dn.clone())
+            .collect();
+        if !missing.is_empty() {
+            self.errors.push(QalaError::Type {
+                span,
+                message: format!(
+                    "missing field(s) in struct literal `{name}`: {}",
+                    missing.join(", ")
+                ),
+            });
+        }
+        for fi in fields {
+            let decl_ty: Option<QalaType> = declared
+                .iter()
+                .find(|(dn, _)| dn == &fi.name)
+                .map(|(_, t)| t.clone());
+            match decl_ty {
+                Some(t) => {
+                    let typed_value = self.check_expr(&fi.value, &t);
+                    typed_fields.push(typed_ast::TypedFieldInit {
+                        name: fi.name.clone(),
+                        value: typed_value,
+                        span: fi.span,
+                    });
+                }
+                None => {
+                    self.errors.push(QalaError::Type {
+                        span: fi.span,
+                        message: format!(
+                            "no field `{}` on struct `{name}`",
+                            fi.name
+                        ),
+                    });
+                    // still type the value so cascading errors don't fire.
+                    let typed_value = self.infer_expr(&fi.value);
+                    typed_fields.push(typed_ast::TypedFieldInit {
+                        name: fi.name.clone(),
+                        value: typed_value,
+                        span: fi.span,
+                    });
+                }
+            }
+        }
+        typed_ast::TypedExpr::StructLit {
+            name: name.to_string(),
+            fields: typed_fields,
+            ty: QalaType::Named(Symbol(name.to_string())),
+            span,
+        }
+    }
+
+    /// type-check a method call. resolves the method via the symbol table's
+    /// `FnKey { type_name: Some(receiver_type_name), name }` first, then
+    /// falls back to the stdlib table (e.g. `FileHandle.read_all`).
+    fn check_method_call(
+        &mut self,
+        receiver: &ast::Expr,
+        name: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> typed_ast::TypedExpr {
+        let typed_receiver = self.infer_expr(receiver);
+        let receiver_ty = typed_receiver.ty().clone();
+        // resolve method signature: user method via FnKey, else stdlib.
+        let resolved: Option<(Vec<QalaType>, QalaType, FnKey)> = (|| {
+            // user fn T.method
+            let type_name = match &receiver_ty {
+                QalaType::Named(Symbol(s)) => Some(s.clone()),
+                QalaType::FileHandle => Some("FileHandle".to_string()),
+                _ => None,
+            };
+            if let Some(tn) = type_name {
+                let key = FnKey { type_name: Some(tn.clone()), name: name.to_string() };
+                if let Some(info) = self.symbols.fns.get(&key) {
+                    // params after self.
+                    let params: Vec<QalaType> = info
+                        .params
+                        .iter()
+                        .skip(if info.params.first().map(|(n, _, _)| n == "self").unwrap_or(false) {
+                            1
+                        } else {
+                            0
+                        })
+                        .map(|(_, t, _)| t.clone())
+                        .collect();
+                    return Some((params, info.ret_ty.clone(), key));
+                }
+                // stdlib?
+                for entry in stdlib_signatures().iter() {
+                    if entry.type_name.as_deref() == Some(tn.as_str()) && entry.name == name {
+                        let params: Vec<QalaType> = entry.params.clone();
+                        return Some((
+                            params,
+                            entry.ret_ty.clone(),
+                            FnKey {
+                                type_name: Some(tn.clone()),
+                                name: name.to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+            None
+        })();
+        let (params, ret_ty) = match resolved {
+            Some((p, r, key)) => {
+                // record for pass 3's effect resolution.
+                if let Some(ctx) = &mut self.fn_ctx {
+                    ctx.called_fns.push(key.clone());
+                    if ctx.annotated_effect.is_some() {
+                        ctx.callsites_to_check.push(EffectViolationCandidate {
+                            caller_key: FnKey {
+                                type_name: ctx.type_name.clone(),
+                                name: ctx.name.clone(),
+                            },
+                            callee_key: key,
+                            call_span: span,
+                        });
+                    }
+                }
+                (p, r)
+            }
+            None => {
+                if !matches!(receiver_ty, QalaType::Unknown) {
+                    self.errors.push(QalaError::Type {
+                        span,
+                        message: format!(
+                            "no method `{name}` on type `{}`",
+                            receiver_ty.display()
+                        ),
+                    });
+                }
+                (Vec::new(), QalaType::Unknown)
+            }
+        };
+        let typed_args: Vec<typed_ast::TypedExpr> = if params.is_empty() && args.is_empty() {
+            Vec::new()
+        } else {
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if i < params.len() {
+                        self.check_expr(a, &params[i])
+                    } else {
+                        self.infer_expr(a)
+                    }
+                })
+                .collect()
+        };
+        if args.len() != params.len() && !matches!(receiver_ty, QalaType::Unknown) && !ret_ty.types_match(&QalaType::Unknown) {
+            // arity mismatch -- emit a generic Type error.
+            self.errors.push(QalaError::Type {
+                span,
+                message: format!(
+                    "method `{name}` expects {} argument(s), found {}",
+                    params.len(),
+                    args.len()
+                ),
+            });
+        }
+        typed_ast::TypedExpr::MethodCall {
+            receiver: Box::new(typed_receiver),
+            name: name.to_string(),
+            args: typed_args,
+            ty: ret_ty,
+            span,
+        }
+    }
+
+    /// type-check a plain call expression `callee(args)`. handles built-in
+    /// constructors `Ok`/`Err`/`Some`/`None`, user-defined free functions,
+    /// stdlib free functions (including the generic ones), and identifier
+    /// callees in general.
+    fn check_call(
+        &mut self,
+        callee: &ast::Expr,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> typed_ast::TypedExpr {
+        // special-case the built-in constructor names appearing in callee
+        // position as a bare ident.
+        if let ast::Expr::Ident { name, .. } = callee {
+            if let Some(ctor_ty) = self.try_builtin_constructor(name, args, span) {
+                let typed_callee = typed_ast::TypedExpr::Ident {
+                    name: name.clone(),
+                    ty: QalaType::Function {
+                        params: Vec::new(),
+                        returns: Box::new(ctor_ty.0.clone()),
+                    },
+                    span: callee.span(),
+                };
+                return typed_ast::TypedExpr::Call {
+                    callee: Box::new(typed_callee),
+                    args: ctor_ty.1,
+                    ty: ctor_ty.0,
+                    span,
+                };
+            }
+            // user-defined free fn, or stdlib free fn (incl. virtual generics).
+            if let Some((params, ret_ty, is_generic, name_clone, callee_key)) =
+                self.resolve_free_callable(name)
+            {
+                // record for pass 3.
+                if let Some(ctx) = &mut self.fn_ctx {
+                    ctx.called_fns.push(callee_key.clone());
+                    if ctx.annotated_effect.is_some() {
+                        ctx.callsites_to_check.push(EffectViolationCandidate {
+                            caller_key: FnKey {
+                                type_name: ctx.type_name.clone(),
+                                name: ctx.name.clone(),
+                            },
+                            callee_key,
+                            call_span: span,
+                        });
+                    }
+                }
+                let typed_callee = typed_ast::TypedExpr::Ident {
+                    name: name_clone.clone(),
+                    ty: QalaType::Function {
+                        params: params.clone(),
+                        returns: Box::new(ret_ty.clone()),
+                    },
+                    span: callee.span(),
+                };
+                let typed_args = self.check_call_args(args, &params, is_generic, &name_clone, span);
+                let result_ty = self.resolve_generic_return_ty(&name_clone, &ret_ty, &typed_args);
+                return typed_ast::TypedExpr::Call {
+                    callee: Box::new(typed_callee),
+                    args: typed_args,
+                    ty: result_ty,
+                    span,
+                };
+            }
+            // unresolved free name in callee position.
+            self.errors.push(QalaError::UndefinedName {
+                span: callee.span(),
+                name: name.clone(),
+            });
+            let typed_callee = typed_ast::TypedExpr::Ident {
+                name: name.clone(),
+                ty: QalaType::Unknown,
+                span: callee.span(),
+            };
+            let typed_args: Vec<typed_ast::TypedExpr> =
+                args.iter().map(|a| self.infer_expr(a)).collect();
+            return typed_ast::TypedExpr::Call {
+                callee: Box::new(typed_callee),
+                args: typed_args,
+                ty: QalaType::Unknown,
+                span,
+            };
+        }
+        // non-identifier callee (rare in v1): infer it and treat its type as
+        // a function shape.
+        let typed_callee = self.infer_expr(callee);
+        let (params, ret_ty) = match typed_callee.ty() {
+            QalaType::Function { params, returns } => (params.clone(), (**returns).clone()),
+            _ => {
+                self.errors.push(QalaError::Type {
+                    span,
+                    message: format!(
+                        "cannot call value of type `{}`",
+                        typed_callee.ty().display()
+                    ),
+                });
+                (Vec::new(), QalaType::Unknown)
+            }
+        };
+        let typed_args: Vec<typed_ast::TypedExpr> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if i < params.len() {
+                    self.check_expr(a, &params[i])
+                } else {
+                    self.infer_expr(a)
+                }
+            })
+            .collect();
+        typed_ast::TypedExpr::Call {
+            callee: Box::new(typed_callee),
+            args: typed_args,
+            ty: ret_ty,
+            span,
+        }
+    }
+
+    /// helper: check a call's args against a parameter list. for generic
+    /// virtual stdlib calls (`len<T>(coll: [T]) -> i64`) the typechecker
+    /// accepts any matching concrete instantiation -- it infers each arg
+    /// and applies a loose check.
+    fn check_call_args(
+        &mut self,
+        args: &[ast::Expr],
+        params: &[QalaType],
+        is_generic: bool,
+        name: &str,
+        call_span: Span,
+    ) -> Vec<typed_ast::TypedExpr> {
+        if args.len() != params.len() {
+            // emit one arity error, then infer args.
+            // skip arity check when the generic flag is set AND the
+            // signature was a placeholder (params.len() may be sentinel).
+            if !is_generic {
+                self.errors.push(QalaError::Type {
+                    span: call_span,
+                    message: format!(
+                        "function `{name}` expects {} argument(s), found {}",
+                        params.len(),
+                        args.len()
+                    ),
+                });
+            }
+        }
+        args.iter()
+            .enumerate()
+            .map(|(i, a)| {
+                if !is_generic && i < params.len() {
+                    self.check_expr(a, &params[i])
+                } else {
+                    self.infer_expr(a)
+                }
+            })
+            .collect()
+    }
+
+    /// helper: compute the result type of a stdlib generic call once its
+    /// args are typed. for non-generic functions, returns the declared
+    /// `ret_ty` unchanged. handles `len`, `push`, `pop`, `type_of`, `map`,
+    /// `filter`, `reduce`.
+    fn resolve_generic_return_ty(
+        &self,
+        name: &str,
+        ret_ty: &QalaType,
+        typed_args: &[typed_ast::TypedExpr],
+    ) -> QalaType {
+        match name {
+            "len" => QalaType::I64,
+            "push" => QalaType::Void,
+            "pop" => {
+                // pop returns Option<T> where T is the element type of arg 0.
+                if let Some(arg0) = typed_args.first()
+                    && let QalaType::Array(elem, _) = arg0.ty()
+                {
+                    return QalaType::Option(elem.clone());
+                }
+                QalaType::Option(Box::new(QalaType::Unknown))
+            }
+            "type_of" => QalaType::Str,
+            "map" => {
+                // map(coll: [T], f: fn(T) -> U) -> [U]
+                let u = typed_args.get(1).and_then(|f| match f.ty() {
+                    QalaType::Function { returns, .. } => Some((**returns).clone()),
+                    _ => None,
+                });
+                QalaType::Array(Box::new(u.unwrap_or(QalaType::Unknown)), None)
+            }
+            "filter" => {
+                // filter(coll: [T], pred: fn(T) -> bool) -> [T]
+                if let Some(arg0) = typed_args.first() {
+                    return arg0.ty().clone();
+                }
+                QalaType::Array(Box::new(QalaType::Unknown), None)
+            }
+            "reduce" => {
+                // reduce(coll: [T], init: U, f: fn(U, T) -> U) -> U
+                if let Some(arg1) = typed_args.get(1) {
+                    return arg1.ty().clone();
+                }
+                QalaType::Unknown
+            }
+            _ => ret_ty.clone(),
+        }
+    }
+
+    /// helper: resolve a callable name (user fn, then stdlib). returns
+    /// `(param-types, ret-ty, is-generic, name, key)`.
+    #[allow(clippy::type_complexity)]
+    fn resolve_free_callable(
+        &self,
+        name: &str,
+    ) -> Option<(Vec<QalaType>, QalaType, bool, String, FnKey)> {
+        let key = FnKey { type_name: None, name: name.to_string() };
+        if let Some(info) = self.symbols.fns.get(&key) {
+            let params: Vec<QalaType> = info.params.iter().map(|(_, t, _)| t.clone()).collect();
+            return Some((params, info.ret_ty.clone(), false, name.to_string(), key));
+        }
+        for entry in stdlib_signatures().iter() {
+            if entry.type_name.is_none() && entry.name == name {
+                return Some((
+                    entry.params.clone(),
+                    entry.ret_ty.clone(),
+                    entry.is_generic,
+                    name.to_string(),
+                    FnKey { type_name: None, name: name.to_string() },
+                ));
+            }
+        }
+        None
+    }
+
+    /// type-check the built-in constructors Ok/Err/Some/None when seen in
+    /// a call-position bare-ident shape. returns the (result-type, typed-args)
+    /// tuple on a hit, None otherwise.
+    fn try_builtin_constructor(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Option<(QalaType, Vec<typed_ast::TypedExpr>)> {
+        match name {
+            "Ok" => {
+                if args.len() != 1 {
+                    self.errors.push(QalaError::Type {
+                        span,
+                        message: format!("`Ok` expects 1 argument, found {}", args.len()),
+                    });
+                    let typed_args: Vec<_> = args.iter().map(|a| self.infer_expr(a)).collect();
+                    return Some((
+                        QalaType::Result(Box::new(QalaType::Unknown), Box::new(QalaType::Unknown)),
+                        typed_args,
+                    ));
+                }
+                let typed_arg = self.infer_expr(&args[0]);
+                let ok_ty = typed_arg.ty().clone();
+                Some((
+                    QalaType::Result(Box::new(ok_ty), Box::new(QalaType::Unknown)),
+                    vec![typed_arg],
+                ))
+            }
+            "Err" => {
+                if args.len() != 1 {
+                    self.errors.push(QalaError::Type {
+                        span,
+                        message: format!("`Err` expects 1 argument, found {}", args.len()),
+                    });
+                    let typed_args: Vec<_> = args.iter().map(|a| self.infer_expr(a)).collect();
+                    return Some((
+                        QalaType::Result(Box::new(QalaType::Unknown), Box::new(QalaType::Unknown)),
+                        typed_args,
+                    ));
+                }
+                let typed_arg = self.infer_expr(&args[0]);
+                let err_ty = typed_arg.ty().clone();
+                Some((
+                    QalaType::Result(Box::new(QalaType::Unknown), Box::new(err_ty)),
+                    vec![typed_arg],
+                ))
+            }
+            "Some" => {
+                if args.len() != 1 {
+                    self.errors.push(QalaError::Type {
+                        span,
+                        message: format!("`Some` expects 1 argument, found {}", args.len()),
+                    });
+                    let typed_args: Vec<_> = args.iter().map(|a| self.infer_expr(a)).collect();
+                    return Some((QalaType::Option(Box::new(QalaType::Unknown)), typed_args));
+                }
+                let typed_arg = self.infer_expr(&args[0]);
+                let inner = typed_arg.ty().clone();
+                Some((QalaType::Option(Box::new(inner)), vec![typed_arg]))
+            }
+            "None" => {
+                if !args.is_empty() {
+                    self.errors.push(QalaError::Type {
+                        span,
+                        message: format!("`None` expects 0 arguments, found {}", args.len()),
+                    });
+                }
+                let typed_args: Vec<_> = args.iter().map(|a| self.infer_expr(a)).collect();
+                Some((QalaType::Option(Box::new(QalaType::Unknown)), typed_args))
+            }
+            _ => None,
+        }
+    }
+
+    /// type a binary expression. arithmetic ops produce the operand type
+    /// (with `str + str = str` as the special-case); comparison and
+    /// equality produce bool; logical ops require bool operands.
+    fn check_binary(
+        &mut self,
+        op: &ast::BinOp,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        span: Span,
+    ) -> typed_ast::TypedExpr {
+        use ast::BinOp;
+        let typed_lhs = self.infer_expr(lhs);
+        let typed_rhs = self.infer_expr(rhs);
+        let lty = typed_lhs.ty().clone();
+        let rty = typed_rhs.ty().clone();
+        let result_ty = match op {
+            BinOp::Add => {
+                // str + str = str (concatenation).
+                if lty.types_match(&QalaType::Str) && rty.types_match(&QalaType::Str) {
+                    QalaType::Str
+                } else if lty.types_match(&rty)
+                    && (lty.types_match(&QalaType::I64) || lty.types_match(&QalaType::F64))
+                {
+                    lty.clone()
+                } else if matches!(lty, QalaType::Unknown) || matches!(rty, QalaType::Unknown) {
+                    QalaType::Unknown
+                } else {
+                    self.errors.push(QalaError::TypeMismatch {
+                        span,
+                        expected: lty.display(),
+                        found: rty.display(),
+                    });
+                    QalaType::Unknown
+                }
+            }
+            BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                if lty.types_match(&rty)
+                    && (lty.types_match(&QalaType::I64) || lty.types_match(&QalaType::F64))
+                {
+                    lty.clone()
+                } else if matches!(lty, QalaType::Unknown) || matches!(rty, QalaType::Unknown) {
+                    QalaType::Unknown
+                } else {
+                    self.errors.push(QalaError::TypeMismatch {
+                        span,
+                        expected: lty.display(),
+                        found: rty.display(),
+                    });
+                    QalaType::Unknown
+                }
+            }
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                if !lty.types_match(&rty) {
+                    self.errors.push(QalaError::TypeMismatch {
+                        span,
+                        expected: lty.display(),
+                        found: rty.display(),
+                    });
+                }
+                QalaType::Bool
+            }
+            BinOp::Eq | BinOp::Ne => {
+                if !lty.types_match(&rty) {
+                    self.errors.push(QalaError::TypeMismatch {
+                        span,
+                        expected: lty.display(),
+                        found: rty.display(),
+                    });
+                }
+                QalaType::Bool
+            }
+            BinOp::And | BinOp::Or => {
+                if !lty.types_match(&QalaType::Bool) {
+                    self.errors.push(QalaError::TypeMismatch {
+                        span: lhs.span(),
+                        expected: "bool".to_string(),
+                        found: lty.display(),
+                    });
+                }
+                if !rty.types_match(&QalaType::Bool) {
+                    self.errors.push(QalaError::TypeMismatch {
+                        span: rhs.span(),
+                        expected: "bool".to_string(),
+                        found: rty.display(),
+                    });
+                }
+                QalaType::Bool
+            }
+        };
+        typed_ast::TypedExpr::Binary {
+            op: op.clone(),
+            lhs: Box::new(typed_lhs),
+            rhs: Box::new(typed_rhs),
+            ty: result_ty,
+            span,
+        }
+    }
+
+    /// resolve a pipeline `lhs |> call` -- the call is either an Ident
+    /// (zero extra args) or a Call (1+ extra args). type as if `lhs` were
+    /// the first arg of the resolved function. returns (typed call, result-ty).
+    fn check_pipeline_call(
+        &mut self,
+        call: &ast::Expr,
+        lhs_ty: &QalaType,
+    ) -> (typed_ast::TypedExpr, QalaType) {
+        // build the virtual argument list = [lhs_ty] + extra arg types,
+        // and look up the call target's signature.
+        match call {
+            ast::Expr::Ident { name, span } => {
+                // zero extra args: signature expects 1 param matching lhs_ty.
+                if let Some((params, ret_ty, is_generic, name_clone, key)) =
+                    self.resolve_free_callable(name)
+                {
+                    if let Some(ctx) = &mut self.fn_ctx {
+                        ctx.called_fns.push(key.clone());
+                        if ctx.annotated_effect.is_some() {
+                            ctx.callsites_to_check.push(EffectViolationCandidate {
+                                caller_key: FnKey {
+                                    type_name: ctx.type_name.clone(),
+                                    name: ctx.name.clone(),
+                                },
+                                callee_key: key,
+                                call_span: *span,
+                            });
+                        }
+                    }
+                    // check param 0 against lhs_ty (when not generic).
+                    if !is_generic
+                        && !params.is_empty()
+                        && !lhs_ty.types_match(&params[0])
+                    {
+                        self.errors.push(QalaError::TypeMismatch {
+                            span: *span,
+                            expected: params[0].display(),
+                            found: lhs_ty.display(),
+                        });
+                    }
+                    // result type: generic-aware.
+                    let typed_call = typed_ast::TypedExpr::Ident {
+                        name: name_clone.clone(),
+                        ty: QalaType::Function {
+                            params: params.clone(),
+                            returns: Box::new(ret_ty.clone()),
+                        },
+                        span: *span,
+                    };
+                    return (typed_call, ret_ty);
+                }
+                // unresolved.
+                self.errors.push(QalaError::UndefinedName {
+                    span: *span,
+                    name: name.clone(),
+                });
+                (
+                    typed_ast::TypedExpr::Ident {
+                        name: name.clone(),
+                        ty: QalaType::Unknown,
+                        span: *span,
+                    },
+                    QalaType::Unknown,
+                )
+            }
+            ast::Expr::Call { callee, args, span } => {
+                // delegate to the normal call handler, but prepend lhs
+                // virtually. simplest implementation: infer the call as
+                // written (the parser has already collected the actual
+                // args), then re-check the first param against lhs_ty. for
+                // a generic stdlib call (`map`, `filter`, ...), accept
+                // whatever the resolver computed.
+                let typed_call = self.check_call(callee, args, *span);
+                // the type of the typed call is the result type of the
+                // pipeline (lhs flows into the existing first param).
+                let ret_ty = typed_call.ty().clone();
+                (typed_call, ret_ty)
+            }
+            other => {
+                // any other call shape is unsupported.
+                let typed = self.infer_expr(other);
+                let ty = typed.ty().clone();
+                (typed, ty)
+            }
+        }
+    }
+
+    /// type-check a match expression.
+    ///
+    /// task 2 implements the basic typing rule: infer the scrutinee, type
+    /// each arm body, require a common arm body type (Unknown counts as
+    /// poison). exhaustiveness checking is task 3.
+    fn check_match(
+        &mut self,
+        scrutinee: &ast::Expr,
+        arms: &[ast::MatchArm],
+        span: Span,
+    ) -> typed_ast::TypedExpr {
+        let typed_scrutinee = self.infer_expr(scrutinee);
+        let scrut_ty = typed_scrutinee.ty().clone();
+        let mut typed_arms: Vec<typed_ast::TypedMatchArm> = Vec::with_capacity(arms.len());
+        let mut result_ty: Option<QalaType> = None;
+        for arm in arms {
+            // check the pattern in a fresh scope so any bindings it
+            // introduces are local to the arm.
+            self.scopes.push(HashMap::new());
+            self.bind_pattern(&arm.pattern, &scrut_ty);
+            let typed_guard = arm.guard.as_ref().map(|g| self.check_expr(g, &QalaType::Bool));
+            let typed_body = match &arm.body {
+                ast::MatchArmBody::Expr(e) => {
+                    let typed = self.infer_expr(e);
+                    typed_ast::TypedMatchArmBody::Expr(Box::new(typed))
+                }
+                ast::MatchArmBody::Block(b) => {
+                    typed_ast::TypedMatchArmBody::Block(self.check_block(b, None))
+                }
+            };
+            self.scopes.pop();
+            // accumulate the common arm result type.
+            let body_ty = match &typed_body {
+                typed_ast::TypedMatchArmBody::Expr(e) => e.ty().clone(),
+                typed_ast::TypedMatchArmBody::Block(b) => b.ty.clone(),
+            };
+            result_ty = match (result_ty, body_ty.clone()) {
+                (None, b) => Some(b),
+                (Some(a), b) if a.types_match(&b) => Some(a),
+                (Some(_), _) => Some(QalaType::Unknown),
+            };
+            typed_arms.push(typed_ast::TypedMatchArm {
+                pattern: arm.pattern.clone(),
+                guard: typed_guard,
+                body: typed_body,
+                span: arm.span,
+            });
+        }
+        // task 3 will add exhaustiveness checking here.
+        let ty = result_ty.unwrap_or(QalaType::Unknown);
+        typed_ast::TypedExpr::Match {
+            scrutinee: Box::new(typed_scrutinee),
+            arms: typed_arms,
+            ty,
+            span,
+        }
+    }
+
+    /// bind any names introduced by a pattern into the topmost scope, with
+    /// types derived from the scrutinee type.
+    ///
+    /// task 2's minimal implementation: for `Variant { sub }`, look up the
+    /// variant in any enum and use its field types; for `Binding`, bind
+    /// the scrutinee type; for literal / wildcard patterns, nothing.
+    fn bind_pattern(&mut self, pattern: &ast::Pattern, scrut_ty: &QalaType) {
+        match pattern {
+            ast::Pattern::Variant { name, sub, span } => {
+                // find the matching variant. for an enum scrutinee, look in
+                // that enum specifically. otherwise look in any enum.
+                let mut variant_fields: Option<Vec<QalaType>> = None;
+                if let QalaType::Named(Symbol(enum_name)) = scrut_ty
+                    && let Some(info) = self.symbols.enums.get(enum_name)
+                {
+                    for (vname, fields) in &info.variants {
+                        if vname == name {
+                            variant_fields = Some(fields.clone());
+                            break;
+                        }
+                    }
+                    if variant_fields.is_none() {
+                        self.errors.push(QalaError::Type {
+                            span: *span,
+                            message: format!(
+                                "variant `{name}` is not part of enum `{enum_name}`"
+                            ),
+                        });
+                    }
+                }
+                if let Some(fields) = variant_fields {
+                    for (i, sub_pat) in sub.iter().enumerate() {
+                        let sub_ty = fields
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(QalaType::Unknown);
+                        self.bind_pattern(sub_pat, &sub_ty);
+                    }
+                } else {
+                    // recurse with Unknown for each sub-pattern.
+                    for sub_pat in sub {
+                        self.bind_pattern(sub_pat, &QalaType::Unknown);
+                    }
+                }
+            }
+            ast::Pattern::Binding { name, span } => {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.insert(
+                        name.clone(),
+                        LocalInfo {
+                            ty: scrut_ty.clone(),
+                            span: *span,
+                            is_mut: false,
+                            // pattern bindings are scoped to the arm; treat
+                            // them like loop variables (no unused_var).
+                            used: false,
+                            is_param: true,
+                        },
+                    );
+                }
+            }
+            // literal / wildcard patterns introduce no bindings.
+            _ => {}
+        }
+    }
+
     /// pass 3: resolve every function's inferred effect.
     ///
-    /// task 1 leaves this as a no-op so the crate compiles end-to-end while
-    /// tasks 2-3 are pending.
+    /// task 1/2 leaves this as a no-op so the crate compiles end-to-end
+    /// while task 3 fills in the fixed-point algorithm.
     fn resolve_function_effects(&mut self) {
         // no-op; task 3 fills this in.
     }
+
+    /// emit a warning, honouring the directive table set by task 5. task 4
+    /// installs the placeholder version of this method.
+    fn emit_warning(&mut self, w: QalaWarning) {
+        // task 5 wires `is_silenced` to the real `allow` table.
+        let line = self.line_index.location(self.src, w.span.start as usize).0;
+        if let Some(cats) = self.allow.get(&line)
+            && cats.contains(&w.category)
+        {
+            return;
+        }
+        self.warnings.push(w);
+    }
+}
+
+/// the per-function record pass 3 reads to settle effect inference.
+#[allow(dead_code)]
+struct BodyEffectRecord {
+    /// the intrinsic effect of the body (the union of every non-call
+    /// statement's intrinsic effect set).
+    intrinsic: EffectSet,
+    /// every function this body calls.
+    called: Vec<FnKey>,
+    /// call sites that need an effect-violation check after pass 3 settles.
+    callsites_to_check: Vec<EffectViolationCandidate>,
+}
+
+/// strict type equality: a wildcard `Unknown` does NOT match anything. used
+/// by the `redundant_annotation` warning so a typo's `Unknown` does not
+/// fire the warning by accident.
+fn types_strictly_equal(a: &QalaType, b: &QalaType) -> bool {
+    if matches!(a, QalaType::Unknown) || matches!(b, QalaType::Unknown) {
+        return false;
+    }
+    a == b
+}
+
+/// one entry in the stdlib signature table. task 3 fills in the actual
+/// list; task 2 only needs the shape so dependent code compiles.
+#[allow(dead_code)]
+struct StdlibFn {
+    /// `None` for a free function; `Some(T)` for `fn T.method` (e.g.
+    /// `FileHandle.read_all`).
+    type_name: Option<String>,
+    /// the function name.
+    name: String,
+    /// parameter types (or sentinels for the virtual generics).
+    params: Vec<QalaType>,
+    /// return type.
+    ret_ty: QalaType,
+    /// the function's effect.
+    effect: EffectSet,
+    /// true for virtual-generic functions (`len`, `push`, `pop`, `type_of`,
+    /// `map`, `filter`, `reduce`, `Ok`, `Err`, `Some`, `None`). the
+    /// call-site checker accepts any concrete instantiation.
+    is_generic: bool,
+}
+
+/// the hardcoded stdlib signature table. task 3 finalises this; task 2's
+/// stub gives enough entries that pass 2 tests resolve the names they need
+/// (println, print, parse_int-shaped placeholders are NOT in the stdlib;
+/// the test fixtures define those as user functions when needed).
+fn stdlib_signatures() -> Vec<StdlibFn> {
+    vec![
+        StdlibFn {
+            type_name: None,
+            name: "print".to_string(),
+            params: vec![QalaType::Str],
+            ret_ty: QalaType::Void,
+            effect: EffectSet::io(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "println".to_string(),
+            params: vec![QalaType::Str],
+            ret_ty: QalaType::Void,
+            effect: EffectSet::io(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "sqrt".to_string(),
+            params: vec![QalaType::F64],
+            ret_ty: QalaType::F64,
+            effect: EffectSet::pure(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "abs".to_string(),
+            params: vec![QalaType::I64],
+            ret_ty: QalaType::I64,
+            effect: EffectSet::pure(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "abs".to_string(),
+            params: vec![QalaType::F64],
+            ret_ty: QalaType::F64,
+            effect: EffectSet::pure(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "assert".to_string(),
+            params: vec![QalaType::Bool],
+            ret_ty: QalaType::Void,
+            effect: EffectSet::panic(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "len".to_string(),
+            params: vec![QalaType::Array(Box::new(QalaType::Unknown), None)],
+            ret_ty: QalaType::I64,
+            effect: EffectSet::pure(),
+            is_generic: true,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "push".to_string(),
+            params: vec![
+                QalaType::Array(Box::new(QalaType::Unknown), None),
+                QalaType::Unknown,
+            ],
+            ret_ty: QalaType::Void,
+            effect: EffectSet::alloc(),
+            is_generic: true,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "pop".to_string(),
+            params: vec![QalaType::Array(Box::new(QalaType::Unknown), None)],
+            ret_ty: QalaType::Option(Box::new(QalaType::Unknown)),
+            effect: EffectSet::alloc(),
+            is_generic: true,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "type_of".to_string(),
+            params: vec![QalaType::Unknown],
+            ret_ty: QalaType::Str,
+            effect: EffectSet::pure(),
+            is_generic: true,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "open".to_string(),
+            params: vec![QalaType::Str],
+            ret_ty: QalaType::FileHandle,
+            effect: EffectSet::io(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "close".to_string(),
+            params: vec![QalaType::FileHandle],
+            ret_ty: QalaType::Void,
+            effect: EffectSet::io(),
+            is_generic: false,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "map".to_string(),
+            params: vec![
+                QalaType::Array(Box::new(QalaType::Unknown), None),
+                QalaType::Function {
+                    params: vec![QalaType::Unknown],
+                    returns: Box::new(QalaType::Unknown),
+                },
+            ],
+            ret_ty: QalaType::Array(Box::new(QalaType::Unknown), None),
+            effect: EffectSet::pure(),
+            is_generic: true,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "filter".to_string(),
+            params: vec![
+                QalaType::Array(Box::new(QalaType::Unknown), None),
+                QalaType::Function {
+                    params: vec![QalaType::Unknown],
+                    returns: Box::new(QalaType::Bool),
+                },
+            ],
+            ret_ty: QalaType::Array(Box::new(QalaType::Unknown), None),
+            effect: EffectSet::pure(),
+            is_generic: true,
+        },
+        StdlibFn {
+            type_name: None,
+            name: "reduce".to_string(),
+            params: vec![
+                QalaType::Array(Box::new(QalaType::Unknown), None),
+                QalaType::Unknown,
+                QalaType::Function {
+                    params: vec![QalaType::Unknown, QalaType::Unknown],
+                    returns: Box::new(QalaType::Unknown),
+                },
+            ],
+            ret_ty: QalaType::Unknown,
+            effect: EffectSet::pure(),
+            is_generic: true,
+        },
+        // FileHandle.read_all -- the only stdlib method in v1.
+        StdlibFn {
+            type_name: Some("FileHandle".to_string()),
+            name: "read_all".to_string(),
+            params: vec![],
+            ret_ty: QalaType::Result(Box::new(QalaType::Str), Box::new(QalaType::Str)),
+            effect: EffectSet::io(),
+            is_generic: false,
+        },
+    ]
 }
 
 /// resolve a `TypeExpr` to a [`QalaType`] without emitting errors. used by
@@ -1231,5 +3066,331 @@ mod tests {
         let mut sorted = starts.clone();
         sorted.sort();
         assert_eq!(starts, sorted, "errors not sorted by span.start: {errors:?}");
+    }
+
+    // ---- pass 2: bidirectional type checking -------------------------------
+
+    #[test]
+    fn infer_local_let_types() {
+        // let x = 42 -> x: i64.
+        let src = "fn main() is io { let x = 42; println(\"hi\") }";
+        let (_, errors, _) = check(src);
+        // unused-var on x is expected since it is not read.
+        let type_errors: Vec<&QalaError> =
+            errors.iter().filter(|e| !matches!(e, QalaError::UndefinedName { .. })).collect();
+        assert!(type_errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn let_with_wrong_annotation_emits_type_mismatch() {
+        // let x: i64 = "hello" -> TypeMismatch at the rhs span.
+        let src = "fn main() is io { let x: i64 = \"hello\"; println(\"\") }";
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "expected TypeMismatch in {errors:?}");
+    }
+
+    #[test]
+    fn redundant_annotation_warns() {
+        // let x: i64 = 42 fires `redundant_annotation`.
+        let src = "fn main() is io { let x: i64 = 42; println(\"{x}\") }";
+        let (_, errors, warnings) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        let red: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "redundant_annotation")
+            .collect();
+        assert_eq!(red.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn undefined_name_in_initializer_emits_one_error() {
+        let src = "fn main() is io { let x = nope; println(\"\") }";
+        let (_, errors, _) = check(src);
+        let undef: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::UndefinedName { name, .. } if name == "nope"))
+            .collect();
+        assert_eq!(undef.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn arg_type_mismatch_message() {
+        // a fn declared with -> str whose body's trailing value is an i64.
+        let src = "fn f(x: i64) -> str is pure { x }";
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "expected TypeMismatch in {errors:?}");
+        match mismatch[0] {
+            QalaError::TypeMismatch { expected, found, .. } => {
+                assert_eq!(expected, "str");
+                assert_eq!(found, "i64");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn missing_return_at_last_expr() {
+        // a non-void fn whose body has no trailing value and no return stmt.
+        let src = "fn f() -> i64 is pure { }";
+        let (_, errors, _) = check(src);
+        let missing: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::MissingReturn { .. }))
+            .collect();
+        assert_eq!(missing.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn fn_with_correct_trailing_value_passes() {
+        let src = "fn f(x: i64) -> i64 is pure { x }";
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn fn_with_explicit_return_passes() {
+        let src = "fn f(x: i64) -> i64 is pure { return x }";
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn fn_return_with_wrong_type() {
+        let src = "fn f(x: i64) -> i64 is pure { return \"oops\" }";
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn or_fallback_typechecks_success() {
+        // x: Option<i64> or i64 -> i64.
+        let src = r#"
+            fn lookup() -> Option<i64> is pure { return Some(1) }
+            fn main() is io {
+                let r = lookup() or 0
+                println("{r}")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(mismatch.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn or_fallback_wrong_type_errors_at_fallback() {
+        let src = r#"
+            fn lookup() -> Option<i64> is pure { return Some(1) }
+            fn main() is io {
+                let r = lookup() or "oops"
+                println("{r}")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn question_legal_inside_result_fn() {
+        let src = r#"
+            fn parse_int(s: str) -> Result<i64, str> is pure { return Ok(0) }
+            fn f(s: str) -> Result<i64, str> is pure {
+                let x = parse_int(s)?
+                return Ok(x)
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let redundant: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::RedundantQuestionOperator { .. }))
+            .collect();
+        assert!(redundant.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn question_in_non_result_fn_errors() {
+        let src = r#"
+            fn parse_int(s: str) -> Result<i64, str> is pure { return Ok(0) }
+            fn f(s: str) -> i64 is pure {
+                let x = parse_int(s)?
+                return x
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let redundant: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::RedundantQuestionOperator { .. }))
+            .collect();
+        assert_eq!(redundant.len(), 1, "{errors:?}");
+    }
+
+    #[test]
+    fn struct_literal_unknown_field_errors() {
+        let src = r#"
+            struct Point { x: i64, y: i64 }
+            fn main() is io {
+                let p = Point { x: 1, z: 2 }
+                println("ok")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        // expect a missing-field error AND a no-such-field error.
+        let type_errors: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::Type { .. }))
+            .collect();
+        assert!(type_errors.len() >= 2, "{errors:?}");
+    }
+
+    #[test]
+    fn method_call_resolves_user_method() {
+        let src = r#"
+            struct Point { x: f64, y: f64 }
+            fn Point.distance(self) -> f64 is pure { return 0.0 }
+            fn main() is io {
+                let p = Point { x: 1.0, y: 2.0 }
+                let d = p.distance()
+                println("{d}")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn index_into_fixed_array_types_to_elem() {
+        let src = r#"
+            fn main() is io {
+                let arr = [1, 2, 3]
+                let v = arr[0]
+                println("{v}")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn index_with_string_errors() {
+        let src = r#"
+            fn main() is io {
+                let arr = [1, 2, 3]
+                let v = arr["x"]
+                println("{v}")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn pipeline_with_unary_callee_types_through() {
+        let src = r#"
+            fn double(x: i64) -> i64 is pure { return x * 2 }
+            fn main() is io {
+                let r = 5 |> double
+                println("{r}")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn interpolation_resolves_inner_expression() {
+        let src = r#"
+            fn main() is io {
+                let name = "world"
+                println("hello, {name}!")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn binary_arithmetic_on_matching_types_passes() {
+        let src = r#"
+            fn add(a: i64, b: i64) -> i64 is pure { return a + b }
+        "#;
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn binary_arithmetic_on_mismatched_types_errors() {
+        let src = r#"
+            fn bad(a: i64, b: str) -> i64 is pure { return a + b }
+        "#;
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn comparison_returns_bool() {
+        let src = r#"
+            fn lt(a: i64, b: i64) -> bool is pure { return a < b }
+        "#;
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn boolean_ops_require_bool_operands() {
+        let src = r#"
+            fn bad() -> bool is pure { return 1 && 2 }
+        "#;
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        // two bool mismatches (lhs and rhs).
+        assert!(mismatch.len() >= 2, "{errors:?}");
+    }
+
+    #[test]
+    fn unreachable_after_return_warns_once() {
+        // `return` is followed by `let`, a statement-head keyword, so the
+        // parser treats the return as bare and the `let` as a separate
+        // statement -- which then triggers the unreachable_code warning.
+        let src = r#"
+            fn main() is io {
+                return
+                let x = 1
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let unreach: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unreachable_code")
+            .collect();
+        assert_eq!(unreach.len(), 1, "{warnings:?}");
     }
 }
