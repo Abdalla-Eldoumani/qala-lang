@@ -15,3 +15,5 @@ pub mod effects;
 pub mod typed_ast;
 pub mod typechecker;
 pub mod diagnostics;
+// constant-pool value enum -- shared by chunk, codegen, vm
+pub mod value;
