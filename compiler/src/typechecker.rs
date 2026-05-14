@@ -2192,6 +2192,20 @@ impl<'src> Checker<'src> {
                     span: callee.span(),
                 };
                 let typed_args = self.check_call_args(args, &params, is_generic, &name_clone, span);
+                // abs only accepts i64 or f64; the generic param placeholder lets
+                // non-numeric types through check_call_args, so we guard here.
+                if name_clone == "abs" {
+                    if let Some(arg0) = typed_args.first() {
+                        let arg_ty = arg0.ty();
+                        if !matches!(arg_ty, QalaType::I64 | QalaType::F64 | QalaType::Unknown) {
+                            self.errors.push(QalaError::TypeMismatch {
+                                span,
+                                expected: "i64 or f64".to_string(),
+                                found: arg_ty.display(),
+                            });
+                        }
+                    }
+                }
                 let result_ty = self.resolve_generic_return_ty(&name_clone, &ret_ty, &typed_args);
                 return typed_ast::TypedExpr::Call {
                     callee: Box::new(typed_callee),
@@ -2306,11 +2320,14 @@ impl<'src> Checker<'src> {
         match name {
             "len" => QalaType::I64,
             "push" => QalaType::Void,
-            // abs mirrors its input type: abs(-3) -> i64, abs(1.5) -> f64.
-            "abs" => typed_args
-                .first()
-                .map(|a| a.ty().clone())
-                .unwrap_or(QalaType::Unknown),
+            // abs mirrors its input type for i64/f64; non-numeric args are
+            // rejected upstream in check_call, so Unknown (poison) propagates
+            // here when the arg type is neither I64 nor F64.
+            "abs" => match typed_args.first().map(|a| a.ty()) {
+                Some(QalaType::I64) => QalaType::I64,
+                Some(QalaType::F64) => QalaType::F64,
+                _ => QalaType::Unknown,
+            },
             "pop" => {
                 // pop returns Option<T> where T is the element type of arg 0.
                 if let Some(arg0) = typed_args.first()
@@ -4547,6 +4564,19 @@ fn f() -> Alpha is pure { return Mark }
             }
             _ => panic!("expected Fn"),
         }
+    }
+
+    #[test]
+    fn abs_rejects_non_numeric_arg() {
+        // abs(bool) must produce a TypeMismatch; result type is Unknown so
+        // multi-error collection continues without cascading errors.
+        let src = "fn main() -> bool is pure { return abs(true) }";
+        let (_, errors, _) = check(src);
+        let mismatch: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!mismatch.is_empty(), "abs(bool) should produce TypeMismatch: {errors:?}");
     }
 
     #[test]
