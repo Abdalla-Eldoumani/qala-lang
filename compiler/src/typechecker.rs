@@ -29,7 +29,7 @@ use crate::parser::MAX_DEPTH;
 use crate::span::{LineIndex, Span};
 use crate::types::{QalaType, Symbol};
 use crate::typed_ast;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---- public surface --------------------------------------------------------
 
@@ -107,8 +107,9 @@ pub fn check_program(
 struct SymbolTable {
     /// every `struct Decl { ... }` keyed by name.
     structs: HashMap<String, StructInfo>,
-    /// every `enum Decl { ... }` keyed by name.
-    enums: HashMap<String, EnumInfo>,
+    /// every `enum Decl { ... }` keyed by name. `BTreeMap` so iteration
+    /// order is deterministic (alphabetical) across all enum lookups.
+    enums: BTreeMap<String, EnumInfo>,
     /// every `interface Decl { ... }` keyed by name.
     interfaces: HashMap<String, InterfaceInfo>,
     /// every `fn` or `fn Type.method` declaration keyed by [`FnKey`].
@@ -4459,6 +4460,31 @@ mod tests {
             warnings.iter().filter(|w| w.category == "unused_var").collect();
         assert_eq!(unused.len(), 1, "{warnings:?}");
         assert!(unused[0].message.contains("`y`"), "{unused:?}");
+    }
+
+    #[test]
+    fn enum_variant_lookup_is_deterministic_across_runs() {
+        // two enums share a zero-data variant name "Mark"; the BTreeMap
+        // iteration order is alphabetical, so "Alpha" < "Beta" and the
+        // lookup always resolves to Alpha::Mark first. the type of a bare
+        // `Mark` ident must be the Named type for "Alpha" every run.
+        let src = r#"
+enum Beta { Mark, Other }
+enum Alpha { Mark, Stuff }
+fn f() -> Alpha is pure { return Mark }
+"#;
+        let (_, errors, _) = check(src);
+        // with deterministic order, the resolver consistently picks the
+        // alphabetically first enum; no undefined-name or type-mismatch
+        // errors are expected.
+        let relevant: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::UndefinedName { .. } | QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(
+            relevant.is_empty(),
+            "unexpected errors with deterministic enum lookup: {relevant:?}"
+        );
     }
 
     #[test]
