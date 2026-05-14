@@ -17,3 +17,5 @@ pub mod typechecker;
 pub mod diagnostics;
 // constant-pool value enum -- shared by chunk, codegen, vm
 pub mod value;
+// bytecode opcode enum -- consumed by chunk, codegen, optimizer, vm
+pub mod opcode;
