@@ -78,10 +78,99 @@ pub enum QalaError {
     /// detected; `message` is the human description.
     Parse { span: Span, message: String },
 
-    // ---- type / runtime: added in later phases, same shape ----
+    // ---- type / effect ----
+    /// an expression's actual type does not match the type required by its
+    /// context (an argument vs a parameter, an initializer vs an annotation, an
+    /// arm body vs the first arm's type, ...). span = the offending
+    /// sub-expression. `expected` and `found` are rendered via
+    /// `QalaType::display()` so the wording is always the canonical form (`i64`,
+    /// `Result<i64, str>`, `?` for the poison type, and so on).
+    TypeMismatch { span: Span, expected: String, found: String },
+
+    /// a function declared to return a non-`void` type fell off the end of its
+    /// body without producing a value. span = the last expression in the body,
+    /// or the closing brace of an empty body, because that is where the missing
+    /// value should appear. `expected` is the canonical form of the declared
+    /// return type.
+    MissingReturn { span: Span, fn_name: String, expected: String },
+
+    /// a name is used that the type checker cannot resolve to a local, a
+    /// parameter, a top-level function, or a stdlib entry. span = the
+    /// identifier. one variant covers free identifiers and unknown function
+    /// calls together; the message is the same either way.
+    UndefinedName { span: Span, name: String },
+
+    /// a type name is used (in a parameter annotation, a struct field, an enum
+    /// variant data position, a `let` annotation, a generic argument) that no
+    /// `struct` / `enum` / `interface` declaration nor any built-in primitive
+    /// matches. span = the type expression's source position.
+    UnknownType { span: Span, name: String },
+
+    /// a struct contains itself by value, directly or transitively through
+    /// other by-value compounds. span = the declaration site of the
+    /// lexicographically smallest struct in the cycle (the "head" -- chosen so
+    /// the message is deterministic). `path` lists the cycle's struct names
+    /// starting and ending with the head, so the cycle reads as a closed loop
+    /// when joined with arrows.
+    RecursiveStructByValue { span: Span, path: Vec<String> },
+
+    /// a `match` does not cover every variant of its scrutinee's enum and has
+    /// no `_` wildcard. span = the `match` keyword (where the reader's
+    /// attention belongs). `missing` is alphabetically sorted by the type
+    /// checker before this variant is constructed; the message stores the
+    /// already-sorted list verbatim so the output is deterministic.
+    NonExhaustiveMatch { span: Span, enum_name: String, missing: Vec<String> },
+
+    /// a named type used in an interface position does not satisfy the
+    /// interface: one or more required methods are missing, and one or more
+    /// methods that do exist have the wrong signature. span = the use site (the
+    /// place where the type was demanded to satisfy the interface). `missing`
+    /// and `mismatched` are sorted by the type checker; the diagnostics layer
+    /// turns them into per-method `note:` lines. each `mismatched` tuple is
+    /// `(method_name, expected_signature, found_signature)`.
+    InterfaceNotSatisfied {
+        span: Span,
+        ty: String,
+        interface: String,
+        missing: Vec<String>,
+        mismatched: Vec<(String, String, String)>,
+    },
+
+    /// a function with one effect set is calling a function with effects it has
+    /// not declared. span = the call site. `caller_effect` / `callee_effect`
+    /// are the lowercase effect words (`pure`, `io`, `alloc`, `panic`, or a
+    /// comma-joined combo like `io, alloc`) produced by
+    /// `EffectSet::display()`. the message reads "{caller_effect} function
+    /// `{caller}` calls {callee_effect} function `{callee}`".
+    EffectViolation {
+        span: Span,
+        caller: String,
+        caller_effect: String,
+        callee: String,
+        callee_effect: String,
+    },
+
+    /// the `?` operator was used somewhere it cannot be: outside a
+    /// `Result`/`Option`-returning function, or on a value whose type is not
+    /// `Result<_, _>` / `Option<_>`, or where the operand's error type does
+    /// not match the enclosing function's error type. span = the `?` token.
+    /// the type checker constructs the specific human wording so this variant
+    /// stores the message structurally, mirroring the existing `Parse`
+    /// fallback.
+    RedundantQuestionOperator { span: Span, message: String },
+
+    /// a type-level fault that does not fit any structured variant above: a
+    /// literal pattern matched against an enum value, a variant name that is
+    /// not a member of the enum, a `?` operand whose type is not `Result` /
+    /// `Option`, and so on. span = wherever the fault was detected;
+    /// `message` is the human description. mirrors the existing `Parse`
+    /// fallback so later passes can extend the type-error vocabulary without
+    /// reshaping the enum.
+    Type { span: Span, message: String },
+
+    // ---- runtime: added in later phases, same shape ----
     // keeping these as comments, not code, means later phases extend the enum
     // and teach `span()` the new arms without changing any existing variant.
-    // Type    { span: Span, message: String },
     // Runtime { span: Span, message: String },
 }
 
@@ -103,7 +192,17 @@ impl QalaError {
             | QalaError::UnexpectedToken { span, .. }
             | QalaError::UnclosedDelimiter { span, .. }
             | QalaError::UnexpectedEof { span, .. }
-            | QalaError::Parse { span, .. } => *span,
+            | QalaError::Parse { span, .. }
+            | QalaError::TypeMismatch { span, .. }
+            | QalaError::MissingReturn { span, .. }
+            | QalaError::UndefinedName { span, .. }
+            | QalaError::UnknownType { span, .. }
+            | QalaError::RecursiveStructByValue { span, .. }
+            | QalaError::NonExhaustiveMatch { span, .. }
+            | QalaError::InterfaceNotSatisfied { span, .. }
+            | QalaError::EffectViolation { span, .. }
+            | QalaError::RedundantQuestionOperator { span, .. }
+            | QalaError::Type { span, .. } => *span,
         }
     }
 
@@ -145,6 +244,39 @@ impl QalaError {
                 format!("unexpected end of input, expected {}", expected_list(expected))
             }
             QalaError::Parse { message, .. } => message.clone(),
+            QalaError::TypeMismatch { expected, found, .. } => {
+                format!("expected {expected}, found {found}")
+            }
+            QalaError::MissingReturn { fn_name, expected, .. } => {
+                format!(
+                    "function `{fn_name}` is declared to return {expected} but its body has no value"
+                )
+            }
+            QalaError::UndefinedName { name, .. } => {
+                format!("undefined name `{name}`")
+            }
+            QalaError::UnknownType { name, .. } => {
+                format!("unknown type `{name}`")
+            }
+            QalaError::RecursiveStructByValue { path, .. } => {
+                format!("recursive struct: {}", path.join(" -> "))
+            }
+            QalaError::NonExhaustiveMatch { enum_name, missing, .. } => {
+                format!(
+                    "non-exhaustive match on enum `{enum_name}`: missing variants: {}",
+                    missing.join(", ")
+                )
+            }
+            QalaError::InterfaceNotSatisfied { ty, interface, .. } => {
+                format!("type `{ty}` does not satisfy interface `{interface}`")
+            }
+            QalaError::EffectViolation { caller, caller_effect, callee, callee_effect, .. } => {
+                format!(
+                    "{caller_effect} function `{caller}` calls {callee_effect} function `{callee}`"
+                )
+            }
+            QalaError::RedundantQuestionOperator { message, .. } => message.clone(),
+            QalaError::Type { message, .. } => message.clone(),
         }
     }
 }
@@ -323,6 +455,85 @@ mod tests {
     }
 
     #[test]
+    fn span_returns_the_carried_span_for_every_type_variant() {
+        let cases: Vec<(QalaError, Span)> = vec![
+            (
+                QalaError::TypeMismatch {
+                    span: sample(1),
+                    expected: "i64".to_string(),
+                    found: "str".to_string(),
+                },
+                sample(1),
+            ),
+            (
+                QalaError::MissingReturn {
+                    span: sample(2),
+                    fn_name: "f".to_string(),
+                    expected: "i64".to_string(),
+                },
+                sample(2),
+            ),
+            (
+                QalaError::UndefinedName { span: sample(3), name: "x".to_string() },
+                sample(3),
+            ),
+            (
+                QalaError::UnknownType { span: sample(4), name: "Shape".to_string() },
+                sample(4),
+            ),
+            (
+                QalaError::RecursiveStructByValue {
+                    span: sample(5),
+                    path: vec!["A".to_string(), "B".to_string(), "A".to_string()],
+                },
+                sample(5),
+            ),
+            (
+                QalaError::NonExhaustiveMatch {
+                    span: sample(6),
+                    enum_name: "Dir".to_string(),
+                    missing: vec!["Bar".to_string(), "Foo".to_string()],
+                },
+                sample(6),
+            ),
+            (
+                QalaError::InterfaceNotSatisfied {
+                    span: sample(7),
+                    ty: "Point".to_string(),
+                    interface: "Printable".to_string(),
+                    missing: vec!["to_string".to_string()],
+                    mismatched: vec![],
+                },
+                sample(7),
+            ),
+            (
+                QalaError::EffectViolation {
+                    span: sample(8),
+                    caller: "compute".to_string(),
+                    caller_effect: "pure".to_string(),
+                    callee: "println".to_string(),
+                    callee_effect: "io".to_string(),
+                },
+                sample(8),
+            ),
+            (
+                QalaError::RedundantQuestionOperator {
+                    span: sample(9),
+                    message: "`?` outside a Result-returning function".to_string(),
+                },
+                sample(9),
+            ),
+            (
+                QalaError::Type { span: sample(10), message: "literal pattern cannot match an enum value".to_string() },
+                sample(10),
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.span(), expected, "span() mismatch for {err:?}");
+        }
+    }
+
+    #[test]
     fn errors_are_comparable_and_clonable() {
         let a = QalaError::IntOverflow { span: sample(0) };
         let b = a.clone();
@@ -353,11 +564,139 @@ mod tests {
             },
             QalaError::UnexpectedEof { span: sample(0), expected: vec![TokenKind::Ident(String::new())] },
             QalaError::Parse { span: sample(0), message: "expression nests too deeply".to_string() },
+            QalaError::TypeMismatch {
+                span: sample(0),
+                expected: "i64".to_string(),
+                found: "str".to_string(),
+            },
+            QalaError::MissingReturn {
+                span: sample(0),
+                fn_name: "f".to_string(),
+                expected: "i64".to_string(),
+            },
+            QalaError::UndefinedName { span: sample(0), name: "x".to_string() },
+            QalaError::UnknownType { span: sample(0), name: "Shape".to_string() },
+            QalaError::RecursiveStructByValue {
+                span: sample(0),
+                path: vec!["A".to_string(), "B".to_string(), "A".to_string()],
+            },
+            QalaError::NonExhaustiveMatch {
+                span: sample(0),
+                enum_name: "Dir".to_string(),
+                missing: vec!["Bar".to_string(), "Foo".to_string()],
+            },
+            QalaError::InterfaceNotSatisfied {
+                span: sample(0),
+                ty: "Point".to_string(),
+                interface: "Printable".to_string(),
+                missing: vec!["to_string".to_string()],
+                mismatched: vec![],
+            },
+            QalaError::EffectViolation {
+                span: sample(0),
+                caller: "compute".to_string(),
+                caller_effect: "pure".to_string(),
+                callee: "println".to_string(),
+                callee_effect: "io".to_string(),
+            },
+            QalaError::RedundantQuestionOperator {
+                span: sample(0),
+                message: "`?` outside a Result-returning function".to_string(),
+            },
+            QalaError::Type {
+                span: sample(0),
+                message: "variant `Square` is not part of enum `Shape`".to_string(),
+            },
         ];
         for e in &errs {
             let m = e.message();
             assert!(!m.is_empty());
             assert!(!m.contains('\n'), "message should be one line: {m:?}");
+        }
+    }
+
+    #[test]
+    fn type_mismatch_message_uses_expected_vs_found_template() {
+        let e = QalaError::TypeMismatch {
+            span: sample(0),
+            expected: "i64".to_string(),
+            found: "str".to_string(),
+        };
+        assert_eq!(e.message(), "expected i64, found str");
+    }
+
+    #[test]
+    fn effect_violation_message_uses_locked_template() {
+        let e = QalaError::EffectViolation {
+            span: sample(0),
+            caller: "compute".to_string(),
+            caller_effect: "pure".to_string(),
+            callee: "println".to_string(),
+            callee_effect: "io".to_string(),
+        };
+        let m = e.message();
+        // exact substring required by the diagnostics renderer's wording-drift test.
+        assert!(
+            m.contains("pure function `compute` calls io function `println`"),
+            "effect violation message drift: {m:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_struct_message_joins_path_with_arrows() {
+        let e = QalaError::RecursiveStructByValue {
+            span: sample(0),
+            path: vec!["A".to_string(), "B".to_string(), "A".to_string()],
+        };
+        let m = e.message();
+        assert!(m.contains("A -> B -> A"), "missing arrow-joined path: {m:?}");
+        // the literal "recursive struct" prefix is the locked wording.
+        assert!(m.starts_with("recursive struct: "), "missing prefix: {m:?}");
+    }
+
+    #[test]
+    fn non_exhaustive_match_message_lists_missing_variants() {
+        // the type checker pre-sorts `missing`; the variant stores it verbatim.
+        let e = QalaError::NonExhaustiveMatch {
+            span: sample(0),
+            enum_name: "Dir".to_string(),
+            missing: vec!["Bar".to_string(), "Foo".to_string()],
+        };
+        let m = e.message();
+        assert!(m.contains("missing variants: Bar, Foo"), "{m:?}");
+        assert!(m.contains("`Dir`"), "missing enum name: {m:?}");
+    }
+
+    #[test]
+    fn interface_not_satisfied_message_names_type_and_interface() {
+        let e = QalaError::InterfaceNotSatisfied {
+            span: sample(0),
+            ty: "Point".to_string(),
+            interface: "Printable".to_string(),
+            missing: vec!["to_string".to_string()],
+            mismatched: vec![(
+                "render".to_string(),
+                "fn(self) -> str".to_string(),
+                "fn(self) -> i64".to_string(),
+            )],
+        };
+        let m = e.message();
+        assert!(m.contains("`Point`"), "missing type name: {m:?}");
+        assert!(m.contains("`Printable`"), "missing interface name: {m:?}");
+        // the per-method details flow into the diagnostic `notes` list, not the
+        // message, so the message stays one line.
+        assert!(!m.contains('\n'), "message should be one line: {m:?}");
+        // the carried `missing` and `mismatched` lists round-trip verbatim
+        // (the type checker pre-sorts; nothing here re-orders them).
+        match &e {
+            QalaError::InterfaceNotSatisfied { missing, mismatched, .. } => {
+                assert_eq!(missing, &vec!["to_string".to_string()]);
+                assert_eq!(mismatched.len(), 1);
+                assert_eq!(mismatched[0].0, "render");
+                assert_eq!(mismatched[0].1, "fn(self) -> str");
+                assert_eq!(mismatched[0].2, "fn(self) -> i64");
+            }
+            _ => unreachable!(),
         }
     }
 
