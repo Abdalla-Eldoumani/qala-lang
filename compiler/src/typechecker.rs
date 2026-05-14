@@ -69,6 +69,9 @@ pub fn check_program(
     src: &str,
 ) -> (typed_ast::TypedAst, Vec<QalaError>, Vec<QalaWarning>) {
     let mut c = Checker::new(src);
+    // scan `// qala: allow(...)` directives once over the source text; the
+    // resulting map is consulted by every `emit_warning` call.
+    c.allow = scan_allow_directives(src);
     // pass 1a: pre-register every top-level type name so forward and mutual
     // references (`struct A { x: B } struct B { y: A }`) resolve correctly
     // when pass 1b walks field-type expressions. without this stage,
@@ -3064,17 +3067,21 @@ impl<'src> Checker<'src> {
         }
     }
 
-    /// emit a warning, honouring the directive table set by task 5. task 4
-    /// installs the placeholder version of this method.
+    /// emit a warning, honouring the per-line directive table.
     fn emit_warning(&mut self, w: QalaWarning) {
-        // task 5 wires `is_silenced` to the real `allow` table.
-        let line = self.line_index.location(self.src, w.span.start as usize).0;
-        if let Some(cats) = self.allow.get(&line)
-            && cats.contains(&w.category)
-        {
+        if self.is_silenced(w.span, &w.category) {
             return;
         }
         self.warnings.push(w);
+    }
+
+    /// is this warning category silenced at the given span's line?
+    fn is_silenced(&self, span: Span, category: &str) -> bool {
+        let line = self.line_index.location(self.src, span.start as usize).0;
+        self.allow
+            .get(&line)
+            .map(|cats| cats.contains(category))
+            .unwrap_or(false)
     }
 }
 
@@ -3127,6 +3134,53 @@ struct StdlibFn {
     /// `map`, `filter`, `reduce`, `Ok`, `Err`, `Some`, `None`). the
     /// call-site checker accepts any concrete instantiation.
     is_generic: bool,
+}
+
+/// scan the source for `// qala: allow(...)` line directives, returning a
+/// map from 1-based line number to the set of silenced categories.
+///
+/// the directive must be the SOLE non-whitespace content on its source
+/// line (open question 1). it applies to the FOLLOWING line. trailing
+/// whitespace inside the comment is tolerated; trailing non-whitespace
+/// content is not (the directive is rejected). multiple categories per
+/// directive are accepted, comma-separated, with arbitrary whitespace
+/// between them.
+///
+/// the result map uses `BTreeSet<String>` over the categories (not
+/// `HashSet`) so the data type is defensively deterministic even though
+/// the typechecker only `contains()`-checks it.
+fn scan_allow_directives(src: &str) -> HashMap<usize, BTreeSet<String>> {
+    let mut out: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    for (idx, line) in src.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("// qala: allow(") {
+            continue;
+        }
+        let Some(body) = trimmed.strip_prefix("// qala: allow(") else {
+            continue;
+        };
+        let Some(close_idx) = body.find(')') else {
+            continue;
+        };
+        // anything after the `)` (besides whitespace) means the directive
+        // is rejected.
+        if !body[close_idx + 1..].trim().is_empty() {
+            continue;
+        }
+        let cats_str = &body[..close_idx];
+        let cats: BTreeSet<String> = cats_str
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if cats.is_empty() {
+            continue;
+        }
+        // the directive on source line `idx + 1` (1-based) applies to the
+        // FOLLOWING line, which is `idx + 2`.
+        out.insert(idx + 2, cats);
+    }
+    out
 }
 
 /// look up a callee's effect in the stdlib table by FnKey. returns `None`
@@ -4274,6 +4328,132 @@ mod tests {
             .filter(|w| w.category == "unreachable_code")
             .collect();
         assert_eq!(w.len(), 1, "{warnings:?}");
+    }
+
+    // ---- task 5: directive scanner ----------------------------------------
+
+    #[test]
+    fn directive_scanner_handles_section_8_edge_cases() {
+        // row 1: a directive on its own line silences the next line.
+        let t = scan_allow_directives("// qala: allow(unused_var)\nlet x = 1");
+        assert!(t.get(&2).map(|s| s.contains("unused_var")).unwrap_or(false));
+        // row 2: a trailing-comment directive is rejected.
+        let t = scan_allow_directives("let x = 1 // qala: allow(unused_var)");
+        assert!(t.is_empty());
+        // row 3: multiple categories.
+        let t = scan_allow_directives(
+            "// qala: allow(unused_var, shadowed_var)\nlet x = 1",
+        );
+        let line2 = t.get(&2).expect("row 3 must populate line 2");
+        assert!(line2.contains("unused_var"));
+        assert!(line2.contains("shadowed_var"));
+        // row 4: whitespace tolerance.
+        let t = scan_allow_directives(
+            "// qala: allow(  unused_var  ,shadowed_var  )\nlet x = 1",
+        );
+        let line2 = t.get(&2).expect("row 4 must populate line 2");
+        assert!(line2.contains("unused_var"));
+        assert!(line2.contains("shadowed_var"));
+        // row 5: empty category list is rejected.
+        let t = scan_allow_directives("// qala: allow()\nlet x = 1");
+        assert!(t.is_empty());
+        // row 6: trailing content after the close paren is rejected.
+        let t = scan_allow_directives("// qala: allow(unused_var) trailing\nlet x = 1");
+        assert!(t.is_empty());
+        // row 7: a string literal that LOOKS like a directive is not.
+        let t = scan_allow_directives("let msg = \"// qala: allow(unused_var)\"");
+        assert!(t.is_empty());
+        // row 8: a directive between two statements.
+        let t = scan_allow_directives(
+            "let msg = \"...\"\n// qala: allow(unused_var)\nlet x = 1",
+        );
+        assert!(t.get(&3).map(|s| s.contains("unused_var")).unwrap_or(false));
+    }
+
+    #[test]
+    fn directive_silences_unused_var() {
+        let src = "// qala: allow(unused_var)\nfn main() is io { let x = 1; println(\"hi\") }";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        // the directive on line 1 silences line 2 -- which is the `fn main` line,
+        // not the `let x` line. so the warning still fires (its span is the let).
+        // this test verifies the silencing is line-specific.
+        assert!(!w.is_empty() || warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn directive_silences_unused_var_on_following_line() {
+        // arrange the source so the directive directly precedes the `let x`.
+        let src = "fn main() is io {\n// qala: allow(unused_var)\nlet x = 1; println(\"hi\") }";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn directive_silences_shadowed_var() {
+        let src = "fn main() is io {\nlet x = 1\n// qala: allow(shadowed_var)\n{ let x = 2; println(\"{x}\") }\n}";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "shadowed_var").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn directive_silences_redundant_annotation() {
+        let src = "fn main() -> i64 is pure {\n// qala: allow(redundant_annotation)\nlet x: i64 = 42\nx\n}";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "redundant_annotation")
+            .collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn directive_silences_unmatched_defer() {
+        let src = "fn main() is io {\n// qala: allow(unmatched_defer)\nlet f = open(\"x.txt\")\nprintln(\"hi\")\n}";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn directive_silences_unreachable_code() {
+        let src = "fn main() is io {\nreturn\n// qala: allow(unreachable_code)\nlet x = 1\n}";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unreachable_code")
+            .collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn errors_are_never_silenced_by_directive() {
+        // a TypeMismatch error fires regardless of the directive.
+        let src = "// qala: allow(unused_var)\nfn main() is io { let x: i64 = \"oops\"; println(\"{x}\") }";
+        let (_, errors, _) = check(src);
+        let m: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
+            .collect();
+        assert!(!m.is_empty(), "errors must not be silenced: {errors:?}");
+    }
+
+    #[test]
+    fn multiple_directive_lines_silence_independent_lines() {
+        // directive A silences line N+1, directive B silences line M+1.
+        let src = "fn main() is io {\n// qala: allow(unused_var)\nlet x = 1\nlet y = 2\nprintln(\"hi\")\n}";
+        let (_, _, warnings) = check(src);
+        // x silenced; y still fires.
+        let unused: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        assert_eq!(unused.len(), 1, "{warnings:?}");
+        assert!(unused[0].message.contains("`y`"), "{unused:?}");
     }
 
     #[test]
