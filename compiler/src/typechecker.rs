@@ -932,6 +932,112 @@ impl<'src> Checker<'src> {
         }
     }
 
+    /// check whether a name names a stdlib resource-returning call. v1's
+    /// allow-list is `open` only; conservative: false negatives are
+    /// acceptable, false positives are not.
+    fn is_resource_returning(name: &str) -> bool {
+        matches!(name, "open")
+    }
+
+    /// extract the handle name closed by a defer's body. recognizes
+    /// `close(name)` and `name.close()`. returns `None` for any other
+    /// shape.
+    fn extract_closed_handle(expr: &ast::Expr) -> Option<String> {
+        match expr {
+            ast::Expr::Call { callee, args, .. } => {
+                if let ast::Expr::Ident { name, .. } = callee.as_ref()
+                    && name == "close"
+                    && args.len() == 1
+                    && let ast::Expr::Ident { name: h, .. } = &args[0]
+                {
+                    return Some(h.clone());
+                }
+                None
+            }
+            ast::Expr::MethodCall { receiver, name, args, .. } => {
+                if name == "close"
+                    && args.is_empty()
+                    && let ast::Expr::Ident { name: h, .. } = receiver.as_ref()
+                {
+                    return Some(h.clone());
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// scan a block (and recursively, its nested blocks) for resource
+    /// bindings without a matching `defer close`.
+    fn check_unmatched_defer(&mut self, block: &ast::Block) {
+        // collect bindings of the form `let h = open(...)` in this block's
+        // stmts -- only at this level; nested blocks are handled by the
+        // recursion below.
+        let mut handle_bindings: Vec<(String, Span)> = Vec::new();
+        for stmt in &block.stmts {
+            if let ast::Stmt::Let { name, init, span, .. } = stmt
+                && let ast::Expr::Call { callee, .. } = init
+                && let ast::Expr::Ident { name: cname, .. } = callee.as_ref()
+                && Self::is_resource_returning(cname)
+            {
+                handle_bindings.push((name.clone(), *span));
+            }
+        }
+        // collect closed handle names from same-block defer statements.
+        let mut closed: BTreeSet<String> = BTreeSet::new();
+        for stmt in &block.stmts {
+            if let ast::Stmt::Defer { expr, .. } = stmt
+                && let Some(h) = Self::extract_closed_handle(expr)
+            {
+                closed.insert(h);
+            }
+        }
+        // fire unmatched_defer for any handle binding with no matching close.
+        for (name, span) in &handle_bindings {
+            if !closed.contains(name) {
+                let w = QalaWarning {
+                    category: "unmatched_defer".to_string(),
+                    message: format!(
+                        "resource `{name}` is acquired without a matching `defer close`"
+                    ),
+                    span: *span,
+                    note: None,
+                };
+                self.emit_warning(w);
+            }
+        }
+        // recurse into nested blocks.
+        for stmt in &block.stmts {
+            match stmt {
+                ast::Stmt::If { then_block, else_branch, .. } => {
+                    self.check_unmatched_defer(then_block);
+                    match else_branch {
+                        Some(ast::ElseBranch::Block(b)) => self.check_unmatched_defer(b),
+                        Some(ast::ElseBranch::If(boxed)) => {
+                            // chase the if-chain.
+                            if let ast::Stmt::If { then_block, else_branch, .. } = boxed.as_ref() {
+                                self.check_unmatched_defer(then_block);
+                                if let Some(ast::ElseBranch::Block(b)) = else_branch {
+                                    self.check_unmatched_defer(b);
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                ast::Stmt::While { body, .. } => self.check_unmatched_defer(body),
+                ast::Stmt::For { body, .. } => self.check_unmatched_defer(body),
+                _ => {}
+            }
+        }
+        // also recurse into the trailing value's block, if it is one.
+        if let Some(boxed) = &block.value
+            && let ast::Expr::Block { block: inner, .. } = boxed.as_ref()
+        {
+            self.check_unmatched_defer(inner);
+        }
+    }
+
     /// check a single fn declaration: open a scope, bind params, walk the
     /// body, close the scope, build the `TypedFnDecl`.
     fn check_fn_decl(&mut self, d: &ast::FnDecl) -> typed_ast::TypedItem {
@@ -992,6 +1098,9 @@ impl<'src> Checker<'src> {
 
         // check the body against the declared return type.
         let body = self.check_block(&d.body, Some(&ret_ty));
+        // unmatched_defer scan: walk the body looking for `let h = open(...)`
+        // without a same-scope `defer close(h)`.
+        self.check_unmatched_defer(&d.body);
 
         // missing-return check: a function declared to return a non-Void type
         // must produce a value (a trailing block expression or a return
@@ -4003,6 +4112,168 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    // ---- task 4: five warning categories ----------------------------------
+
+    #[test]
+    fn unused_var_warns_with_correct_category() {
+        let src = "fn main() is io { let x = 1; println(\"hi\") }";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> = warnings.iter().filter(|w| w.category == "unused_var").collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
+        assert!(w[0].message.contains("`x`"), "{w:?}");
+    }
+
+    #[test]
+    fn underscore_prefixed_name_exempt_from_unused_var() {
+        let src = "fn main() is io { let _ = 1; println(\"hi\") }";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn function_params_exempt_from_unused_var() {
+        // open question 4: parameters never fire unused_var.
+        let src = "fn f(x: i64) -> i64 is pure { 1 }";
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn shadowed_var_warns_with_prior_binding_note() {
+        let src = r#"
+            fn main() is io {
+                let x = 1
+                {
+                    let x = 2
+                    println("{x}")
+                }
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "shadowed_var").collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
+        assert!(w[0].note.is_some(), "{w:?}");
+        assert!(w[0].note.as_ref().unwrap().contains("prior binding"), "{w:?}");
+    }
+
+    #[test]
+    fn redundant_annotation_warns_for_matching_inferred_type() {
+        let src = r#"
+            fn main() -> i64 is pure {
+                let x: i64 = 42
+                x
+            }
+        "#;
+        let (_, errors, warnings) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "redundant_annotation")
+            .collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn unmatched_defer_warns() {
+        let src = r#"
+            fn main() is io {
+                let f = open("x.txt")
+                println("hi")
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn unmatched_defer_silenced_by_call_form_close() {
+        let src = r#"
+            fn main() is io {
+                let f = open("x.txt")
+                defer close(f)
+                println("hi")
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn unmatched_defer_silenced_by_method_form_close() {
+        let src = r#"
+            fn main() is io {
+                let f = open("x.txt")
+                defer f.close()
+                println("hi")
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        assert!(w.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn unmatched_defer_fires_per_handle_independently() {
+        let src = r#"
+            fn main() is io {
+                let f = open("x.txt")
+                let g = open("y.txt")
+                defer close(f)
+                println("hi")
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> =
+            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
+        // the warning is at the `let g` site.
+        assert!(w[0].message.contains("`g`"), "{w:?}");
+    }
+
+    #[test]
+    fn unreachable_code_fires_after_return_keyword_followed_by_stmt_head() {
+        let src = r#"
+            fn main() is io {
+                return
+                let x = 1
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unreachable_code")
+            .collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn unreachable_code_fires_exactly_once_per_block() {
+        // multiple subsequent statements after `return` -- only ONE warning.
+        let src = r#"
+            fn main() is io {
+                return
+                let x = 1
+                let y = 2
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unreachable_code")
+            .collect();
+        assert_eq!(w.len(), 1, "{warnings:?}");
     }
 
     #[test]
