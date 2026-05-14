@@ -7,6 +7,7 @@
 //! variants follow the same `{ span, message }` shape and are sketched in
 //! comments below so later phases extend this enum rather than restructure it.
 
+use crate::ast::BinOp;
 use crate::span::Span;
 use crate::token::TokenKind;
 
@@ -168,6 +169,44 @@ pub enum QalaError {
     /// reshaping the enum.
     Type { span: Span, message: String },
 
+    // ---- codegen / comptime ----
+    /// an arithmetic operation that would overflow `i64` if computed at
+    /// compile time. emitted by codegen's inline constant folder before the
+    /// operation is materialised in bytecode. span = the outer binary
+    /// operator's full span (the `Binary { span, .. }` node, not the
+    /// operator-token span). `op` is the offending operator; `lhs` and `rhs`
+    /// are the literal operands at fold time, used to render a precise
+    /// message like `integer overflow: 9223372036854775807 * 2 does not fit
+    /// in i64`. comparison and logical [`BinOp`] variants (`Eq`, `Lt`, `&&`,
+    /// and the rest) never reach this variant -- those folds cannot overflow.
+    IntegerOverflow { span: Span, op: BinOp, lhs: i64, rhs: i64 },
+
+    /// the comptime interpreter exhausted its 100000-instruction budget.
+    /// emitted at the originating `comptime { ... }` block, not at the
+    /// runaway instruction inside it -- the reader's attention belongs at
+    /// the block declaration so they can shrink the work. the budget is a
+    /// hard limit; raising it is a v2 concern.
+    ComptimeBudgetExceeded { span: Span },
+
+    /// defense-in-depth: the comptime interpreter dispatched a CALL whose
+    /// callee is not pure. phase 3's effect checker should have caught this;
+    /// emitting at codegen prevents the comptime interpreter from running
+    /// an IO/alloc/panic body if the typechecker missed something. span =
+    /// the comptime block's span (NOT the call site, since by codegen time
+    /// the call is buried inside the throwaway chunk); `fn_name` is the
+    /// callee name; `effect` is `EffectSet::display()` of the callee's
+    /// effect (one of `pure`, `io`, `alloc`, `panic`, or a comma-joined
+    /// combo like `io, alloc`).
+    ComptimeEffectViolation { span: Span, fn_name: String, effect: String },
+
+    /// the comptime block evaluated successfully but its result is not
+    /// representable in the constant pool: an array, a struct, an
+    /// enum-variant payload, or any heap-allocated compound. span = the
+    /// comptime block; `type_name` is `QalaType::display()` of the result's
+    /// type. v1 keeps the constant pool primitives-and-strings-only;
+    /// relaxing this is a future enhancement.
+    ComptimeResultNotConstable { span: Span, type_name: String },
+
     // ---- runtime: added in later phases, same shape ----
     // keeping these as comments, not code, means later phases extend the enum
     // and teach `span()` the new arms without changing any existing variant.
@@ -202,7 +241,11 @@ impl QalaError {
             | QalaError::InterfaceNotSatisfied { span, .. }
             | QalaError::EffectViolation { span, .. }
             | QalaError::RedundantQuestionOperator { span, .. }
-            | QalaError::Type { span, .. } => *span,
+            | QalaError::Type { span, .. }
+            | QalaError::IntegerOverflow { span, .. }
+            | QalaError::ComptimeBudgetExceeded { span }
+            | QalaError::ComptimeEffectViolation { span, .. }
+            | QalaError::ComptimeResultNotConstable { span, .. } => *span,
         }
     }
 
@@ -277,6 +320,20 @@ impl QalaError {
             }
             QalaError::RedundantQuestionOperator { message, .. } => message.clone(),
             QalaError::Type { message, .. } => message.clone(),
+            QalaError::IntegerOverflow { op, lhs, rhs, .. } => {
+                format!("integer overflow: {lhs} {} {rhs} does not fit in i64", op_symbol(op))
+            }
+            QalaError::ComptimeBudgetExceeded { .. } => {
+                "comptime evaluation exceeded 100000-instruction budget".to_string()
+            }
+            QalaError::ComptimeEffectViolation { fn_name, effect, .. } => {
+                format!("comptime block calls {effect} function `{fn_name}`")
+            }
+            QalaError::ComptimeResultNotConstable { type_name, .. } => {
+                format!(
+                    "comptime result of type `{type_name}` is not representable as a constant (only primitives and strings)"
+                )
+            }
         }
     }
 }
@@ -382,6 +439,31 @@ fn expected_list(expected: &[TokenKind]) -> String {
         [only] => only.to_string(),
         [a, b] => format!("{a} or {b}"),
         [head @ .., last] => format!("{}, or {}", head.join(", "), last),
+    }
+}
+
+/// the operator symbol for an [`QalaError::IntegerOverflow`] message.
+///
+/// arithmetic ops return their symbol; non-arithmetic [`BinOp`] variants
+/// (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`/`And`/`Or`) cannot overflow under constant
+/// folding so the fallback `?` is never reached in practice -- but returning a
+/// fallback rather than panicking keeps the WASM build crash-free per the
+/// project convention. takes `&BinOp` because [`BinOp`] is not `Copy`.
+fn op_symbol(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Rem => "%",
+        BinOp::Eq
+        | BinOp::Ne
+        | BinOp::Lt
+        | BinOp::Le
+        | BinOp::Gt
+        | BinOp::Ge
+        | BinOp::And
+        | BinOp::Or => "?",
     }
 }
 
@@ -607,6 +689,22 @@ mod tests {
                 span: sample(0),
                 message: "variant `Square` is not part of enum `Shape`".to_string(),
             },
+            QalaError::IntegerOverflow {
+                span: sample(0),
+                op: BinOp::Mul,
+                lhs: i64::MAX,
+                rhs: 2,
+            },
+            QalaError::ComptimeBudgetExceeded { span: sample(0) },
+            QalaError::ComptimeEffectViolation {
+                span: sample(0),
+                fn_name: "println".to_string(),
+                effect: "io".to_string(),
+            },
+            QalaError::ComptimeResultNotConstable {
+                span: sample(0),
+                type_name: "[i64; 3]".to_string(),
+            },
         ];
         for e in &errs {
             let m = e.message();
@@ -767,5 +865,125 @@ mod tests {
         );
         // an empty set should not occur, but it must not panic.
         assert_eq!(expected_list(&[]), "something else");
+    }
+
+    #[test]
+    fn span_returns_the_carried_span_for_every_codegen_variant() {
+        let cases: Vec<(QalaError, Span)> = vec![
+            (
+                QalaError::IntegerOverflow {
+                    span: sample(1),
+                    op: BinOp::Mul,
+                    lhs: i64::MAX,
+                    rhs: 2,
+                },
+                sample(1),
+            ),
+            (QalaError::ComptimeBudgetExceeded { span: sample(2) }, sample(2)),
+            (
+                QalaError::ComptimeEffectViolation {
+                    span: sample(3),
+                    fn_name: "println".to_string(),
+                    effect: "io".to_string(),
+                },
+                sample(3),
+            ),
+            (
+                QalaError::ComptimeResultNotConstable {
+                    span: sample(4),
+                    type_name: "[i64; 3]".to_string(),
+                },
+                sample(4),
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.span(), expected, "span() mismatch for {err:?}");
+        }
+    }
+
+    #[test]
+    fn integer_overflow_message_renders_mul_with_locked_wording() {
+        let e = QalaError::IntegerOverflow {
+            span: sample(0),
+            op: BinOp::Mul,
+            lhs: i64::MAX,
+            rhs: 2,
+        };
+        assert_eq!(
+            e.message(),
+            "integer overflow: 9223372036854775807 * 2 does not fit in i64"
+        );
+    }
+
+    #[test]
+    fn integer_overflow_message_renders_add_with_locked_wording() {
+        let e = QalaError::IntegerOverflow {
+            span: sample(0),
+            op: BinOp::Add,
+            lhs: i64::MAX,
+            rhs: 1,
+        };
+        assert_eq!(
+            e.message(),
+            "integer overflow: 9223372036854775807 + 1 does not fit in i64"
+        );
+    }
+
+    #[test]
+    fn integer_overflow_message_renders_sub_with_locked_wording() {
+        let e = QalaError::IntegerOverflow {
+            span: sample(0),
+            op: BinOp::Sub,
+            lhs: i64::MIN,
+            rhs: 1,
+        };
+        assert_eq!(
+            e.message(),
+            "integer overflow: -9223372036854775808 - 1 does not fit in i64"
+        );
+    }
+
+    #[test]
+    fn comptime_budget_exceeded_message_uses_locked_wording() {
+        let e = QalaError::ComptimeBudgetExceeded { span: sample(0) };
+        assert_eq!(
+            e.message(),
+            "comptime evaluation exceeded 100000-instruction budget"
+        );
+    }
+
+    #[test]
+    fn comptime_effect_violation_message_quotes_only_the_fn_name() {
+        let e = QalaError::ComptimeEffectViolation {
+            span: sample(0),
+            fn_name: "println".to_string(),
+            effect: "io".to_string(),
+        };
+        // backticks around the function name, none around the effect word.
+        assert_eq!(e.message(), "comptime block calls io function `println`");
+    }
+
+    #[test]
+    fn comptime_result_not_constable_message_quotes_the_type_name() {
+        let e = QalaError::ComptimeResultNotConstable {
+            span: sample(0),
+            type_name: "[i64; 3]".to_string(),
+        };
+        assert_eq!(
+            e.message(),
+            "comptime result of type `[i64; 3]` is not representable as a constant (only primitives and strings)"
+        );
+    }
+
+    #[test]
+    fn op_symbol_maps_arithmetic_binops_and_falls_back_for_others() {
+        assert_eq!(op_symbol(&BinOp::Add), "+");
+        assert_eq!(op_symbol(&BinOp::Sub), "-");
+        assert_eq!(op_symbol(&BinOp::Mul), "*");
+        assert_eq!(op_symbol(&BinOp::Div), "/");
+        assert_eq!(op_symbol(&BinOp::Rem), "%");
+        // every non-arithmetic op shares the `?` fallback; one is enough to lock
+        // the contract.
+        assert_eq!(op_symbol(&BinOp::Eq), "?");
     }
 }
