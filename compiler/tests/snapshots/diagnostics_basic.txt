@@ -1,0 +1,32 @@
+error: expected i64, found str
+  --> 1:24
+   |
+1  |   fn f() -> i64 { return "x" }
+   |                          ^^^
+   |
+
+===
+error: non-exhaustive match on enum `Shape`: missing variants: Triangle
+  --> 2:25
+   |
+2  |   fn f(s: Shape) -> i64 { match s { Circle(r) => r, Rect(w) => w } }
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: add an arm for: Triangle
+
+===
+error: pure function `f` calls io function `println`
+  --> 1:18
+   |
+1  |   fn f() is pure { println("hi") }
+   |                    ^^^^^^^^^^^^^
+   |
+   = hint: remove the `is pure` annotation, or refactor to remove the io call
+
+===
+warning: unused variable `x`
+  --> 2:3
+   |
+2  |     let x = 1
+   |     ^^^^^^^^^
+   |
