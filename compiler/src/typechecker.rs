@@ -3108,12 +3108,16 @@ fn types_strictly_equal(a: &QalaType, b: &QalaType) -> bool {
     a == b
 }
 
-/// format a method signature as `fn(P1, P2) -> R` for the
-/// `InterfaceNotSatisfied` mismatched payload. params are the method's
-/// param types without the self slot.
+/// format a method signature as `fn(self) -> R` (zero params) or
+/// `fn(self, P1, P2) -> R` for the `InterfaceNotSatisfied` mismatched
+/// payload. params are the method's param types without the self slot.
 fn format_fn_sig(params: &[QalaType], ret: &QalaType) -> String {
-    let p: Vec<String> = params.iter().map(|t| t.display()).collect();
-    format!("fn(self, {}) -> {}", p.join(", "), ret.display())
+    if params.is_empty() {
+        format!("fn(self) -> {}", ret.display())
+    } else {
+        let p: Vec<String> = params.iter().map(|t| t.display()).collect();
+        format!("fn(self, {}) -> {}", p.join(", "), ret.display())
+    }
 }
 
 /// one entry in the stdlib signature table. task 3 fills in the actual
@@ -4455,6 +4459,49 @@ mod tests {
             warnings.iter().filter(|w| w.category == "unused_var").collect();
         assert_eq!(unused.len(), 1, "{warnings:?}");
         assert!(unused[0].message.contains("`y`"), "{unused:?}");
+    }
+
+    #[test]
+    fn zero_param_method_sig_has_no_trailing_comma() {
+        // format_fn_sig with empty params must produce "fn(self) -> T",
+        // not "fn(self, ) -> T". trigger via interface mismatch where the
+        // impl's read_all returns i64 instead of Result<str, str>.
+        let src = r#"
+interface Reader { fn read_all(self) -> Result<str, str> }
+struct MyReader { }
+fn MyReader.read_all(self) -> i64 is pure { return 0 }
+fn use_it(r: MyReader) is pure { }
+"#;
+        let (_, errors, _) = check(src);
+        // find the InterfaceNotSatisfied error.
+        let iface_errs: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::InterfaceNotSatisfied { .. }))
+            .collect();
+        // if the check fires, the expected sig must not contain ", )".
+        if !iface_errs.is_empty() {
+            match iface_errs[0] {
+                QalaError::InterfaceNotSatisfied { mismatched, .. } => {
+                    for (_, expected_sig, found_sig) in mismatched {
+                        assert!(
+                            !expected_sig.contains(", )"),
+                            "expected sig has trailing comma: {expected_sig:?}"
+                        );
+                        assert!(
+                            !found_sig.contains(", )"),
+                            "found sig has trailing comma: {found_sig:?}"
+                        );
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        // direct unit-level check: format_fn_sig with no params.
+        let sig = format_fn_sig(&[], &QalaType::I64);
+        assert_eq!(sig, "fn(self) -> i64", "zero-param sig: {sig:?}");
+        // with one param: must include the param after "self, ".
+        let sig2 = format_fn_sig(&[QalaType::Str], &QalaType::Bool);
+        assert_eq!(sig2, "fn(self, str) -> bool", "one-param sig: {sig2:?}");
     }
 
     #[test]
