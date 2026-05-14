@@ -12,3 +12,4 @@ pub mod ast;
 pub mod parser;
 pub mod types;
 pub mod effects;
+pub mod typed_ast;
