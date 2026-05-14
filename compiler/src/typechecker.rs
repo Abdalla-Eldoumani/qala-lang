@@ -2194,16 +2194,16 @@ impl<'src> Checker<'src> {
                 let typed_args = self.check_call_args(args, &params, is_generic, &name_clone, span);
                 // abs only accepts i64 or f64; the generic param placeholder lets
                 // non-numeric types through check_call_args, so we guard here.
-                if name_clone == "abs" {
-                    if let Some(arg0) = typed_args.first() {
-                        let arg_ty = arg0.ty();
-                        if !matches!(arg_ty, QalaType::I64 | QalaType::F64 | QalaType::Unknown) {
-                            self.errors.push(QalaError::TypeMismatch {
-                                span,
-                                expected: "i64 or f64".to_string(),
-                                found: arg_ty.display(),
-                            });
-                        }
+                if name_clone == "abs"
+                    && let Some(arg0) = typed_args.first()
+                {
+                    let arg_ty = arg0.ty();
+                    if !matches!(arg_ty, QalaType::I64 | QalaType::F64 | QalaType::Unknown) {
+                        self.errors.push(QalaError::TypeMismatch {
+                            span,
+                            expected: "i64 or f64".to_string(),
+                            found: arg_ty.display(),
+                        });
                     }
                 }
                 let result_ty = self.resolve_generic_return_ty(&name_clone, &ret_ty, &typed_args);
@@ -2842,7 +2842,6 @@ impl<'src> Checker<'src> {
     /// (param-types, return-type) match (effects NOT compared per open
     /// question 2). emits one `InterfaceNotSatisfied` carrying the
     /// `missing` and `mismatched` lists.
-    #[allow(dead_code)]
     fn check_satisfies(&mut self, ty: &QalaType, interface_name: &str, use_span: Span) {
         let type_name = match ty {
             QalaType::Named(Symbol(s)) => s.clone(),
