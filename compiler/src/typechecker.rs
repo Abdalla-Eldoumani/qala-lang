@@ -2299,6 +2299,11 @@ impl<'src> Checker<'src> {
         match name {
             "len" => QalaType::I64,
             "push" => QalaType::Void,
+            // abs mirrors its input type: abs(-3) -> i64, abs(1.5) -> f64.
+            "abs" => typed_args
+                .first()
+                .map(|a| a.ty().clone())
+                .unwrap_or(QalaType::Unknown),
             "pop" => {
                 // pop returns Option<T> where T is the element type of arg 0.
                 if let Some(arg0) = typed_args.first()
@@ -3234,18 +3239,13 @@ fn stdlib_signatures() -> Vec<StdlibFn> {
         StdlibFn {
             type_name: None,
             name: "abs".to_string(),
-            params: vec![QalaType::I64],
-            ret_ty: QalaType::I64,
+            // generic: accepts i64 or f64; resolve_generic_return_ty
+            // returns the actual argument type so abs(-3) -> i64 and
+            // abs(1.5) -> f64 both typecheck correctly.
+            params: vec![QalaType::Unknown],
+            ret_ty: QalaType::Unknown,
             effect: EffectSet::pure(),
-            is_generic: false,
-        },
-        StdlibFn {
-            type_name: None,
-            name: "abs".to_string(),
-            params: vec![QalaType::F64],
-            ret_ty: QalaType::F64,
-            effect: EffectSet::pure(),
-            is_generic: false,
+            is_generic: true,
         },
         StdlibFn {
             type_name: None,
@@ -4459,6 +4459,30 @@ mod tests {
             warnings.iter().filter(|w| w.category == "unused_var").collect();
         assert_eq!(unused.len(), 1, "{warnings:?}");
         assert!(unused[0].message.contains("`y`"), "{unused:?}");
+    }
+
+    #[test]
+    fn abs_resolves_to_i64_for_int_arg_and_f64_for_float_arg() {
+        // abs(-3) must typecheck and return i64.
+        let src_int = "fn main() -> i64 is pure { return abs(-3) }";
+        let (typed, errors, _) = check(src_int);
+        assert!(errors.is_empty(), "abs(i64) errors: {errors:?}");
+        match &typed[0] {
+            typed_ast::TypedItem::Fn(f) => {
+                assert_eq!(f.ret_ty, QalaType::I64);
+            }
+            _ => panic!("expected Fn"),
+        }
+        // abs(1.5) must typecheck and return f64.
+        let src_float = "fn main() -> f64 is pure { return abs(1.5) }";
+        let (typed2, errors2, _) = check(src_float);
+        assert!(errors2.is_empty(), "abs(f64) errors: {errors2:?}");
+        match &typed2[0] {
+            typed_ast::TypedItem::Fn(f) => {
+                assert_eq!(f.ret_ty, QalaType::F64);
+            }
+            _ => panic!("expected Fn"),
+        }
     }
 
     #[test]
