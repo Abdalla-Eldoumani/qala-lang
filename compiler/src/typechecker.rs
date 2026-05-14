@@ -1012,33 +1012,36 @@ impl<'src> Checker<'src> {
         }
         // recurse into nested blocks.
         for stmt in &block.stmts {
-            match stmt {
-                ast::Stmt::If { then_block, else_branch, .. } => {
-                    self.check_unmatched_defer(then_block);
-                    match else_branch {
-                        Some(ast::ElseBranch::Block(b)) => self.check_unmatched_defer(b),
-                        Some(ast::ElseBranch::If(boxed)) => {
-                            // chase the if-chain.
-                            if let ast::Stmt::If { then_block, else_branch, .. } = boxed.as_ref() {
-                                self.check_unmatched_defer(then_block);
-                                if let Some(ast::ElseBranch::Block(b)) = else_branch {
-                                    self.check_unmatched_defer(b);
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-                }
-                ast::Stmt::While { body, .. } => self.check_unmatched_defer(body),
-                ast::Stmt::For { body, .. } => self.check_unmatched_defer(body),
-                _ => {}
-            }
+            self.check_unmatched_defer_stmt(stmt);
         }
         // also recurse into the trailing value's block, if it is one.
         if let Some(boxed) = &block.value
             && let ast::Expr::Block { block: inner, .. } = boxed.as_ref()
         {
             self.check_unmatched_defer(inner);
+        }
+    }
+
+    /// recurse the defer-mismatch scan through one statement. for `if`,
+    /// visits the then-block and the full else chain (including arbitrarily
+    /// deep `else if` nesting) so every branch is checked.
+    fn check_unmatched_defer_stmt(&mut self, stmt: &ast::Stmt) {
+        match stmt {
+            ast::Stmt::If { then_block, else_branch, .. } => {
+                self.check_unmatched_defer(then_block);
+                match else_branch {
+                    Some(ast::ElseBranch::Block(b)) => self.check_unmatched_defer(b),
+                    Some(ast::ElseBranch::If(boxed)) => {
+                        // recurse into the nested if-stmt so else-if chains
+                        // of any depth are all visited.
+                        self.check_unmatched_defer_stmt(boxed);
+                    }
+                    None => {}
+                }
+            }
+            ast::Stmt::While { body, .. } => self.check_unmatched_defer(body),
+            ast::Stmt::For { body, .. } => self.check_unmatched_defer(body),
+            _ => {}
         }
     }
 
@@ -4460,6 +4463,38 @@ mod tests {
             warnings.iter().filter(|w| w.category == "unused_var").collect();
         assert_eq!(unused.len(), 1, "{warnings:?}");
         assert!(unused[0].message.contains("`y`"), "{unused:?}");
+    }
+
+    #[test]
+    fn unmatched_defer_fires_in_innermost_else_if_branch() {
+        // three-level else-if chain; only the innermost branch opens a file
+        // without a defer. must produce exactly one unmatched_defer warning.
+        let src = r#"
+fn main(a: bool, b: bool, c: bool) is io {
+    if a {
+        let x = 1
+    } else if b {
+        let y = 2
+    } else if c {
+        let f = open("x.txt")
+    }
+}
+"#;
+        let (_, _, warnings) = check(src);
+        let unmatched: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unmatched_defer")
+            .collect();
+        assert_eq!(
+            unmatched.len(),
+            1,
+            "expected one unmatched_defer in innermost else-if: {warnings:?}"
+        );
+        assert!(
+            unmatched[0].message.contains("`f`"),
+            "warning should name the handle: {:?}",
+            unmatched[0].message
+        );
     }
 
     #[test]
