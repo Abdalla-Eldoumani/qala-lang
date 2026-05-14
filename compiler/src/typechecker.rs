@@ -2777,12 +2777,13 @@ impl<'src> Checker<'src> {
             }
         }
         if !has_wildcard {
-            let missing: Vec<String> = variants
+            let mut missing: Vec<String> = variants
                 .iter()
                 .filter(|v| !covered.contains(*v))
                 .cloned()
                 .collect();
             if !missing.is_empty() {
+                missing.sort();
                 self.errors.push(QalaError::NonExhaustiveMatch {
                     span: match_span,
                     enum_name: enum_name.to_string(),
@@ -4454,6 +4455,33 @@ mod tests {
             warnings.iter().filter(|w| w.category == "unused_var").collect();
         assert_eq!(unused.len(), 1, "{warnings:?}");
         assert!(unused[0].message.contains("`y`"), "{unused:?}");
+    }
+
+    #[test]
+    fn non_exhaustive_match_missing_list_is_alphabetically_sorted() {
+        // enum declared in order: Zebra, Apple, Mango.
+        // only Zebra is covered via a data-pattern; missing must be
+        // ["Apple", "Mango"] -- alphabetical -- regardless of declaration order.
+        let src = r#"
+enum Fruit { Zebra(i64), Apple(i64), Mango(i64) }
+fn f(v: Fruit) -> i64 is pure {
+    match v {
+        Zebra(n) => n
+    }
+}
+"#;
+        let (_, errors, _) = check(src);
+        let non_ex: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::NonExhaustiveMatch { .. }))
+            .collect();
+        assert_eq!(non_ex.len(), 1, "expected exactly one NonExhaustiveMatch: {errors:?}");
+        match non_ex[0] {
+            QalaError::NonExhaustiveMatch { missing, .. } => {
+                assert_eq!(missing, &vec!["Apple".to_string(), "Mango".to_string()]);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
