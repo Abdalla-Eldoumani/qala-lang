@@ -243,6 +243,7 @@ struct FnCtx {
 /// a recorded call site that may produce an [`QalaError::EffectViolation`]
 /// after pass 3 resolves every function's inferred effect.
 #[allow(dead_code)]
+#[derive(Clone)]
 struct EffectViolationCandidate {
     /// the caller's [`FnKey`].
     caller_key: FnKey,
@@ -1161,6 +1162,17 @@ impl<'src> Checker<'src> {
                             };
                             self.emit_warning(w);
                         }
+                        // structural-interface check: when the declared type
+                        // is an interface and the initializer types to a
+                        // named-struct, ensure the struct satisfies the
+                        // interface.
+                        if let QalaType::Named(Symbol(iname)) = &expected
+                            && self.symbols.interfaces.contains_key(iname)
+                            && let QalaType::Named(Symbol(_)) = typed_init.ty()
+                        {
+                            let init_ty = typed_init.ty().clone();
+                            self.check_satisfies(&init_ty, iname, *span);
+                        }
                         (typed_init, expected)
                     }
                     None => {
@@ -1995,6 +2007,45 @@ impl<'src> Checker<'src> {
                     span,
                 };
             }
+            // enum variant constructor: `Circle(5.0)` where `Circle` is a
+            // variant of some enum.
+            if let Some((enum_name, fields)) = self.find_enum_variant(name) {
+                let typed_args: Vec<typed_ast::TypedExpr> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        if i < fields.len() {
+                            self.check_expr(a, &fields[i])
+                        } else {
+                            self.infer_expr(a)
+                        }
+                    })
+                    .collect();
+                if args.len() != fields.len() {
+                    self.errors.push(QalaError::Type {
+                        span,
+                        message: format!(
+                            "variant `{name}` of `{enum_name}` expects {} argument(s), found {}",
+                            fields.len(),
+                            args.len()
+                        ),
+                    });
+                }
+                let typed_callee = typed_ast::TypedExpr::Ident {
+                    name: name.clone(),
+                    ty: QalaType::Function {
+                        params: fields.clone(),
+                        returns: Box::new(QalaType::Named(Symbol(enum_name.clone()))),
+                    },
+                    span: callee.span(),
+                };
+                return typed_ast::TypedExpr::Call {
+                    callee: Box::new(typed_callee),
+                    args: typed_args,
+                    ty: QalaType::Named(Symbol(enum_name)),
+                    span,
+                };
+            }
             // user-defined free fn, or stdlib free fn (incl. virtual generics).
             if let Some((params, ret_ty, is_generic, name_clone, callee_key)) =
                 self.resolve_free_callable(name)
@@ -2170,6 +2221,21 @@ impl<'src> Checker<'src> {
             }
             _ => ret_ty.clone(),
         }
+    }
+
+    /// helper: find the enum that contains a variant with the given name,
+    /// returning the enum name and the variant's field types. on a miss,
+    /// returns `None`. linear search over enums; deterministic via
+    /// declaration order.
+    fn find_enum_variant(&self, variant_name: &str) -> Option<(String, Vec<QalaType>)> {
+        for (enum_name, info) in &self.symbols.enums {
+            for (vname, fields) in &info.variants {
+                if vname == variant_name {
+                    return Some((enum_name.clone(), fields.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// helper: resolve a callable name (user fn, then stdlib). returns
@@ -2506,13 +2572,213 @@ impl<'src> Checker<'src> {
                 span: arm.span,
             });
         }
-        // task 3 will add exhaustiveness checking here.
+        // exhaustiveness check (task 3): only against an enum scrutinee.
+        if let QalaType::Named(Symbol(enum_name)) = &scrut_ty
+            && self.symbols.enums.contains_key(enum_name)
+        {
+            self.check_match_exhaustive(enum_name, arms, span);
+        } else {
+            // non-enum scrutinee: still warn on multiple guarded
+            // Binding-pattern arms, since they all match the same value
+            // and only the first wins.
+            let guarded_binding_arms = arms
+                .iter()
+                .filter(|a| matches!(a.pattern, ast::Pattern::Binding { .. }) && a.guard.is_some())
+                .count();
+            if guarded_binding_arms > 1 {
+                let w = QalaWarning {
+                    category: "overlapping_guards".to_string(),
+                    message: "multiple guarded arms cover the same pattern; only the first that matches will run".to_string(),
+                    span,
+                    note: None,
+                };
+                self.emit_warning(w);
+            }
+        }
         let ty = result_ty.unwrap_or(QalaType::Unknown);
         typed_ast::TypedExpr::Match {
             scrutinee: Box::new(typed_scrutinee),
             arms: typed_arms,
             ty,
             span,
+        }
+    }
+
+    /// check the match arms against the scrutinee's enum variants. emits
+    /// `NonExhaustiveMatch` when a variant is missing and no wildcard
+    /// covers it. emits a `Type` error for a literal pattern against an
+    /// enum scrutinee. warns `overlapping_guards` when multiple guarded
+    /// arms target the same variant (or the same all-bindings shape).
+    fn check_match_exhaustive(
+        &mut self,
+        enum_name: &str,
+        arms: &[ast::MatchArm],
+        match_span: Span,
+    ) {
+        let variants: Vec<String> = match self.symbols.enums.get(enum_name) {
+            Some(info) => info.variants.iter().map(|(n, _)| n.clone()).collect(),
+            None => return,
+        };
+        let mut covered: BTreeSet<String> = BTreeSet::new();
+        let mut has_wildcard = false;
+        let mut guarded_arms_by_variant: HashMap<String, u32> = HashMap::new();
+        let mut guarded_binding_arms: u32 = 0;
+        for arm in arms {
+            match &arm.pattern {
+                ast::Pattern::Variant { name, span, .. } => {
+                    if !variants.contains(name) {
+                        self.errors.push(QalaError::Type {
+                            span: *span,
+                            message: format!(
+                                "variant `{name}` is not part of enum `{enum_name}`"
+                            ),
+                        });
+                        continue;
+                    }
+                    if arm.guard.is_some() {
+                        *guarded_arms_by_variant.entry(name.clone()).or_insert(0) += 1;
+                    } else {
+                        // an unguarded variant arm covers the variant.
+                        covered.insert(name.clone());
+                    }
+                }
+                ast::Pattern::Wildcard { .. } => {
+                    has_wildcard = true;
+                }
+                ast::Pattern::Binding { .. } => {
+                    has_wildcard = true;
+                    if arm.guard.is_some() {
+                        guarded_binding_arms += 1;
+                    }
+                }
+                // literal patterns against an enum scrutinee.
+                ast::Pattern::Int { span, .. }
+                | ast::Pattern::Float { span, .. }
+                | ast::Pattern::Byte { span, .. }
+                | ast::Pattern::Str { span, .. }
+                | ast::Pattern::Bool { span, .. } => {
+                    self.errors.push(QalaError::Type {
+                        span: *span,
+                        message: "literal pattern cannot match an enum value".to_string(),
+                    });
+                }
+            }
+        }
+        if !has_wildcard {
+            let missing: Vec<String> = variants
+                .iter()
+                .filter(|v| !covered.contains(*v))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                self.errors.push(QalaError::NonExhaustiveMatch {
+                    span: match_span,
+                    enum_name: enum_name.to_string(),
+                    missing,
+                });
+            }
+        }
+        // overlapping_guards: per-variant counts > 1 OR multiple binding
+        // arms with guards (all matching everything).
+        let any_overlap = guarded_arms_by_variant.values().any(|c| *c > 1)
+            || guarded_binding_arms > 1;
+        if any_overlap {
+            let w = QalaWarning {
+                category: "overlapping_guards".to_string(),
+                message: "multiple guarded arms cover the same pattern; only the first that matches will run".to_string(),
+                span: match_span,
+                note: None,
+            };
+            self.emit_warning(w);
+        }
+    }
+
+    /// structural-interface satisfaction check.
+    ///
+    /// looks up the interface's required methods; for each, finds a
+    /// matching `fn TypeName.method` in the symbol table whose
+    /// (param-types, return-type) match (effects NOT compared per open
+    /// question 2). emits one `InterfaceNotSatisfied` carrying the
+    /// `missing` and `mismatched` lists.
+    #[allow(dead_code)]
+    fn check_satisfies(&mut self, ty: &QalaType, interface_name: &str, use_span: Span) {
+        let type_name = match ty {
+            QalaType::Named(Symbol(s)) => s.clone(),
+            _ => return,
+        };
+        let interface: Vec<(String, Vec<QalaType>, QalaType)> = match self
+            .symbols
+            .interfaces
+            .get(interface_name)
+        {
+            Some(i) => i
+                .methods
+                .iter()
+                .map(|m| (m.name.clone(), m.params.clone(), m.ret_ty.clone()))
+                .collect(),
+            None => return,
+        };
+        let mut missing: Vec<String> = Vec::new();
+        let mut mismatched: Vec<(String, String, String)> = Vec::new();
+        for (mname, mparams, mret) in interface {
+            let key = FnKey {
+                type_name: Some(type_name.clone()),
+                name: mname.clone(),
+            };
+            let impl_info = self.symbols.fns.get(&key);
+            match impl_info {
+                None => missing.push(mname),
+                Some(info) => {
+                    // collect impl params, skipping the self slot.
+                    let impl_params: Vec<QalaType> = info
+                        .params
+                        .iter()
+                        .skip(if info.params.first().map(|(n, _, _)| n == "self").unwrap_or(false) {
+                            1
+                        } else {
+                            0
+                        })
+                        .map(|(_, t, _)| t.clone())
+                        .collect();
+                    // interface method's params skip self (interface
+                    // representations carry Unknown for self -- skip the
+                    // self slot too).
+                    let iface_params: Vec<QalaType> = mparams
+                        .iter()
+                        .skip(if matches!(mparams.first(), Some(QalaType::Unknown)) {
+                            1
+                        } else {
+                            0
+                        })
+                        .cloned()
+                        .collect();
+                    let params_match = iface_params.len() == impl_params.len()
+                        && iface_params
+                            .iter()
+                            .zip(impl_params.iter())
+                            .all(|(a, b)| a.types_match(b));
+                    let ret_match = mret.types_match(&info.ret_ty);
+                    if !params_match || !ret_match {
+                        // build expected / found signature strings.
+                        let expected = format_fn_sig(&iface_params, &mret);
+                        let found = format_fn_sig(&impl_params, &info.ret_ty);
+                        mismatched.push((mname, expected, found));
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() || !mismatched.is_empty() {
+            // sort missing alphabetically for determinism.
+            let mut missing_sorted = missing;
+            missing_sorted.sort();
+            mismatched.sort_by(|a, b| a.0.cmp(&b.0));
+            self.errors.push(QalaError::InterfaceNotSatisfied {
+                span: use_span,
+                ty: type_name,
+                interface: interface_name.to_string(),
+                missing: missing_sorted,
+                mismatched,
+            });
         }
     }
 
@@ -2582,12 +2848,111 @@ impl<'src> Checker<'src> {
         }
     }
 
-    /// pass 3: resolve every function's inferred effect.
+    /// pass 3: resolve every function's inferred effect via fixed-point
+    /// iteration over the call graph, then check annotated functions
+    /// against their annotations.
     ///
-    /// task 1/2 leaves this as a no-op so the crate compiles end-to-end
-    /// while task 3 fills in the fixed-point algorithm.
+    /// the effect lattice has 4 elements
+    /// (`{}` ⊂ `{io}` ⊂ `{io, alloc}` ⊂ `{io, alloc, panic}` is the worst
+    /// chain) so monotonic ascent on a finite lattice converges in at most
+    /// 3 rounds (Davey & Priestley). [`MAX_ROUNDS`] = 8 is a generous
+    /// development-time sentinel; a debug_assert fires if we hit it, but
+    /// production code is bounded by the proof.
     fn resolve_function_effects(&mut self) {
-        // no-op; task 3 fills this in.
+        const MAX_ROUNDS: usize = 8;
+        // initialise every FnInfo's inferred_effect with the body intrinsic
+        // (annotated effects are checked against, not initialised from).
+        let keys: Vec<FnKey> = self.body_records.keys().cloned().collect();
+        for key in &keys {
+            if let Some(info) = self.symbols.fns.get_mut(key) {
+                let intrinsic = self
+                    .body_records
+                    .get(key)
+                    .map(|r| r.intrinsic)
+                    .unwrap_or(EffectSet::pure());
+                info.inferred_effect = Some(intrinsic);
+            }
+        }
+        // outer loop: iterate until no FnInfo's inferred_effect changes.
+        for round in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for key in &keys {
+                let body_rec = match self.body_records.get(key) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let mut e = body_rec.intrinsic;
+                for callee_key in &body_rec.called {
+                    if let Some(callee_info) = self.symbols.fns.get(callee_key) {
+                        if let Some(eff) = callee_info.inferred_effect {
+                            e = e.union(eff);
+                        } else if let Some(eff) = callee_info.annotated_effect {
+                            e = e.union(eff);
+                        }
+                    } else if let Some(stdlib_eff) = stdlib_effect(callee_key) {
+                        e = e.union(stdlib_eff);
+                    }
+                }
+                if let Some(info_mut) = self.symbols.fns.get_mut(key) {
+                    let old = info_mut.inferred_effect.unwrap_or(EffectSet::pure());
+                    let new = old.union(e);
+                    if new != old {
+                        info_mut.inferred_effect = Some(new);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+            // safety sentinel: the lattice proof says <= 3 rounds. if we
+            // hit MAX_ROUNDS - 1, something is wrong.
+            debug_assert!(
+                round < MAX_ROUNDS - 1,
+                "effect fixed-point did not converge in {MAX_ROUNDS} rounds"
+            );
+        }
+        // after settling: check annotated callers against their callees.
+        // candidates were recorded at every call site whose enclosing fn had
+        // an annotated_effect. emit EffectViolation when the callee's
+        // (inferred or annotated) effect is not a subset of the caller's
+        // annotation.
+        let candidates: Vec<EffectViolationCandidate> = keys
+            .iter()
+            .flat_map(|k| {
+                self.body_records
+                    .get(k)
+                    .map(|r| r.callsites_to_check.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for cand in candidates {
+            let caller_eff = self
+                .symbols
+                .fns
+                .get(&cand.caller_key)
+                .and_then(|info| info.annotated_effect)
+                .unwrap_or(EffectSet::full());
+            let callee_eff = if let Some(callee_info) = self.symbols.fns.get(&cand.callee_key) {
+                callee_info
+                    .inferred_effect
+                    .or(callee_info.annotated_effect)
+                    .unwrap_or(EffectSet::pure())
+            } else if let Some(eff) = stdlib_effect(&cand.callee_key) {
+                eff
+            } else {
+                EffectSet::pure()
+            };
+            if !callee_eff.is_subset_of(caller_eff) {
+                self.errors.push(QalaError::EffectViolation {
+                    span: cand.call_span,
+                    caller: cand.caller_key.name.clone(),
+                    caller_effect: caller_eff.display(),
+                    callee: cand.callee_key.name.clone(),
+                    callee_effect: callee_eff.display(),
+                });
+            }
+        }
     }
 
     /// emit a warning, honouring the directive table set by task 5. task 4
@@ -2626,6 +2991,14 @@ fn types_strictly_equal(a: &QalaType, b: &QalaType) -> bool {
     a == b
 }
 
+/// format a method signature as `fn(P1, P2) -> R` for the
+/// `InterfaceNotSatisfied` mismatched payload. params are the method's
+/// param types without the self slot.
+fn format_fn_sig(params: &[QalaType], ret: &QalaType) -> String {
+    let p: Vec<String> = params.iter().map(|t| t.display()).collect();
+    format!("fn(self, {}) -> {}", p.join(", "), ret.display())
+}
+
 /// one entry in the stdlib signature table. task 3 fills in the actual
 /// list; task 2 only needs the shape so dependent code compiles.
 #[allow(dead_code)]
@@ -2645,6 +3018,19 @@ struct StdlibFn {
     /// `map`, `filter`, `reduce`, `Ok`, `Err`, `Some`, `None`). the
     /// call-site checker accepts any concrete instantiation.
     is_generic: bool,
+}
+
+/// look up a callee's effect in the stdlib table by FnKey. returns `None`
+/// if the key does not name a stdlib function. used by pass 3 when a
+/// called name was not found in the user symbol table.
+fn stdlib_effect(key: &FnKey) -> Option<EffectSet> {
+    let stdlib = stdlib_signatures();
+    for entry in stdlib.iter() {
+        if entry.type_name == key.type_name && entry.name == key.name {
+            return Some(entry.effect);
+        }
+    }
+    None
 }
 
 /// the hardcoded stdlib signature table. task 3 finalises this; task 2's
@@ -3392,5 +3778,249 @@ mod tests {
             .filter(|w| w.category == "unreachable_code")
             .collect();
         assert_eq!(unreach.len(), 1, "{warnings:?}");
+    }
+
+    // ---- task 3: effect fixed-point + exhaustiveness + interfaces ---------
+
+    #[test]
+    fn pure_add_function_has_no_effect_errors() {
+        let src = "fn add(a: i64, b: i64) -> i64 is pure { a + b }";
+        let (_, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn pure_calls_io_errors_with_hint() {
+        let src = r#"
+            fn shout(msg: str) is pure {
+                println(msg)
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let viol: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::EffectViolation { .. }))
+            .collect();
+        assert_eq!(viol.len(), 1, "{errors:?}");
+        match viol[0] {
+            QalaError::EffectViolation {
+                caller, caller_effect, callee, callee_effect, ..
+            } => {
+                assert_eq!(caller, "shout");
+                assert_eq!(caller_effect, "pure");
+                assert_eq!(callee, "println");
+                assert_eq!(callee_effect, "io");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn unannotated_caller_inherits_io_effect() {
+        let src = r#"
+            fn echo(msg: str) {
+                println(msg)
+            }
+        "#;
+        let (typed, errors, _) = check(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        // typed effect on `echo` is filled by pass 3.
+        // (the inferred_effect goes into FnInfo; the TypedFnDecl carries the
+        // annotated_effect, which is None here -> pure(). that is acceptable
+        // for the AST view in v1; pass 3 only validates annotated functions.)
+        assert!(matches!(&typed[0], typed_ast::TypedItem::Fn(_)));
+    }
+
+    #[test]
+    fn mutual_recursion_effects_converge() {
+        // a calls b, b calls a, both unannotated. no errors; the fixed
+        // point converges. (b has a println; both inferred to io but no
+        // annotation to violate.)
+        let src = r#"
+            fn a(n: i64) -> i64 {
+                if n == 0 { return 0 }
+                return b(n - 1)
+            }
+            fn b(n: i64) -> i64 {
+                if n == 0 { return 0 }
+                println("b")
+                return a(n - 1)
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let viol: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::EffectViolation { .. }))
+            .collect();
+        assert!(viol.is_empty(), "no annotated callers; no violations: {errors:?}");
+    }
+
+    #[test]
+    fn match_missing_variants_listed() {
+        let src = r#"
+            enum Shape { Circle(f64), Rect(f64, f64), Triangle }
+            fn area(s: Shape) -> f64 is pure {
+                match s {
+                    Circle(r) => r,
+                    Rect(w, h) => w * h,
+                }
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let nonex: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::NonExhaustiveMatch { .. }))
+            .collect();
+        assert_eq!(nonex.len(), 1, "{errors:?}");
+        match nonex[0] {
+            QalaError::NonExhaustiveMatch { enum_name, missing, .. } => {
+                assert_eq!(enum_name, "Shape");
+                assert_eq!(missing, &vec!["Triangle".to_string()]);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn match_with_wildcard_is_exhaustive() {
+        let src = r#"
+            enum Shape { Circle(f64), Rect(f64, f64), Triangle }
+            fn area(s: Shape) -> f64 is pure {
+                match s {
+                    Circle(r) => r,
+                    _ => 0.0,
+                }
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let nonex: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::NonExhaustiveMatch { .. }))
+            .collect();
+        assert!(nonex.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn match_with_all_variants_is_exhaustive() {
+        let src = r#"
+            enum Shape { Circle(f64), Rect(f64, f64), Triangle }
+            fn area(s: Shape) -> f64 is pure {
+                match s {
+                    Circle(r) => r,
+                    Rect(w, h) => w * h,
+                    Triangle => 0.0,
+                }
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let nonex: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::NonExhaustiveMatch { .. }))
+            .collect();
+        assert!(nonex.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn overlapping_guards_warn() {
+        // multiple Binding patterns with guards.
+        let src = r#"
+            fn classify(v: i64) -> str is pure {
+                match v {
+                    x if x > 0 => "pos",
+                    x if x > 10 => "big",
+                    _ => "other",
+                }
+            }
+        "#;
+        let (_, _, warnings) = check(src);
+        let over: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "overlapping_guards")
+            .collect();
+        assert_eq!(over.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn variant_not_in_enum_errors() {
+        let src = r#"
+            enum Shape { Circle(f64) }
+            fn f(s: Shape) -> f64 is pure {
+                match s {
+                    Square(x) => x,
+                    _ => 0.0,
+                }
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let type_errors: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::Type { message, .. } if message.contains("Square")))
+            .collect();
+        assert!(!type_errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn interface_satisfied_structurally() {
+        let src = r#"
+            interface Printable { fn to_string(self) -> str }
+            struct Point { x: f64, y: f64 }
+            fn Point.to_string(self) -> str is pure { return "p" }
+            fn main() is io {
+                let p: Printable = Point { x: 1.0, y: 2.0 }
+                println("ok")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let ifaces: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::InterfaceNotSatisfied { .. }))
+            .collect();
+        assert!(ifaces.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn interface_mismatch_lists_methods() {
+        // Point has no to_string at all.
+        let src = r#"
+            interface Printable { fn to_string(self) -> str }
+            struct Point { x: f64, y: f64 }
+            fn main() is io {
+                let p: Printable = Point { x: 1.0, y: 2.0 }
+                println("ok")
+            }
+        "#;
+        let (_, errors, _) = check(src);
+        let ifaces: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| matches!(e, QalaError::InterfaceNotSatisfied { .. }))
+            .collect();
+        assert_eq!(ifaces.len(), 1, "{errors:?}");
+        match ifaces[0] {
+            QalaError::InterfaceNotSatisfied { ty, interface, missing, .. } => {
+                assert_eq!(ty, "Point");
+                assert_eq!(interface, "Printable");
+                assert!(missing.contains(&"to_string".to_string()));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn six_bundled_examples_typecheck_without_errors() {
+        // the centerpiece smoke test: every example bundled with the
+        // playground must lex, parse, AND typecheck with zero errors.
+        for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
+            let path = format!(
+                "{}/../playground/public/examples/{}.qala",
+                env!("CARGO_MANIFEST_DIR"),
+                name
+            );
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let tokens = crate::lexer::Lexer::tokenize(&src).expect("lex");
+            let ast = crate::parser::Parser::parse(&tokens).expect("parse");
+            let (_, errors, _warnings) = check_program(&ast, &src);
+            assert!(errors.is_empty(), "{name}.qala: unexpected errors: {errors:?}");
+        }
     }
 }
