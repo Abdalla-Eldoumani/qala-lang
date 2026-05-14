@@ -828,7 +828,14 @@ fn tarjan_scc(nodes: &[String], adj: &HashMap<String, Vec<String>>) -> Vec<Vec<S
                 if v_low == v_idx {
                     let mut component: Vec<String> = Vec::new();
                     loop {
-                        let w = stack.pop().unwrap_or_default();
+                        // Tarjan invariant: v must be on the stack when
+                        // we find it is an SCC root. if the stack is empty
+                        // the invariant has been violated; break rather
+                        // than looping forever on an empty stack.
+                        let w = match stack.pop() {
+                            Some(w) => w,
+                            None => break,
+                        };
                         on_stack.insert(w.clone(), false);
                         let is_v = w == v;
                         component.push(w);
