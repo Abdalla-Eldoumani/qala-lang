@@ -91,6 +91,96 @@ pub struct MonacoDiagnostic {
 }
 
 impl Diagnostic {
+    /// render this diagnostic as a Rust-style ASCII-underlined source
+    /// block.
+    ///
+    /// byte-identical for the same `(Diagnostic, src)` pair: same input
+    /// produces the same output, regardless of process, build, or
+    /// platform. that is the DIAG-04 contract; a snapshot test in
+    /// `compiler/tests/snapshots/diagnostics_basic.txt` proves it
+    /// cross-process.
+    ///
+    /// the block has five lines plus optional notes and hints:
+    ///
+    /// ```text
+    /// error: <message>           (or `warning: <message>`)
+    ///   --> <line>:<column>
+    ///    |
+    /// N  |   <source line>
+    ///    |   <pad><carets>
+    ///    |
+    ///    = note: spans multiple lines      (only when the span clips)
+    ///    = note: <each note>
+    ///    = hint: <each hint>
+    /// ```
+    ///
+    /// the underline is one `^` per byte of the span, clipped to the
+    /// source line so a multi-line span does not produce screen-fulls
+    /// of carets (Pitfall 4 of the research); when clipping occurs, a
+    /// `note: spans multiple lines` is appended before any user notes.
+    ///
+    /// no color codes, no emoji, no host paths -- the renderer is a
+    /// pure function over `(self, src)` and produces only ASCII text.
+    pub fn render(&self, src: &str) -> String {
+        let line_index = LineIndex::new(src);
+        let (line, column) =
+            line_index.location(src, self.primary_span.start as usize);
+        let line_text = src.lines().nth(line - 1).unwrap_or("");
+
+        let header = match self.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+
+        let mut out = String::new();
+
+        // header line: "error: <message>" / "warning: <message>".
+        out.push_str(&format!("{header}: {}\n", self.message));
+
+        // arrow line: file path is omitted; Phase 6's WASM bridge
+        // supplies the file name separately if needed.
+        out.push_str(&format!("  --> {line}:{column}\n"));
+
+        // top separator.
+        out.push_str("   |\n");
+
+        // source line: line number left-justified to 3 cols, then
+        // `|   `, then the source text. the line numbers in tests can
+        // be at most 3 digits in practice (a 999-line program is the
+        // outer end of what the playground asks the renderer to draw),
+        // and 3 cols of padding is the rustc convention.
+        out.push_str(&format!("{line:<3}|   {line_text}\n"));
+
+        // underline width: one `^` per byte of the span, clipped to
+        // the source line so a multi-line span does not run off the
+        // end (Pitfall 4). `avail` is the remaining bytes from the
+        // start column to the end of the source line.
+        let avail = line_text.len().saturating_sub(column.saturating_sub(1));
+        let span_bytes = self.primary_span.len as usize;
+        let underline_width = std::cmp::min(span_bytes, avail).max(1);
+        let pad = " ".repeat(column.saturating_sub(1));
+        let underline = "^".repeat(underline_width);
+        out.push_str(&format!("   |   {pad}{underline}\n"));
+
+        // bottom separator.
+        out.push_str("   |\n");
+
+        // multi-line clip note (prepended before any user notes).
+        if span_bytes > avail {
+            out.push_str("   = note: spans multiple lines\n");
+        }
+
+        // user notes, then hints.
+        for note in &self.notes {
+            out.push_str(&format!("   = note: {note}\n"));
+        }
+        for hint in &self.hints {
+            out.push_str(&format!("   = hint: {hint}\n"));
+        }
+
+        out
+    }
+
     /// translate this Diagnostic into the structured Monaco form.
     ///
     /// the source string is required to translate byte offsets into
@@ -207,13 +297,29 @@ impl From<&QalaWarning> for Diagnostic {
 mod tests {
     use super::*;
     use crate::errors::QalaError;
+    use crate::lexer;
+    use crate::parser;
     use crate::span::Span;
+    use crate::typechecker;
     use crate::typechecker::QalaWarning;
 
     /// a small default span; tests that want a specific position
     /// construct `Span::new(...)` inline.
     fn sp() -> Span {
         Span::new(0, 1)
+    }
+
+    /// build a Diagnostic for a small bad program by running it
+    /// through lex/parse/check and converting the first error to a
+    /// Diagnostic. used by the renderer tests so they exercise the
+    /// real From<QalaError> conversion against real typechecker
+    /// output rather than hand-constructed errors.
+    fn diag_for(src: &str) -> Diagnostic {
+        let tokens = lexer::Lexer::tokenize(src).expect("lex");
+        let ast = parser::Parser::parse(&tokens).expect("parse");
+        let (_, errors, _) = typechecker::check_program(&ast, src);
+        assert!(!errors.is_empty(), "expected an error for: {src}");
+        Diagnostic::from(errors[0].clone())
     }
 
     #[test]
@@ -477,5 +583,256 @@ mod tests {
         assert_eq!(a.hints, b.hints);
         assert_eq!(a.message, b.message);
         assert_eq!(a.primary_span, b.primary_span);
+    }
+
+    // ---- Task 2: render tests ---------------------------------------------
+
+    #[test]
+    fn render_header_says_error_for_an_error_diagnostic() {
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "oops".to_string(),
+            primary_span: Span::new(0, 1),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("x");
+        assert!(
+            out.starts_with("error: oops\n"),
+            "wrong header: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_arrow_line_uses_1_based_line_and_column() {
+        // src "abcde\nfghij": bytes a=0,b=1,c=2,d=3,e=4,\n=5,f=6,g=7,...
+        // byte 6 (the `f`) is on line 2, column 1 -- the Plan's stated
+        // expected output "  --> 2:1" corresponds to byte 6, not byte 5
+        // (byte 5 is the `\n` on line 1 col 6). picking byte 6 here
+        // matches the Plan's intent: "show that a span on line 2 col 1
+        // renders the arrow line correctly".
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(6, 1),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("abcde\nfghij");
+        assert!(out.contains("  --> 2:1\n"), "{out:?}");
+    }
+
+    #[test]
+    fn render_source_line_includes_line_number_and_text() {
+        // src "abc\ndef\nghi", span on line 2 (byte 4 is `d`, length 3
+        // covers `def`). source line should render as "2  |   def\n".
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(4, 3),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("abc\ndef\nghi");
+        assert!(out.contains("2  |   def\n"), "{out:?}");
+    }
+
+    #[test]
+    fn render_underline_has_one_caret_per_byte_at_column_1() {
+        // src "hello", span 0..5 -> column 1, pad="" (0 chars), 5 carets.
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(0, 5),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("hello");
+        assert!(out.contains("   |   ^^^^^\n"), "{out:?}");
+    }
+
+    #[test]
+    fn render_underline_pads_for_non_first_column_spans() {
+        // src "hello", span 2..5 -> column 3, pad="  " (2 chars), 3 carets.
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(2, 3),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("hello");
+        assert!(out.contains("   |     ^^^\n"), "{out:?}");
+    }
+
+    #[test]
+    fn render_multi_line_span_clips_underline_and_appends_note() {
+        // src "line one\nline two" (line 1 = "line one" = 8 chars).
+        // span 0..20 starts at byte 0 (col 1) and runs 20 bytes past
+        // the end of line 1. underline clips to 8 carets and a
+        // "spans multiple lines" note is appended before any user notes.
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(0, 20),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("line one\nline two");
+        assert!(out.contains("   |   ^^^^^^^^\n"), "{out:?}");
+        assert!(out.contains("   = note: spans multiple lines\n"), "{out:?}");
+    }
+
+    #[test]
+    fn render_emits_bottom_separator_before_notes_and_hints() {
+        // a Diagnostic with one note and one hint should have the
+        // bottom "   |\n" separator BEFORE either of them, and the
+        // notes BEFORE the hints (rustc order).
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(0, 1),
+            notes: vec!["a fact".to_string()],
+            hints: vec!["a suggestion".to_string()],
+        };
+        let out = d.render("x");
+        let bottom = out.find("   |\n   = note: a fact\n");
+        assert!(bottom.is_some(), "bottom separator and note must be adjacent: {out:?}");
+        let note_pos = out.find("   = note: a fact\n").unwrap();
+        let hint_pos = out.find("   = hint: a suggestion\n").unwrap();
+        assert!(note_pos < hint_pos, "note must come before hint: {out:?}");
+    }
+
+    #[test]
+    fn render_emits_one_line_per_note_in_order() {
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(0, 1),
+            notes: vec!["first".to_string(), "second".to_string()],
+            hints: Vec::new(),
+        };
+        let out = d.render("x");
+        let first = out.find("   = note: first\n").unwrap();
+        let second = out.find("   = note: second\n").unwrap();
+        assert!(first < second, "notes must render in vec order: {out:?}");
+    }
+
+    #[test]
+    fn render_emits_one_line_per_hint_in_order() {
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "m".to_string(),
+            primary_span: Span::new(0, 1),
+            notes: Vec::new(),
+            hints: vec!["try this".to_string(), "or that".to_string()],
+        };
+        let out = d.render("x");
+        let first = out.find("   = hint: try this\n").unwrap();
+        let second = out.find("   = hint: or that\n").unwrap();
+        assert!(first < second, "hints must render in vec order: {out:?}");
+    }
+
+    #[test]
+    fn render_warning_uses_warning_header() {
+        let d = Diagnostic {
+            severity: Severity::Warning,
+            category: Some("unused_var".to_string()),
+            message: "unused variable `x`".to_string(),
+            primary_span: Span::new(0, 1),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("let x = 1");
+        assert!(
+            out.starts_with("warning: unused variable `x`\n"),
+            "wrong warning header: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_is_byte_identical_across_two_calls() {
+        // determinism property in-process: same Diagnostic + same src
+        // = byte-identical output across two calls. exercises a real
+        // typechecker-produced error via diag_for.
+        let src = "fn f() -> i64 { return \"x\" }";
+        let d = diag_for(src);
+        let a = d.render(src);
+        let b = d.render(src);
+        assert_eq!(a, b, "render output drifted between calls");
+    }
+
+    #[test]
+    fn six_bundled_examples_render_no_error_output() {
+        // the Plan 04 typechecker smoke test asserted errors is empty;
+        // this paired Plan 05 test asserts rendering those (empty)
+        // errors collects to the empty string -- proves the renderer
+        // is wired in correctly for the no-error case.
+        for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
+            let path = format!(
+                "{}/../playground/public/examples/{}.qala",
+                env!("CARGO_MANIFEST_DIR"),
+                name
+            );
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let tokens = lexer::Lexer::tokenize(&src).expect("lex");
+            let ast = parser::Parser::parse(&tokens).expect("parse");
+            let (_, errors, _warnings) = typechecker::check_program(&ast, &src);
+            assert!(errors.is_empty(), "{name}.qala: unexpected errors: {errors:?}");
+            let rendered: String = errors
+                .iter()
+                .map(|e| Diagnostic::from(e.clone()).render(&src))
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(
+                rendered.is_empty(),
+                "{name}.qala: errors-rendered-to-empty failed: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_never_block_typed_ast_construction() {
+        // a program that produces a warning still yields a non-empty
+        // TypedAst. this is a regression check that warnings are not
+        // errors: the typechecker emits the warning AND keeps going.
+        let src = "fn main() is io {\nlet x = 1\nprintln(\"hi\")\n}";
+        let tokens = lexer::Lexer::tokenize(src).expect("lex");
+        let ast = parser::Parser::parse(&tokens).expect("parse");
+        let (typed, errors, warnings) = typechecker::check_program(&ast, src);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(!warnings.is_empty(), "expected at least one warning");
+        assert!(!typed.is_empty(), "warnings must not block typed-AST construction");
+    }
+
+    #[test]
+    fn render_with_no_notes_or_hints_ends_at_the_bottom_separator() {
+        // a clean Diagnostic (no notes, no hints) should produce
+        // exactly: header + arrow + top separator + source line +
+        // underline + bottom separator. no trailing `= note:` or
+        // `= hint:` lines.
+        let d = Diagnostic {
+            severity: Severity::Error,
+            category: None,
+            message: "boom".to_string(),
+            primary_span: Span::new(0, 1),
+            notes: Vec::new(),
+            hints: Vec::new(),
+        };
+        let out = d.render("x");
+        // the last non-empty line is the bottom separator.
+        assert!(out.ends_with("   |\n"), "unexpected tail: {out:?}");
+        assert!(!out.contains("= note:"), "no notes expected: {out:?}");
+        assert!(!out.contains("= hint:"), "no hints expected: {out:?}");
     }
 }
