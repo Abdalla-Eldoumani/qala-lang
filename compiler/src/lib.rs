@@ -14,3 +14,4 @@ pub mod types;
 pub mod effects;
 pub mod typed_ast;
 pub mod typechecker;
+pub mod diagnostics;
