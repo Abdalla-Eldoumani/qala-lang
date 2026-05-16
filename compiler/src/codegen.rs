@@ -163,7 +163,14 @@ struct LoopMeta {
     /// the byte position `break` jumps are patched to point past.
     break_patches: Vec<usize>,
     /// the byte position `continue` jumps backward to (the increment label).
+    /// `usize::MAX` is the sentinel meaning "not yet known" -- used by `for`
+    /// loops, which set the real target after the body compiles.
     continue_target: usize,
+    /// forward-jump patch sites for `continue` in `for` loops. when
+    /// `continue_target == usize::MAX`, `continue` emits a forward jump
+    /// placeholder recorded here; `patch_loop_continues` fixes them up after
+    /// the increment label is known.
+    continue_patches: Vec<usize>,
 }
 
 /// a function-table key: `(type_name, name)`. matches the typechecker's
@@ -396,6 +403,7 @@ impl<'a> Codegen<'a> {
             loop_meta: Some(LoopMeta {
                 break_patches: Vec::new(),
                 continue_target,
+                continue_patches: Vec::new(),
             }),
         });
     }
@@ -554,7 +562,15 @@ impl<'a> Codegen<'a> {
                 let line = self.line_at(*span);
                 self.emit_defers_for_exit(ExitKind::Continue, line)?;
                 let target = self.innermost_continue_target()?;
-                self.chunk_mut().emit_loop(target, line)?;
+                if target == usize::MAX {
+                    // inside a for loop: the increment label is not yet
+                    // emitted. emit a forward jump placeholder and record it
+                    // for back-patching by patch_loop_continues.
+                    let pos = self.chunk_mut().emit_jump(Opcode::Jump, line);
+                    self.record_continue_patch(pos)?;
+                } else {
+                    self.chunk_mut().emit_loop(target, line)?;
+                }
                 Ok(true)
             }
             TypedStmt::Defer { expr, .. } => {
@@ -600,6 +616,22 @@ impl<'a> Codegen<'a> {
         Err(QalaError::Type {
             span: Span::new(0, 0),
             message: "codegen: break outside a loop".to_string(),
+        })
+    }
+
+    /// record a `continue`'s forward-jump patch site on the innermost loop
+    /// scope. used only by `for` loops where the increment label is not yet
+    /// emitted when `continue` is compiled.
+    fn record_continue_patch(&mut self, pos: usize) -> Result<(), QalaError> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(meta) = &mut scope.loop_meta {
+                meta.continue_patches.push(pos);
+                return Ok(());
+            }
+        }
+        Err(QalaError::Type {
+            span: Span::new(0, 0),
+            message: "codegen: continue outside a loop".to_string(),
         })
     }
 
@@ -1650,9 +1682,11 @@ impl<'a> Codegen<'a> {
         self.chunk_mut().write_op(Opcode::Len, line);
         self.chunk_mut().write_op(Opcode::Lt, line);
         let jmp_end = self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line);
-        // the loop scope. `continue_target` is patched after the body to
-        // point at the increment, so a `continue` still runs the increment.
-        self.push_loop_scope(loop_start);
+        // sentinel: continue_target == usize::MAX signals that `continue`
+        // sites must emit forward-jump placeholders (recorded in
+        // continue_patches) instead of backward jumps to loop_start, because
+        // the increment label is not yet known at body-compile time.
+        self.push_loop_scope(usize::MAX);
         // the loop variable's slot, bound in the loop scope so it survives
         // the per-iteration body scope `compile_block` pushes.
         let var_slot = self.next_slot();
@@ -1669,9 +1703,8 @@ impl<'a> Codegen<'a> {
         self.chunk_mut().write_u16(var_slot, line);
         // the body -- compile_block pushes its own per-iteration scope.
         self.compile_block(body)?;
-        // the increment is the `continue` target: patch the loop scope.
-        let increment_label = self.chunk_mut().code.len();
-        self.set_loop_continue_target(increment_label);
+        // patch all `continue` forward-jumps to land here (the increment).
+        self.patch_loop_continues()?;
         self.chunk_mut().write_op(Opcode::GetLocal, line);
         self.chunk_mut().write_u16(idx_slot, line);
         self.emit_const(Value::I64(1), line);
@@ -1702,6 +1735,22 @@ impl<'a> Codegen<'a> {
             .iter()
             .rev()
             .find_map(|s| s.loop_meta.as_ref().map(|m| m.break_patches.clone()))
+            .unwrap_or_default();
+        for pos in patches {
+            self.chunk_mut().patch_jump(pos)?;
+        }
+        Ok(())
+    }
+
+    /// patch every `continue` forward-jump recorded on the innermost loop
+    /// scope to land at the current end of `code` (the increment label).
+    /// called by `compile_for` immediately before emitting the increment.
+    fn patch_loop_continues(&mut self) -> Result<(), QalaError> {
+        let patches: Vec<usize> = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.loop_meta.as_ref().map(|m| m.continue_patches.clone()))
             .unwrap_or_default();
         for pos in patches {
             self.chunk_mut().patch_jump(pos)?;
@@ -4019,5 +4068,40 @@ mod tests {
         let p = compile_ok(src);
         assert_eq!(p.chunks.len(), 1);
         assert!(p.chunks[0].constants.contains(&Value::I64(100)));
+    }
+
+    // `continue` in a `for` loop must reach the increment, not the bounds
+    // check. we verify structurally: the chunk must compile cleanly, the
+    // lockstep invariant must hold, and the disassembler must decode every
+    // byte without losing sync (a mis-patched continue-jump landing
+    // mid-instruction would cause the opcode walk to produce a different
+    // instruction count than the disassembler's line count).
+    #[test]
+    fn for_loop_continue_reaches_the_increment_not_the_bounds_check() {
+        let src = "fn main() is io {\n\
+                   for i in 0..5 {\n\
+                   if i == 2 { continue }\n\
+                   println(\"{i}\")\n\
+                   }\n\
+                   }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let chunk = &p.chunks[main_id];
+        assert_eq!(
+            chunk.code.len(),
+            chunk.source_lines.len(),
+            "lockstep invariant broken after for+continue"
+        );
+        let dis = chunk.disassemble(&p);
+        assert!(!dis.is_empty(), "disassembly is empty");
+        // if a continue-jump landed mid-instruction the opcode walker would
+        // decode garbage and produce a different count than the line count.
+        let line_count = dis.matches('\n').count();
+        let op_count = opcodes(&chunk.code).len();
+        assert_eq!(
+            line_count, op_count,
+            "disassembly line count ({line_count}) != opcode count ({op_count}): \
+             continue-jump may have landed mid-instruction"
+        );
     }
 }
