@@ -189,16 +189,16 @@ impl Chunk {
     /// [`Chunk::constants`] as a harmless orphan. the determinism contract
     /// (append-only pool) depends on never mutating prior pool entries.
     ///
-    /// PRECONDITION: [`Chunk::last_const`] returns `Some` -- the caller
-    /// has already peeked and committed to the rewind. debug builds
-    /// `expect`; production-mode misuse would panic, which is consistent
-    /// with the project's "callers don't misuse internal preconditions"
-    /// convention.
-    pub fn rewind_last_const(&mut self) -> u16 {
-        let (off, idx) = self.last_const().expect("rewind_last_const called without a trailing CONST");
+    /// returns `None` when the chunk does not end with a CONST instruction
+    /// (i.e. [`Chunk::last_const`] returns `None`). callers that have
+    /// already peeked via `last_const` / `second_to_last_const` will
+    /// always receive `Some`; the `None` path exists so the WASM build
+    /// cannot panic on misuse.
+    pub fn rewind_last_const(&mut self) -> Option<u16> {
+        let (off, idx) = self.last_const()?;
         self.code.truncate(off);
         self.source_lines.truncate(off);
-        idx
+        Some(idx)
     }
 
     /// emit a forward jump with a placeholder i16 operand. returns the
@@ -571,7 +571,7 @@ mod tests {
         c.write_op(Opcode::Const, 1);
         c.write_u16(7, 1);
         assert_eq!(c.last_const(), Some((0, 7)));
-        let idx = c.rewind_last_const();
+        let idx = c.rewind_last_const().expect("rewind on a trailing CONST returns Some");
         assert_eq!(idx, 7);
         assert_eq!(c.code.len(), 0);
         assert_eq!(c.source_lines.len(), 0);
@@ -613,11 +613,23 @@ mod tests {
         c.write_u16(1, 2);
         assert_eq!(c.code.len(), c.source_lines.len());
         // rewind the trailing CONST; one CONST remains.
-        let idx = c.rewind_last_const();
+        let idx = c.rewind_last_const().expect("rewind on a trailing CONST returns Some");
         assert_eq!(idx, 1);
         assert_eq!(c.code.len(), 3);
         assert_eq!(c.source_lines.len(), 3);
         assert_eq!(c.code.len(), c.source_lines.len());
+    }
+
+    // Test 7b: rewind_last_const returns None when there is no trailing CONST.
+    #[test]
+    fn rewind_last_const_returns_none_when_no_trailing_const() {
+        let mut c = Chunk::new();
+        // empty chunk
+        assert_eq!(c.rewind_last_const(), None);
+        // chunk ending in a non-CONST instruction
+        c.write_op(Opcode::Pop, 1);
+        assert_eq!(c.rewind_last_const(), None);
+        assert_eq!(c.code.len(), 1, "code must be unchanged after None return");
     }
 
     // Test 8: emit_jump returns the operand offset, placeholder is i16::MAX.
