@@ -58,21 +58,11 @@ const STDLIB_FN_BASE: u16 = 40_000;
 
 /// the comptime interpreter's instruction budget. hitting it produces
 /// [`QalaError::ComptimeBudgetExceeded`]; raising it is a v2 concern.
-/// (Task 5 wires the [`ComptimeInterpreter`] that consumes this.)
-#[allow(dead_code)]
 const COMPTIME_BUDGET: u32 = 100_000;
-
-/// the comptime interpreter's per-`MAKE_ARRAY` element cap. v1 rejects
-/// arrays inside comptime entirely, but the constant is kept for the bound
-/// check site so a future array-in-comptime feature has the ceiling ready.
-#[allow(dead_code)]
-const COMPTIME_MAX_ARRAY_ELEMS: u16 = 10_000;
 
 /// the comptime interpreter's call-depth cap. an explicit `Vec<Frame>` stack
 /// (not Rust recursion) means a runaway recursion is bounded here rather than
 /// blowing the host stack; over the cap is treated as a budget overflow.
-/// (Task 5 wires the [`ComptimeInterpreter`] that consumes this.)
-#[allow(dead_code)]
 const COMPTIME_MAX_FRAMES: usize = 256;
 
 /// one row of [`STDLIB_TABLE`]: `(name, type_name, effect-constructor)`.
@@ -138,8 +128,6 @@ struct Codegen<'a> {
     fn_table: HashMap<FnKey, u16>,
     /// stdlib name -> `(fn_id, effect)`. stdlib fns get ids in the
     /// `STDLIB_FN_BASE..` namespace; the effect drives the comptime CALL gate.
-    /// (Task 2's call dispatch reads this.)
-    #[allow(dead_code)]
     stdlib_table: HashMap<FnKey, (u16, EffectSet)>,
     /// `(enum_name, variant_name)` -> variant id (parallel to
     /// [`Program::enum_variant_names`]).
@@ -171,8 +159,6 @@ struct LocalsScope {
 }
 
 /// the loop-specific bookkeeping a loop scope carries.
-/// (Task 4's loop codegen reads these fields.)
-#[allow(dead_code)]
 struct LoopMeta {
     /// the byte position `break` jumps are patched to point past.
     break_patches: Vec<usize>,
@@ -191,10 +177,7 @@ struct FnKey {
 }
 
 /// which scopes a control-flow exit unwinds, for defer emission.
-/// (Task 4 constructs the `Return` / `Break` / `Continue` / `QuestionProp`
-/// variants from `compile_stmt`; `Fallthrough` is used from Task 1.)
 #[derive(Copy, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ExitKind {
     /// reached the end of a block normally -- emit just the top scope's
     /// defers.
@@ -406,8 +389,6 @@ impl<'a> Codegen<'a> {
     }
 
     /// push a loop scope: a plain scope plus the loop bookkeeping.
-    /// (Task 4's `while` / `for` codegen calls this.)
-    #[allow(dead_code)]
     fn push_loop_scope(&mut self, continue_target: usize) {
         self.scopes.push(LocalsScope {
             locals: Vec::new(),
@@ -430,8 +411,6 @@ impl<'a> Codegen<'a> {
     /// (LIFO). used at a block's fall-through exit. each defer's bytecode is
     /// followed by a POP when the defer's result type is not `void` -- a
     /// defer is evaluated for effect, its value discarded.
-    /// (Task 4's `compile_block` calls this on the fall-through path.)
-    #[allow(dead_code)]
     fn pop_scope_and_emit_defers(&mut self, line: u32) -> Result<(), QalaError> {
         let scope = match self.scopes.pop() {
             Some(s) => s,
@@ -1028,8 +1007,10 @@ impl<'a> Codegen<'a> {
                 let line = self.line_at(*span);
                 self.compile_match(scrutinee, arms, line, *span)
             }
-            // Task 5 fills the Comptime arm.
-            TypedExpr::Comptime { .. } => self.unsupported_expr(e),
+            TypedExpr::Comptime { body, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_comptime(body, line, *span)
+            }
         }
     }
 
@@ -1129,14 +1110,54 @@ impl<'a> Codegen<'a> {
             .map(|(_, id)| id)
     }
 
-    /// the placeholder for the `Comptime` arm until Task 5 wires the
-    /// [`ComptimeInterpreter`]. returns a codegen error so the match stays
-    /// exhaustive and the crate compiles between tasks.
-    fn unsupported_expr(&mut self, e: &TypedExpr) -> Result<(), QalaError> {
-        Err(QalaError::Type {
-            span: e.span(),
-            message: "codegen: comptime is wired up in a later step".to_string(),
-        })
+    // ---- comptime ----------------------------------------------------------
+
+    /// compile a `comptime { body }` expression. the body is compiled into a
+    /// throwaway chunk, run by the [`ComptimeInterpreter`] under the 100K
+    /// instruction budget, and the result embedded as a single `CONST` in the
+    /// surrounding chunk.
+    ///
+    /// the result must be a constant-pool-representable value -- a primitive
+    /// or a string; an array / struct / enum-variant result is rejected with
+    /// [`QalaError::ComptimeResultNotConstable`].
+    fn compile_comptime(
+        &mut self,
+        body: &TypedExpr,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        // compile the body into a throwaway chunk appended at the END of
+        // program.chunks (so the existing dense fn-ids 0..N are untouched),
+        // then pop it back off. the body's own scopes are isolated by
+        // swapping in a fresh scope stack.
+        let throwaway_id = self.program.chunks.len() as u16;
+        self.program.chunks.push(Chunk::new());
+        let saved_fn_id = self.current_fn_id;
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        self.current_fn_id = throwaway_id;
+        self.push_scope();
+        let compile_result = self.compile_expr(body);
+        // append a RETURN so the interpreter has a halt point: the body's
+        // value is on the stack, RETURN hands it back.
+        self.chunk_mut().write_op(Opcode::Return, line);
+        // detach the throwaway chunk and restore the real compile state.
+        let throwaway = self.program.chunks.pop().unwrap_or_default();
+        self.current_fn_id = saved_fn_id;
+        self.scopes = saved_scopes;
+        compile_result?;
+        // run the throwaway chunk on the comptime interpreter.
+        let mut interp = ComptimeInterpreter::new(&self.program, &self.fn_effects, span);
+        let value = interp.run(throwaway)?;
+        // the result must be representable in the constant pool.
+        if !is_constable_primitive(&value) {
+            return Err(QalaError::ComptimeResultNotConstable {
+                span,
+                type_name: value_type_name(&value),
+            });
+        }
+        // embed the result as a single CONST.
+        self.emit_const(value, line);
+        Ok(())
     }
 
     // ---- compound-expression helpers ---------------------------------------
@@ -2011,6 +2032,479 @@ fn fold_binary_value(
         _ => return Ok(None),
     };
     Ok(Some(folded))
+}
+
+/// is `v` a value the constant pool can hold? primitives and strings are;
+/// heap objects (arrays, structs, enum variants) and function references
+/// are not. a `comptime` block whose result is not constable is rejected.
+fn is_constable_primitive(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::I64(_)
+            | Value::F64(_)
+            | Value::Bool(_)
+            | Value::Byte(_)
+            | Value::Str(_)
+            | Value::Void
+    )
+}
+
+/// the canonical type name of a [`Value`], for the
+/// [`QalaError::ComptimeResultNotConstable`] message. only [`Value::Function`]
+/// reaches this in practice (every other variant is constable).
+fn value_type_name(v: &Value) -> String {
+    match v {
+        Value::I64(_) => "i64",
+        Value::F64(_) => "f64",
+        Value::Bool(_) => "bool",
+        Value::Byte(_) => "byte",
+        Value::Str(_) => "str",
+        Value::Void => "void",
+        Value::Function(_) => "fn",
+    }
+    .to_string()
+}
+
+/// one call frame on the [`ComptimeInterpreter`]'s explicit call stack. the
+/// explicit `Vec<Frame>` (rather than Rust recursion) bounds call depth at
+/// [`COMPTIME_MAX_FRAMES`] so a runaway comptime recursion cannot blow the
+/// host stack.
+struct Frame {
+    /// the chunk this frame executes -- an index into `program.chunks`, or
+    /// [`u16::MAX`] for the throwaway chunk the comptime body compiled to.
+    chunk_id: u16,
+    /// the frame's local slots, indexed by `GET_LOCAL` / `SET_LOCAL`. a
+    /// callee's slots 0..argc are pre-filled with the call arguments.
+    locals: Vec<Value>,
+    /// the instruction pointer -- a byte offset into the frame's chunk.
+    ip: usize,
+}
+
+/// the compile-time bytecode interpreter. a small stack VM that executes a
+/// `comptime` block's bytecode under a hard instruction budget; it supports
+/// only pure computation -- arithmetic, comparisons, locals, jumps, and calls
+/// to functions whose effect set is pure (a defense-in-depth gate; Phase 3
+/// already enforces comptime-body purity).
+struct ComptimeInterpreter<'a> {
+    /// the program -- supplies the chunks that comptime CALLs dispatch into.
+    program: &'a Program,
+    /// fn-id -> effect, for the per-CALL purity gate.
+    fn_effects: &'a HashMap<u16, EffectSet>,
+    /// the value stack.
+    stack: Vec<Value>,
+    /// the explicit call-frame stack -- no Rust recursion.
+    frames: Vec<Frame>,
+    /// the remaining instruction budget; ticks down per instruction.
+    budget: u32,
+    /// the originating `comptime { }` span, for error reporting.
+    block_span: Span,
+}
+
+impl<'a> ComptimeInterpreter<'a> {
+    /// construct an interpreter for the `comptime` block at `block_span`.
+    fn new(
+        program: &'a Program,
+        fn_effects: &'a HashMap<u16, EffectSet>,
+        block_span: Span,
+    ) -> Self {
+        ComptimeInterpreter {
+            program,
+            fn_effects,
+            stack: Vec::new(),
+            frames: Vec::new(),
+            budget: COMPTIME_BUDGET,
+            block_span,
+        }
+    }
+
+    /// a comptime stack-underflow error -- a codegen bug if it fires (the
+    /// bytecode codegen produces is stack-balanced), surfaced rather than
+    /// panicking.
+    fn underflow(&self) -> QalaError {
+        QalaError::Type {
+            span: self.block_span,
+            message: "comptime interpreter: stack underflow".to_string(),
+        }
+    }
+
+    /// pop one value, or an underflow error.
+    fn pop(&mut self) -> Result<Value, QalaError> {
+        self.stack.pop().ok_or_else(|| self.underflow())
+    }
+
+    /// run the throwaway chunk to completion, returning the value the
+    /// outermost `RETURN` leaves on the stack.
+    fn run(&mut self, throwaway: Chunk) -> Result<Value, QalaError> {
+        // the initial frame executes the throwaway chunk (chunk_id u16::MAX).
+        self.frames.push(Frame {
+            chunk_id: u16::MAX,
+            locals: Vec::new(),
+            ip: 0,
+        });
+        while !self.frames.is_empty() {
+            // the chunk the current frame executes.
+            let frame_idx = self.frames.len() - 1;
+            let chunk_id = self.frames[frame_idx].chunk_id;
+            let chunk: &Chunk = if chunk_id == u16::MAX {
+                &throwaway
+            } else {
+                self.program
+                    .chunks
+                    .get(chunk_id as usize)
+                    .ok_or_else(|| QalaError::Type {
+                        span: self.block_span,
+                        message: "comptime interpreter: call to a missing chunk".to_string(),
+                    })?
+            };
+            let ip = self.frames[frame_idx].ip;
+            // ran off the end without a RETURN -- treat the result as void.
+            if ip >= chunk.code.len() {
+                self.frames.pop();
+                if self.frames.is_empty() {
+                    return Ok(Value::Void);
+                }
+                self.stack.push(Value::Void);
+                continue;
+            }
+            if self.budget == 0 {
+                return Err(QalaError::ComptimeBudgetExceeded {
+                    span: self.block_span,
+                });
+            }
+            self.budget -= 1;
+            let op_byte = chunk.code[ip];
+            let op = Opcode::from_u8(op_byte).ok_or_else(|| QalaError::Type {
+                span: self.block_span,
+                message: format!("comptime interpreter: undefined opcode {op_byte:#x}"),
+            })?;
+            // advance the ip past the opcode + its operands; specific arms
+            // read the operands from the bytes that follow `ip`.
+            let next_ip = ip + 1 + op.operand_bytes() as usize;
+            self.frames[frame_idx].ip = next_ip;
+            match op {
+                Opcode::Const => {
+                    let idx = chunk.read_u16(ip + 1) as usize;
+                    let v = chunk
+                        .constants
+                        .get(idx)
+                        .cloned()
+                        .ok_or_else(|| QalaError::Type {
+                            span: self.block_span,
+                            message: "comptime interpreter: bad constant index".to_string(),
+                        })?;
+                    self.stack.push(v);
+                }
+                Opcode::Pop => {
+                    self.pop()?;
+                }
+                Opcode::Dup => {
+                    let top = self.stack.last().cloned().ok_or_else(|| self.underflow())?;
+                    self.stack.push(top);
+                }
+                Opcode::GetLocal => {
+                    let slot = chunk.read_u16(ip + 1) as usize;
+                    let v = self.frames[frame_idx]
+                        .locals
+                        .get(slot)
+                        .cloned()
+                        .ok_or_else(|| QalaError::Type {
+                            span: self.block_span,
+                            message: "comptime interpreter: unbound local".to_string(),
+                        })?;
+                    self.stack.push(v);
+                }
+                Opcode::SetLocal => {
+                    let slot = chunk.read_u16(ip + 1) as usize;
+                    let v = self.pop()?;
+                    let locals = &mut self.frames[frame_idx].locals;
+                    if slot >= locals.len() {
+                        locals.resize(slot + 1, Value::Void);
+                    }
+                    locals[slot] = v;
+                }
+                Opcode::Add
+                | Opcode::Sub
+                | Opcode::Mul
+                | Opcode::Div
+                | Opcode::Mod
+                | Opcode::FAdd
+                | Opcode::FSub
+                | Opcode::FMul
+                | Opcode::FDiv => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let r = self.eval_arith(op, a, b)?;
+                    self.stack.push(r);
+                }
+                Opcode::Neg => {
+                    let a = self.pop()?;
+                    match a {
+                        Value::I64(n) => {
+                            let r = n.checked_neg().ok_or(QalaError::IntegerOverflow {
+                                span: self.block_span,
+                                op: BinOp::Sub,
+                                lhs: 0,
+                                rhs: n,
+                            })?;
+                            self.stack.push(Value::I64(r));
+                        }
+                        _ => return Err(self.type_error("NEG expects i64")),
+                    }
+                }
+                Opcode::FNeg => {
+                    let a = self.pop()?;
+                    match a {
+                        Value::F64(x) => self.stack.push(Value::F64(-x)),
+                        _ => return Err(self.type_error("F_NEG expects f64")),
+                    }
+                }
+                Opcode::Eq
+                | Opcode::Ne
+                | Opcode::Lt
+                | Opcode::Le
+                | Opcode::Gt
+                | Opcode::Ge
+                | Opcode::FEq
+                | Opcode::FNe
+                | Opcode::FLt
+                | Opcode::FLe
+                | Opcode::FGt
+                | Opcode::FGe => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    let r = self.eval_compare(op, a, b)?;
+                    self.stack.push(Value::Bool(r));
+                }
+                Opcode::Not => {
+                    let a = self.pop()?;
+                    match a {
+                        Value::Bool(b) => self.stack.push(Value::Bool(!b)),
+                        _ => return Err(self.type_error("NOT expects bool")),
+                    }
+                }
+                Opcode::Jump => {
+                    let offset = chunk.read_i16(ip + 1);
+                    self.frames[frame_idx].ip = jump_target(next_ip, offset)?;
+                }
+                Opcode::JumpIfFalse => {
+                    let offset = chunk.read_i16(ip + 1);
+                    let cond = self.pop()?;
+                    if matches!(cond, Value::Bool(false)) {
+                        self.frames[frame_idx].ip = jump_target(next_ip, offset)?;
+                    }
+                }
+                Opcode::JumpIfTrue => {
+                    let offset = chunk.read_i16(ip + 1);
+                    let cond = self.pop()?;
+                    if matches!(cond, Value::Bool(true)) {
+                        self.frames[frame_idx].ip = jump_target(next_ip, offset)?;
+                    }
+                }
+                Opcode::Call => {
+                    let fn_id = chunk.read_u16(ip + 1);
+                    let argc = chunk.code[ip + 3];
+                    // defense-in-depth: a non-pure callee is rejected even
+                    // though Phase 3 should already have caught it.
+                    let effect = self
+                        .fn_effects
+                        .get(&fn_id)
+                        .copied()
+                        .unwrap_or_else(EffectSet::full);
+                    if !effect.is_pure() {
+                        let fn_name = self
+                            .program
+                            .fn_names
+                            .get(fn_id as usize)
+                            .cloned()
+                            .unwrap_or_else(|| format!("#{fn_id}"));
+                        return Err(QalaError::ComptimeEffectViolation {
+                            span: self.block_span,
+                            fn_name,
+                            effect: effect.display(),
+                        });
+                    }
+                    // a stdlib callee has no chunk to execute; v1 does not
+                    // support stdlib calls inside comptime.
+                    if fn_id >= STDLIB_FN_BASE {
+                        return Err(QalaError::Type {
+                            span: self.block_span,
+                            message: "comptime interpreter: stdlib calls inside comptime \
+                                      are a v2 feature"
+                                .to_string(),
+                        });
+                    }
+                    if self.frames.len() >= COMPTIME_MAX_FRAMES {
+                        // call-depth overflow is treated as a budget overflow.
+                        return Err(QalaError::ComptimeBudgetExceeded {
+                            span: self.block_span,
+                        });
+                    }
+                    // pop argc arguments; slot 0 is the first argument.
+                    let mut locals: Vec<Value> = Vec::with_capacity(argc as usize);
+                    for _ in 0..argc {
+                        locals.push(self.pop()?);
+                    }
+                    locals.reverse();
+                    self.frames.push(Frame {
+                        chunk_id: fn_id,
+                        locals,
+                        ip: 0,
+                    });
+                }
+                Opcode::Return => {
+                    let result = self.pop()?;
+                    self.frames.pop();
+                    if self.frames.is_empty() {
+                        return Ok(result);
+                    }
+                    self.stack.push(result);
+                }
+                Opcode::ToStr => {
+                    let v = self.pop()?;
+                    self.stack.push(Value::Str(v.to_string()));
+                }
+                Opcode::ConcatN => {
+                    let count = chunk.read_u16(ip + 1) as usize;
+                    if self.stack.len() < count {
+                        return Err(self.underflow());
+                    }
+                    let parts = self.stack.split_off(self.stack.len() - count);
+                    let mut s = String::new();
+                    for part in parts {
+                        match part {
+                            Value::Str(p) => s.push_str(&p),
+                            other => s.push_str(&other.to_string()),
+                        }
+                    }
+                    self.stack.push(Value::Str(s));
+                }
+                // heap-construction and pattern opcodes are not supported in
+                // comptime v1 -- the result must be a primitive or string.
+                Opcode::MakeArray
+                | Opcode::MakeTuple
+                | Opcode::MakeStruct
+                | Opcode::MakeEnumVariant
+                | Opcode::Index
+                | Opcode::Field
+                | Opcode::Len
+                | Opcode::MatchVariant => {
+                    return Err(QalaError::Type {
+                        span: self.block_span,
+                        message: format!(
+                            "comptime interpreter: {} is not supported inside comptime (v1)",
+                            op.name()
+                        ),
+                    });
+                }
+                Opcode::GetGlobal | Opcode::SetGlobal => {
+                    return Err(QalaError::Type {
+                        span: self.block_span,
+                        message: "comptime interpreter: globals are not supported in comptime"
+                            .to_string(),
+                    });
+                }
+                Opcode::Halt => {
+                    return Err(QalaError::Type {
+                        span: self.block_span,
+                        message: "comptime interpreter: unexpected HALT".to_string(),
+                    });
+                }
+            }
+        }
+        Err(QalaError::Type {
+            span: self.block_span,
+            message: "comptime interpreter: ran out of frames without a result".to_string(),
+        })
+    }
+
+    /// a comptime type error with the block span.
+    fn type_error(&self, message: &str) -> QalaError {
+        QalaError::Type {
+            span: self.block_span,
+            message: format!("comptime interpreter: {message}"),
+        }
+    }
+
+    /// evaluate an arithmetic opcode on two values. i64 ops are checked --
+    /// an overflow is an error; division / remainder by zero is an error.
+    /// f64 ops follow IEEE 754.
+    fn eval_arith(&self, op: Opcode, a: Value, b: Value) -> Result<Value, QalaError> {
+        let int_overflow = |bin: BinOp, x: i64, y: i64| QalaError::IntegerOverflow {
+            span: self.block_span,
+            op: bin,
+            lhs: x,
+            rhs: y,
+        };
+        match (op, a, b) {
+            (Opcode::Add, Value::I64(x), Value::I64(y)) => Ok(Value::I64(
+                x.checked_add(y).ok_or_else(|| int_overflow(BinOp::Add, x, y))?,
+            )),
+            (Opcode::Sub, Value::I64(x), Value::I64(y)) => Ok(Value::I64(
+                x.checked_sub(y).ok_or_else(|| int_overflow(BinOp::Sub, x, y))?,
+            )),
+            (Opcode::Mul, Value::I64(x), Value::I64(y)) => Ok(Value::I64(
+                x.checked_mul(y).ok_or_else(|| int_overflow(BinOp::Mul, x, y))?,
+            )),
+            (Opcode::Div, Value::I64(x), Value::I64(y)) => {
+                if y == 0 {
+                    return Err(self.type_error("division by zero"));
+                }
+                Ok(Value::I64(
+                    x.checked_div(y).ok_or_else(|| int_overflow(BinOp::Div, x, y))?,
+                ))
+            }
+            (Opcode::Mod, Value::I64(x), Value::I64(y)) => {
+                if y == 0 {
+                    return Err(self.type_error("remainder by zero"));
+                }
+                Ok(Value::I64(
+                    x.checked_rem(y).ok_or_else(|| int_overflow(BinOp::Rem, x, y))?,
+                ))
+            }
+            (Opcode::FAdd, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x + y)),
+            (Opcode::FSub, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x - y)),
+            (Opcode::FMul, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x * y)),
+            (Opcode::FDiv, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x / y)),
+            _ => Err(self.type_error("arithmetic operand type mismatch")),
+        }
+    }
+
+    /// evaluate a comparison opcode on two values, returning the bool result.
+    fn eval_compare(&self, op: Opcode, a: Value, b: Value) -> Result<bool, QalaError> {
+        match (op, a, b) {
+            (Opcode::Eq, Value::I64(x), Value::I64(y)) => Ok(x == y),
+            (Opcode::Ne, Value::I64(x), Value::I64(y)) => Ok(x != y),
+            (Opcode::Lt, Value::I64(x), Value::I64(y)) => Ok(x < y),
+            (Opcode::Le, Value::I64(x), Value::I64(y)) => Ok(x <= y),
+            (Opcode::Gt, Value::I64(x), Value::I64(y)) => Ok(x > y),
+            (Opcode::Ge, Value::I64(x), Value::I64(y)) => Ok(x >= y),
+            (Opcode::Eq, Value::Bool(x), Value::Bool(y)) => Ok(x == y),
+            (Opcode::Ne, Value::Bool(x), Value::Bool(y)) => Ok(x != y),
+            (Opcode::Eq, Value::Str(x), Value::Str(y)) => Ok(x == y),
+            (Opcode::Ne, Value::Str(x), Value::Str(y)) => Ok(x != y),
+            (Opcode::FEq, Value::F64(x), Value::F64(y)) => Ok(x == y),
+            (Opcode::FNe, Value::F64(x), Value::F64(y)) => Ok(x != y),
+            (Opcode::FLt, Value::F64(x), Value::F64(y)) => Ok(x < y),
+            (Opcode::FLe, Value::F64(x), Value::F64(y)) => Ok(x <= y),
+            (Opcode::FGt, Value::F64(x), Value::F64(y)) => Ok(x > y),
+            (Opcode::FGe, Value::F64(x), Value::F64(y)) => Ok(x >= y),
+            _ => Err(self.type_error("comparison operand type mismatch")),
+        }
+    }
+}
+
+/// compute a jump's absolute target byte offset from the byte AFTER the
+/// jump's operand and the signed relative `offset`. an out-of-range target
+/// is a corrupted-bytecode error rather than a panic.
+fn jump_target(after_operand: usize, offset: i16) -> Result<usize, QalaError> {
+    let target = after_operand as isize + offset as isize;
+    if target < 0 {
+        return Err(QalaError::Type {
+            span: Span::new(0, 0),
+            message: "comptime interpreter: jump target out of range".to_string(),
+        });
+    }
+    Ok(target as usize)
 }
 
 #[cfg(test)]
@@ -3309,5 +3803,221 @@ mod tests {
             cleanup_calls, 2,
             "the defer fires on the break path and the fall-through"
         );
+    }
+
+    // ===== Task 5: ComptimeInterpreter =======================================
+
+    /// build a Chunk from a list of (opcode, operands) -- a tiny assembler
+    /// for the comptime interpreter unit tests.
+    fn asm(ops: &[(Opcode, &[u8])]) -> Chunk {
+        let mut c = Chunk::new();
+        for (op, operands) in ops {
+            c.write_op(*op, 1);
+            for b in *operands {
+                c.code.push(*b);
+                c.source_lines.push(1);
+            }
+        }
+        c
+    }
+
+    // Test 1: `comptime { 1 + 2 }` embeds a single CONST(I64(3)). (the `1+2`
+    // folds at codegen before the comptime even runs; the comptime body
+    // chunk is `CONST 3; RETURN`, the interpreter returns I64(3).)
+    #[test]
+    fn comptime_folds_arithmetic_to_one_const() {
+        let src = "fn main() is io { let x = comptime { 1 + 2 }\n println(\"{x}\") }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        // the comptime result CONST(I64(3)) is in main's constant pool.
+        assert!(
+            p.chunks[main_id].constants.contains(&Value::I64(3)),
+            "comptime of 1 + 2 should embed CONST(I64(3))"
+        );
+    }
+
+    // Test 2: `comptime { "hello" }` embeds CONST(Str("hello")).
+    #[test]
+    fn comptime_string_result() {
+        let src = "fn f() -> str is pure { comptime { \"hello\" } }";
+        let p = compile_ok(src);
+        assert!(p.chunks[0].constants.contains(&Value::Str("hello".to_string())));
+    }
+
+    // Test 3: `comptime { let x = 2; x * x }` evaluates to I64(4).
+    #[test]
+    fn comptime_block_with_local() {
+        let src = "fn f() -> i64 is pure { comptime { let x = 2\n x * x } }";
+        let p = compile_ok(src);
+        assert!(
+            p.chunks[0].constants.contains(&Value::I64(4)),
+            "comptime block result should be I64(4)"
+        );
+    }
+
+    // Test 4: comptime division by zero is a codegen error.
+    #[test]
+    fn comptime_division_by_zero_errors() {
+        // run a hand-built chunk `CONST 1; CONST 0; DIV; RETURN` directly.
+        let program = Program::new();
+        let effects: HashMap<u16, EffectSet> = HashMap::new();
+        let mut chunk = Chunk::new();
+        let one = chunk.add_constant(Value::I64(1));
+        let zero = chunk.add_constant(Value::I64(0));
+        let mut body = asm(&[
+            (Opcode::Const, &one.to_le_bytes()),
+            (Opcode::Const, &zero.to_le_bytes()),
+            (Opcode::Div, &[]),
+            (Opcode::Return, &[]),
+        ]);
+        body.constants = chunk.constants;
+        let mut interp = ComptimeInterpreter::new(&program, &effects, Span::new(0, 1));
+        match interp.run(body) {
+            Err(QalaError::Type { message, .. }) => {
+                assert!(
+                    message.contains("division by zero"),
+                    "expected division-by-zero, got: {message}"
+                );
+            }
+            other => panic!("expected a division-by-zero Type error, got {other:?}"),
+        }
+    }
+
+    // Test 5: a 100000-instruction budget is enforced. a hand-built chunk of
+    // a tight self-loop runs forever; the interpreter halts it at the budget.
+    #[test]
+    fn comptime_budget_exhaustion_errors() {
+        let program = Program::new();
+        let effects: HashMap<u16, EffectSet> = HashMap::new();
+        // `loop: JUMP loop` -- an infinite loop with no RETURN.
+        // JUMP is 3 bytes; the offset back to 0 from after-the-operand (3) is
+        // -3.
+        let body = asm(&[(Opcode::Jump, &(-3i16).to_le_bytes())]);
+        let mut interp = ComptimeInterpreter::new(&program, &effects, Span::new(5, 1));
+        match interp.run(body) {
+            Err(QalaError::ComptimeBudgetExceeded { span }) => {
+                assert_eq!(span, Span::new(5, 1));
+            }
+            other => panic!("expected ComptimeBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    // Test 6: defense-in-depth -- a comptime CALL to a non-pure function is
+    // rejected with ComptimeEffectViolation.
+    #[test]
+    fn comptime_effect_violation_on_impure_call() {
+        // a program with one io function (fn-id 0); the comptime body CALLs
+        // it. the throwaway chunk: `CALL 0/0; RETURN`.
+        let mut program = Program::new();
+        program.chunks.push(Chunk::new()); // fn-id 0's (empty) chunk.
+        program.fn_names.push("do_io".to_string());
+        let mut effects: HashMap<u16, EffectSet> = HashMap::new();
+        effects.insert(0, EffectSet::io());
+        let body = asm(&[
+            (Opcode::Call, &[0, 0, 0]), // fn-id 0 (u16), argc 0 (u8).
+            (Opcode::Return, &[]),
+        ]);
+        let mut interp = ComptimeInterpreter::new(&program, &effects, Span::new(3, 1));
+        match interp.run(body) {
+            Err(QalaError::ComptimeEffectViolation { fn_name, effect, .. }) => {
+                assert_eq!(fn_name, "do_io");
+                assert_eq!(effect, "io");
+            }
+            other => panic!("expected ComptimeEffectViolation, got {other:?}"),
+        }
+    }
+
+    // Test 7: a comptime result that is not a primitive / string is
+    // rejected. (an array cannot even be built inside the comptime
+    // interpreter -- MAKE_ARRAY is unsupported -- so `comptime { [1,2,3] }`
+    // errors at the MAKE_ARRAY, the documented v1 behavior. the
+    // result-constability check itself is unit-tested via the helpers
+    // below.)
+    #[test]
+    fn comptime_array_body_is_rejected() {
+        let src = "fn f() -> [i64; 3] is pure { comptime { [1, 2, 3] } }";
+        match compile(src) {
+            Err(errors) => {
+                assert!(
+                    errors.iter().any(|e| matches!(
+                        e,
+                        QalaError::Type { message, .. } if message.contains("MAKE_ARRAY")
+                    )),
+                    "expected a MAKE_ARRAY-unsupported error, got {errors:?}"
+                );
+            }
+            Ok(_) => panic!("comptime with an array body should not compile"),
+        }
+    }
+
+    // Test 7b: the result-constability predicate and its type-name helper.
+    #[test]
+    fn comptime_constable_primitive_predicate() {
+        assert!(is_constable_primitive(&Value::I64(1)));
+        assert!(is_constable_primitive(&Value::F64(1.0)));
+        assert!(is_constable_primitive(&Value::Bool(true)));
+        assert!(is_constable_primitive(&Value::Byte(0)));
+        assert!(is_constable_primitive(&Value::Str(String::new())));
+        assert!(is_constable_primitive(&Value::Void));
+        // a function reference is NOT constable.
+        assert!(!is_constable_primitive(&Value::Function(0)));
+        assert_eq!(value_type_name(&Value::Function(0)), "fn");
+        assert_eq!(value_type_name(&Value::I64(0)), "i64");
+    }
+
+    // Test 8: the interpreter uses an explicit Vec<Frame>, so deep recursion
+    // is bounded by COMPTIME_MAX_FRAMES rather than the host stack. a chunk
+    // that calls itself unconditionally overflows the frame cap and reports
+    // ComptimeBudgetExceeded -- WITHOUT a Rust stack overflow.
+    #[test]
+    fn comptime_deep_recursion_is_bounded_by_the_frame_cap() {
+        let mut program = Program::new();
+        // fn-id 0: a pure function whose body is `CALL 0/0` -- it calls
+        // itself forever. the explicit frame stack caps the depth.
+        let recursive = asm(&[(Opcode::Call, &[0, 0, 0])]);
+        program.chunks.push(recursive);
+        program.fn_names.push("recurse".to_string());
+        let mut effects: HashMap<u16, EffectSet> = HashMap::new();
+        effects.insert(0, EffectSet::pure());
+        // the throwaway body just calls `recurse`.
+        let body = asm(&[(Opcode::Call, &[0, 0, 0]), (Opcode::Return, &[])]);
+        let mut interp = ComptimeInterpreter::new(&program, &effects, Span::new(0, 1));
+        match interp.run(body) {
+            Err(QalaError::ComptimeBudgetExceeded { .. }) => {
+                // the frame cap (or the budget) halted it -- no host-stack
+                // overflow, which is the point of the explicit Vec<Frame>.
+            }
+            other => panic!("expected ComptimeBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    // Test 9: a comptime block calling a pure user function. `square` is
+    // compiled to a real chunk; the comptime interpreter dispatches the CALL
+    // into it via the frame stack and embeds the I64 result.
+    #[test]
+    fn comptime_calls_a_pure_user_function() {
+        let src = "fn square(x: i64) -> i64 is pure { return x * x }\n\
+                   fn f() -> i64 is pure { comptime { square(5) } }";
+        let p = compile_ok(src);
+        let f_id = p.fn_names.iter().position(|n| n == "f").unwrap();
+        // square(5) == 25 -- embedded as a CONST in f's pool.
+        assert!(
+            p.chunks[f_id].constants.contains(&Value::I64(25)),
+            "comptime square(5) should embed CONST(I64(25))"
+        );
+        // the disassembly of f shows a CONST 25 and no trace of `square`'s
+        // call -- the comptime evaluation collapsed it.
+        let ops = opcodes(&p.chunks[f_id].code);
+        assert!(ops.contains(&Opcode::Const));
+    }
+
+    // Test 10: the public entry compile_program is reachable and produces a
+    // Program for a comptime-using source.
+    #[test]
+    fn comptime_program_compiles_through_the_public_entry() {
+        let src = "fn f() -> i64 is pure { comptime { 10 * 10 } }";
+        let p = compile_ok(src);
+        assert_eq!(p.chunks.len(), 1);
+        assert!(p.chunks[0].constants.contains(&Value::I64(100)));
     }
 }
