@@ -21,3 +21,5 @@ pub mod value;
 pub mod opcode;
 // instruction stream + constant pool + source map + disassembler.
 pub mod chunk;
+// typed AST -> bytecode; constant folding, DCE, defer compilation, comptime.
+pub mod codegen;
