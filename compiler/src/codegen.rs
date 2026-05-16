@@ -1175,7 +1175,10 @@ impl<'a> Codegen<'a> {
         // value is on the stack, RETURN hands it back.
         self.chunk_mut().write_op(Opcode::Return, line);
         // detach the throwaway chunk and restore the real compile state.
-        let throwaway = self.program.chunks.pop().unwrap_or_default();
+        let throwaway = self.program.chunks.pop().ok_or_else(|| QalaError::Parse {
+            span,
+            message: "internal: comptime chunk was removed during compilation".to_string(),
+        })?;
         self.current_fn_id = saved_fn_id;
         self.scopes = saved_scopes;
         compile_result?;
