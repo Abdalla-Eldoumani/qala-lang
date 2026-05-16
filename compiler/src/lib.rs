@@ -23,3 +23,5 @@ pub mod opcode;
 pub mod chunk;
 // typed AST -> bytecode; constant folding, DCE, defer compilation, comptime.
 pub mod codegen;
+// peephole optimizer -- single-pass bytecode rewrites.
+pub mod optimizer;
