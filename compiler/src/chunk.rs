@@ -459,16 +459,18 @@ impl Program {
         out
     }
 
-    /// the single-pass peephole optimizer entry point. Plan 04-05 will
-    /// replace this body once `peephole(&mut Chunk)` exists in
-    /// optimizer.rs; for now this is a no-op so codegen (Plan 04-04) can
-    /// call it without forward-referencing the optimizer module.
+    /// run the peephole optimizer over every chunk in this program. invokes
+    /// [`crate::optimizer::peephole`]. idempotent: a second call does no
+    /// work, because the first pass already collapsed every matchable
+    /// instruction window.
     ///
-    /// the method lives on [`Program`] because optimization is a whole-
-    /// program pass; the body will iterate `chunks` and apply peephole
-    /// rewrites to each.
+    /// optimization is opt-in -- the disassembler can show un-optimized
+    /// bytecode by skipping this call, which supports the playground's
+    /// "show me what the compiler did" use case.
     pub fn optimize(&mut self) {
-        // intentionally empty; Plan 04-05 fills the body.
+        for chunk in &mut self.chunks {
+            crate::optimizer::peephole(chunk);
+        }
     }
 }
 
@@ -875,9 +877,10 @@ mod tests {
         assert_eq!(out.matches('\n').count(), 4, "wrong line count in:\n{out}");
     }
 
-    // Test 18: Program::optimize is a no-op stub.
+    // Test 18: Program::optimize runs the peephole pass over every chunk --
+    // both chunks have their CONST+POP pairs removed in place.
     #[test]
-    fn program_optimize_is_a_no_op_stub() {
+    fn program_optimize_runs_peephole_over_every_chunk() {
         let mut p = Program::new();
         p.fn_names.push("main".to_string());
         p.fn_names.push("helper".to_string());
@@ -887,24 +890,57 @@ mod tests {
         a.write_op(Opcode::Const, 1);
         a.write_u16(idx_a, 1);
         a.write_op(Opcode::Pop, 1);
+        a.write_op(Opcode::Return, 1);
 
         let mut b = Chunk::new();
         let idx_b = b.add_constant(Value::I64(1));
         b.write_op(Opcode::Const, 1);
         b.write_u16(idx_b, 1);
         b.write_op(Opcode::Pop, 1);
+        b.write_op(Opcode::Return, 1);
 
-        p.chunks.push(a.clone());
-        p.chunks.push(b.clone());
+        p.chunks.push(a);
+        p.chunks.push(b);
 
         p.optimize();
 
-        // Plan 04-05 will replace the stub with the actual peephole pass;
-        // until then optimize() must NOT modify the chunks.
-        assert_eq!(p.chunks[0].code, a.code);
-        assert_eq!(p.chunks[0].source_lines, a.source_lines);
-        assert_eq!(p.chunks[1].code, b.code);
-        assert_eq!(p.chunks[1].source_lines, b.source_lines);
+        // the CONST+POP pair is gone from each chunk; only RETURN remains.
+        assert_eq!(p.chunks[0].code, vec![Opcode::Return as u8]);
+        assert_eq!(p.chunks[1].code, vec![Opcode::Return as u8]);
+        // the lockstep invariant survives the whole-program pass.
+        assert_eq!(p.chunks[0].code.len(), p.chunks[0].source_lines.len());
+        assert_eq!(p.chunks[1].code.len(), p.chunks[1].source_lines.len());
+    }
+
+    // Test 18b: Program::optimize on an empty program is a no-op (no panic).
+    #[test]
+    fn program_optimize_on_an_empty_program_does_nothing() {
+        let mut p = Program::new();
+        p.optimize();
+        assert!(p.chunks.is_empty());
+    }
+
+    // Test 18c: Program::optimize is idempotent -- a second call changes
+    // nothing because the first pass already collapsed every window.
+    #[test]
+    fn program_optimize_is_idempotent() {
+        let mut p = Program::new();
+        p.fn_names.push("main".to_string());
+
+        let mut a = Chunk::new();
+        let idx = a.add_constant(Value::I64(0));
+        a.write_op(Opcode::Const, 1);
+        a.write_u16(idx, 1);
+        a.write_op(Opcode::Pop, 1);
+        a.write_op(Opcode::Dup, 2);
+        a.write_op(Opcode::Pop, 2);
+        a.write_op(Opcode::Return, 3);
+        p.chunks.push(a);
+
+        p.optimize();
+        let after_first = p.chunks[0].code.clone();
+        p.optimize();
+        assert_eq!(p.chunks[0].code, after_first, "second optimize changed bytes");
     }
 
     // bonus: Program::disassemble header + body composition is determ.
