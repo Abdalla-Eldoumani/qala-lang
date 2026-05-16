@@ -194,18 +194,18 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
         let a_idx = chunk.read_u16(i + 1) as usize;
         let b_idx = chunk.read_u16(i + 4) as usize;
         let a = chunk.constants.get(a_idx);
-        let b = chunk.constants.get(b_idx);
-        let folded = match (a, b, code[i + 6]) {
+        let b_val = chunk.constants.get(b_idx);
+        let folded = match (a, b_val, code[i + 6]) {
             // i64 + i64: checked_add. on overflow return None so the window
             // is left un-rewritten -- the codegen inline folder is the
             // user-facing IntegerOverflow path; if a fold reaches peephole
             // and overflows, v1 leaves the bytes rather than erroring (an
             // error here would break the build silently).
-            (Some(Value::I64(x)), Some(Value::I64(y)), b) if b == add_byte => {
+            (Some(Value::I64(x)), Some(Value::I64(y)), op_byte) if op_byte == add_byte => {
                 x.checked_add(*y).map(Value::I64)
             }
             // f64 + f64: IEEE 754 add. inf / NaN are valid fold results.
-            (Some(Value::F64(x)), Some(Value::F64(y)), b) if b == fadd_byte => {
+            (Some(Value::F64(x)), Some(Value::F64(y)), op_byte) if op_byte == fadd_byte => {
                 Some(Value::F64(x + y))
             }
             // any other type pair (or opcode/type mismatch): no fold.
