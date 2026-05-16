@@ -19,3 +19,5 @@ pub mod diagnostics;
 pub mod value;
 // bytecode opcode enum -- consumed by chunk, codegen, optimizer, vm
 pub mod opcode;
+// instruction stream + constant pool + source map + disassembler.
+pub mod chunk;
