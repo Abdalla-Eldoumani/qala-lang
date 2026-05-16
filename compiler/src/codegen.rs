@@ -1763,16 +1763,6 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    /// set the innermost loop scope's `continue` target.
-    fn set_loop_continue_target(&mut self, target: usize) {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(meta) = &mut scope.loop_meta {
-                meta.continue_target = target;
-                return;
-            }
-        }
-    }
-
     /// compile a `match`. each arm tests the scrutinee and, on a match, runs
     /// its body; the body's value is the match's value. variant patterns use
     /// `MATCH_VARIANT`, literal patterns a `DUP; CONST; EQ` test, binding and
