@@ -34,14 +34,17 @@
 //! [`Chunk::write_u16`] / [`Chunk::write_i16`] so the lockstep invariant
 //! `chunk.code.len() == chunk.source_lines.len()` survives codegen.
 
-use crate::ast::{BinOp, UnaryOp};
+use crate::ast::{BinOp, Pattern, UnaryOp};
 use crate::chunk::{Chunk, Program};
 use crate::effects::EffectSet;
 use crate::errors::QalaError;
 use crate::opcode::Opcode;
 use crate::span::{LineIndex, Span};
-use crate::typed_ast::{TypedAst, TypedBlock, TypedExpr, TypedItem, TypedStmt};
-use crate::types::QalaType;
+use crate::typed_ast::{
+    TypedAst, TypedBlock, TypedElseBranch, TypedExpr, TypedInterpPart, TypedItem, TypedMatchArm,
+    TypedMatchArmBody, TypedStmt,
+};
+use crate::types::{QalaType, Symbol};
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -490,27 +493,148 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    // ---- statement + block (placeholders; Task 4 implements) ---------------
+    // ---- statement + block -------------------------------------------------
 
-    /// compile a `{ ... }` block. returns `true` when the block was
-    /// terminated by a `return` / `break` / `continue` (so a caller skips a
-    /// fall-through RETURN).
+    /// compile a `{ ... }` block. pushes its own lexical scope, walks the
+    /// statements (stopping at the first terminator -- dead-code elimination),
+    /// emits the trailing value if any, then emits the scope's fall-through
+    /// defers and pops the scope. returns `true` when the block was
+    /// terminated by a `return` / `break` / `continue` so a caller skips a
+    /// fall-through RETURN.
     ///
-    /// PLACEHOLDER for Task 1: emits nothing and reports "not terminated".
-    /// Task 4 replaces the body with the full statement walk + DCE.
+    /// `compile_item` does NOT push a scope itself -- it relies on this
+    /// method's scope push; arm bodies and block expressions get their own
+    /// scope the same way.
     fn compile_block(&mut self, block: &TypedBlock) -> Result<bool, QalaError> {
-        let _ = block;
-        Ok(false)
+        self.push_scope();
+        let mut terminated = false;
+        for stmt in &block.stmts {
+            if self.compile_stmt(stmt)? {
+                // a terminator: the remaining statements are dead code.
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            if let Some(value) = &block.value {
+                self.compile_expr(value)?;
+            }
+            let line = self.line_at(block.span);
+            // the trailing value (if any) is already on the stack; the
+            // fall-through defers fire after it, each popping its own result.
+            self.pop_scope_and_emit_defers(line)?;
+        } else {
+            // the terminator's exit already fired this scope's defers.
+            self.pop_scope_no_defers();
+        }
+        Ok(terminated)
     }
 
     /// compile one statement. returns `true` when the statement terminated
-    /// the surrounding block.
-    ///
-    /// PLACEHOLDER for Task 1: emits nothing. Task 4 replaces the body.
-    #[allow(dead_code)]
+    /// the surrounding block (`return` / `break` / `continue`).
     fn compile_stmt(&mut self, stmt: &TypedStmt) -> Result<bool, QalaError> {
-        let _ = stmt;
-        Ok(false)
+        match stmt {
+            TypedStmt::Let { name, init, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_expr(init)?;
+                let slot = self.next_slot();
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.locals.push((name.clone(), slot));
+                }
+                self.chunk_mut().write_op(Opcode::SetLocal, line);
+                self.chunk_mut().write_u16(slot, line);
+                Ok(false)
+            }
+            TypedStmt::If { cond, then_block, else_branch, span } => {
+                self.compile_if(cond, then_block, else_branch.as_ref(), *span)
+            }
+            TypedStmt::While { cond, body, span } => {
+                self.compile_while(cond, body, *span)
+            }
+            TypedStmt::For { var, iter, body, span, .. } => {
+                self.compile_for(var, iter, body, *span)
+            }
+            TypedStmt::Return { value, span } => {
+                let line = self.line_at(*span);
+                if let Some(v) = value {
+                    self.compile_expr(v)?;
+                }
+                self.emit_defers_for_exit(ExitKind::Return, line)?;
+                self.chunk_mut().write_op(Opcode::Return, line);
+                Ok(true)
+            }
+            TypedStmt::Break { span } => {
+                let line = self.line_at(*span);
+                self.emit_defers_for_exit(ExitKind::Break, line)?;
+                let pos = self.chunk_mut().emit_jump(Opcode::Jump, line);
+                // record the jump for the innermost loop scope to patch.
+                self.record_break_patch(pos)?;
+                Ok(true)
+            }
+            TypedStmt::Continue { span } => {
+                let line = self.line_at(*span);
+                self.emit_defers_for_exit(ExitKind::Continue, line)?;
+                let target = self.innermost_continue_target()?;
+                self.chunk_mut().emit_loop(target, line)?;
+                Ok(true)
+            }
+            TypedStmt::Defer { expr, .. } => {
+                // a defer is NOT emitted now -- it is appended to the topmost
+                // scope's deferred list and emitted (reversed) at every exit.
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.deferred.push(expr.clone());
+                }
+                Ok(false)
+            }
+            TypedStmt::Expr { expr, span } => {
+                let line = self.line_at(*span);
+                self.compile_expr(expr)?;
+                // an expression statement discards its value.
+                if !matches!(expr.ty(), QalaType::Void) {
+                    self.chunk_mut().write_op(Opcode::Pop, line);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// the next free local slot in the current chunk: one past the highest
+    /// slot any scope currently binds.
+    fn next_slot(&self) -> u16 {
+        let mut max: i32 = -1;
+        for scope in &self.scopes {
+            for (_, slot) in &scope.locals {
+                max = max.max(*slot as i32);
+            }
+        }
+        (max + 1) as u16
+    }
+
+    /// record a `break`'s jump-patch site on the innermost loop scope.
+    fn record_break_patch(&mut self, pos: usize) -> Result<(), QalaError> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(meta) = &mut scope.loop_meta {
+                meta.break_patches.push(pos);
+                return Ok(());
+            }
+        }
+        Err(QalaError::Type {
+            span: Span::new(0, 0),
+            message: "codegen: break outside a loop".to_string(),
+        })
+    }
+
+    /// the innermost loop scope's `continue` target byte offset.
+    fn innermost_continue_target(&self) -> Result<usize, QalaError> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(meta) = &scope.loop_meta {
+                return Ok(meta.continue_target);
+            }
+        }
+        Err(QalaError::Type {
+            span: Span::new(0, 0),
+            message: "codegen: continue outside a loop".to_string(),
+        })
     }
 
     // ---- expression emission helpers ---------------------------------------
@@ -613,60 +737,82 @@ impl<'a> Codegen<'a> {
         self.chunk_mut().write_op(opcode, line);
     }
 
-    /// try to constant-fold a binary operator whose two operands were just
-    /// emitted as CONSTs. returns `Ok(true)` when a fold happened (the two
-    /// source CONSTs are rewound and a single result CONST emitted on
-    /// `line`), `Ok(false)` when no fold applies (the caller emits the
-    /// opcode), `Err` on an i64 overflow.
+    /// try to constant-fold a binary operator. `lhs_start` / `rhs_start` are
+    /// the chunk byte offsets where the lhs and the rhs sub-expressions began
+    /// emitting; `end` is the current end of `code`. a fold happens only when
+    /// the lhs region is exactly one `CONST` instruction (3 bytes) and the
+    /// rhs region is exactly one `CONST` instruction (3 bytes) -- this is the
+    /// structural, non-heuristic check (the `Const` discriminant is 0, so a
+    /// byte-pattern peek would mis-fire on operand bytes).
+    ///
+    /// returns `Ok(true)` when a fold happened (the two source CONSTs are
+    /// rewound and one result CONST emitted on `line`), `Ok(false)` when no
+    /// fold applies (the caller emits the opcode), `Err` on an i64 overflow.
     fn try_fold_binary(
         &mut self,
         op: &BinOp,
         operand_ty: &QalaType,
         line: u32,
         span: Span,
+        lhs_start: usize,
+        rhs_start: usize,
     ) -> Result<bool, QalaError> {
-        // peek both operand CONSTs; bail if either is missing.
-        let (b_off, b_idx) = match self.chunk_mut().last_const() {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-        let (a_off, a_idx) = match self.chunk_mut().second_to_last_const() {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-        // the two CONSTs must be adjacent in the byte stream -- if anything
-        // intervened, folding them is unsound.
-        if a_off + 3 != b_off {
+        let chunk = self.chunk_mut();
+        let end = chunk.code.len();
+        // each operand must have emitted exactly one 3-byte CONST.
+        if rhs_start - lhs_start != 3 || end - rhs_start != 3 {
             return Ok(false);
         }
-        let a = self.chunk_mut().constants[a_idx as usize].clone();
-        let b = self.chunk_mut().constants[b_idx as usize].clone();
+        if chunk.code[lhs_start] != Opcode::Const as u8
+            || chunk.code[rhs_start] != Opcode::Const as u8
+        {
+            return Ok(false);
+        }
+        let a_idx = chunk.read_u16(lhs_start + 1);
+        let b_idx = chunk.read_u16(rhs_start + 1);
+        if a_idx as usize >= chunk.constants.len()
+            || b_idx as usize >= chunk.constants.len()
+        {
+            return Ok(false);
+        }
+        let a = chunk.constants[a_idx as usize].clone();
+        let b = chunk.constants[b_idx as usize].clone();
         let result = match fold_binary_value(&a, &b, op, operand_ty, span)? {
             Some(v) => v,
             None => return Ok(false),
         };
         // rewind both source CONSTs, then emit the folded result.
         let chunk = self.chunk_mut();
-        chunk.code.truncate(a_off);
-        chunk.source_lines.truncate(a_off);
+        chunk.code.truncate(lhs_start);
+        chunk.source_lines.truncate(lhs_start);
         self.emit_const(result, line);
         Ok(true)
     }
 
     /// try to constant-fold a unary operator whose operand was just emitted
-    /// as a CONST. returns `Ok(true)` on a fold, `Ok(false)` when none
-    /// applies, `Err` on an i64 negation overflow (`-i64::MIN`).
+    /// as a CONST. `operand_start` is the chunk offset where the operand
+    /// began emitting; the fold runs only when the operand compiled to
+    /// exactly one 3-byte CONST. returns `Ok(true)` on a fold, `Ok(false)`
+    /// when none applies, `Err` on an i64 negation overflow (`-i64::MIN`).
     fn try_fold_unary(
         &mut self,
         op: &UnaryOp,
         line: u32,
         span: Span,
+        operand_start: usize,
     ) -> Result<bool, QalaError> {
-        let (off, idx) = match self.chunk_mut().last_const() {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-        let v = self.chunk_mut().constants[idx as usize].clone();
+        let chunk = self.chunk_mut();
+        let end = chunk.code.len();
+        // the operand must have emitted exactly one 3-byte CONST.
+        if end - operand_start != 3 || chunk.code[operand_start] != Opcode::Const as u8 {
+            return Ok(false);
+        }
+        let idx = chunk.read_u16(operand_start + 1);
+        if idx as usize >= chunk.constants.len() {
+            return Ok(false);
+        }
+        let off = operand_start;
+        let v = chunk.constants[idx as usize].clone();
         let result = match (op, &v) {
             (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
             (UnaryOp::Neg, Value::I64(n)) => {
@@ -749,9 +895,10 @@ impl<'a> Codegen<'a> {
             }
             TypedExpr::Paren { inner, .. } => self.compile_expr(inner),
             TypedExpr::Unary { op, operand, span, .. } => {
+                let operand_start = self.chunk_mut().code.len();
                 self.compile_expr(operand)?;
                 let line = self.line_at(*span);
-                if !self.try_fold_unary(op, line, *span)? {
+                if !self.try_fold_unary(op, line, *span, operand_start)? {
                     self.emit_unop(op, operand.ty(), line);
                 }
                 Ok(())
@@ -762,9 +909,10 @@ impl<'a> Codegen<'a> {
                     // short-circuit: compile lhs, DUP it, conditionally jump
                     // past rhs, otherwise POP the lhs copy and evaluate rhs.
                     // `&&` jumps past on a false lhs; `||` jumps past on true.
+                    let lhs_start = self.chunk_mut().code.len();
                     self.compile_expr(lhs)?;
-                    // a literal lhs+rhs both-CONST case still folds: peek.
-                    if self.try_fold_short_circuit(op, rhs, line)? {
+                    // a literal lhs+rhs both-CONST case still folds.
+                    if self.try_fold_short_circuit(op, rhs, line, lhs_start)? {
                         return Ok(());
                     }
                     self.chunk_mut().write_op(Opcode::Dup, line);
@@ -778,9 +926,11 @@ impl<'a> Codegen<'a> {
                     self.chunk_mut().patch_jump(skip)?;
                     Ok(())
                 } else {
+                    let lhs_start = self.chunk_mut().code.len();
                     self.compile_expr(lhs)?;
+                    let rhs_start = self.chunk_mut().code.len();
                     self.compile_expr(rhs)?;
-                    if !self.try_fold_binary(op, lhs.ty(), line, *span)? {
+                    if !self.try_fold_binary(op, lhs.ty(), line, *span, lhs_start, rhs_start)? {
                         self.emit_binop(op, lhs.ty(), line);
                     }
                     Ok(())
@@ -790,37 +940,129 @@ impl<'a> Codegen<'a> {
                 let line = self.line_at(*span);
                 self.compile_call(callee, args, line, *span)
             }
-            // Task 3 + Task 5 fill these arms in.
-            other => self.unsupported_expr(other),
+            TypedExpr::Pipeline { lhs, call, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_pipeline(lhs, call, line, *span)
+            }
+            TypedExpr::Interpolation { parts, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_interpolation(parts, line)
+            }
+            TypedExpr::Try { expr, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_try(expr, line, *span)
+            }
+            TypedExpr::OrElse { expr, fallback, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_or_else(expr, fallback, line, *span)
+            }
+            TypedExpr::MethodCall { receiver, name, args, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_method_call(receiver, name, args, line, *span)
+            }
+            TypedExpr::FieldAccess { obj, name, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_expr(obj)?;
+                // resolve the struct + field to the FIELD operand index.
+                let field_idx = self.resolve_field_index(obj.ty(), name, *span)?;
+                self.chunk_mut().write_op(Opcode::Field, line);
+                self.chunk_mut().write_u16(field_idx, line);
+                Ok(())
+            }
+            TypedExpr::Index { obj, index, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_expr(obj)?;
+                self.compile_expr(index)?;
+                self.chunk_mut().write_op(Opcode::Index, line);
+                Ok(())
+            }
+            TypedExpr::Tuple { elems, span, .. } => {
+                let line = self.line_at(*span);
+                for elem in elems {
+                    self.compile_expr(elem)?;
+                }
+                self.chunk_mut().write_op(Opcode::MakeTuple, line);
+                self.chunk_mut().write_u16(elems.len() as u16, line);
+                Ok(())
+            }
+            TypedExpr::ArrayLit { elems, span, .. } => {
+                let line = self.line_at(*span);
+                for elem in elems {
+                    self.compile_expr(elem)?;
+                }
+                self.chunk_mut().write_op(Opcode::MakeArray, line);
+                self.chunk_mut().write_u16(elems.len() as u16, line);
+                Ok(())
+            }
+            TypedExpr::ArrayRepeat { value, count, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_array_repeat(value, count, line, *span)
+            }
+            TypedExpr::StructLit { name, fields, span, .. } => {
+                let line = self.line_at(*span);
+                // emit field values in declaration order. the typechecker
+                // already verified the field set; codegen trusts it.
+                for field in fields {
+                    self.compile_expr(&field.value)?;
+                }
+                // v1 limitation: MAKE_STRUCT carries only the field count,
+                // not the struct name -- Phase 5 will need a struct-id table
+                // extension to recover the runtime layout. documented in the
+                // SUMMARY.
+                let _ = name;
+                self.chunk_mut().write_op(Opcode::MakeStruct, line);
+                self.chunk_mut().write_u16(fields.len() as u16, line);
+                Ok(())
+            }
+            TypedExpr::Range { start, end, inclusive, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_range(start.as_deref(), end.as_deref(), *inclusive, line, *span)
+            }
+            TypedExpr::Block { block, .. } => {
+                // a block expression: compile_block runs its statements and
+                // leaves the trailing value on the stack.
+                self.compile_block(block)?;
+                Ok(())
+            }
+            TypedExpr::Match { scrutinee, arms, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_match(scrutinee, arms, line, *span)
+            }
+            // Task 5 fills the Comptime arm.
+            TypedExpr::Comptime { .. } => self.unsupported_expr(e),
         }
     }
 
-    /// compile an `&&` / `||` whose operands are both literal CONSTs: peek
-    /// the already-emitted lhs CONST, compile rhs (which may itself be a
-    /// CONST), then fold via [`try_fold_binary`]. returns `Ok(true)` when the
-    /// whole short-circuit folded to one CONST. when the lhs is not a CONST
-    /// this returns `Ok(false)` without emitting `rhs`.
+    /// compile an `&&` / `||` whose operands may both be literal CONSTs.
+    /// `lhs_start` is the chunk offset where the (already-emitted) lhs began.
+    /// when the lhs compiled to exactly one CONST, the rhs is compiled and
+    /// [`try_fold_binary`] attempts the fold. returns `Ok(true)` when the
+    /// whole short-circuit folded to one CONST; `Ok(false)` otherwise, with
+    /// any rhs emission rewound so the caller emits the jump pattern from a
+    /// clean state (just the lhs).
     fn try_fold_short_circuit(
         &mut self,
         op: &BinOp,
         rhs: &TypedExpr,
         line: u32,
+        lhs_start: usize,
     ) -> Result<bool, QalaError> {
-        // only attempt the fold when the lhs is already a single CONST.
-        if self.chunk_mut().last_const().is_none() {
+        // the lhs must have emitted exactly one 3-byte CONST.
+        let rhs_start = self.chunk_mut().code.len();
+        if rhs_start - lhs_start != 3
+            || self.chunk_mut().code[lhs_start] != Opcode::Const as u8
+        {
             return Ok(false);
         }
-        let lhs_len = self.chunk_mut().code.len();
         self.compile_expr(rhs)?;
-        // rhs must have emitted exactly one CONST after the lhs CONST.
-        if self.try_fold_binary(op, &QalaType::Bool, line, rhs.span())? {
+        if self.try_fold_binary(op, &QalaType::Bool, line, rhs.span(), lhs_start, rhs_start)? {
             return Ok(true);
         }
-        // no fold: rewind rhs's emission so the caller emits the
+        // no fold: rewind the rhs emission so the caller emits the
         // short-circuit jump pattern from a clean state (just the lhs CONST).
         let chunk = self.chunk_mut();
-        chunk.code.truncate(lhs_len);
-        chunk.source_lines.truncate(lhs_len);
+        chunk.code.truncate(rhs_start);
+        chunk.source_lines.truncate(rhs_start);
         Ok(false)
     }
 
@@ -887,14 +1129,768 @@ impl<'a> Codegen<'a> {
             .map(|(_, id)| id)
     }
 
-    /// the placeholder for expression kinds Task 3 and Task 5 implement.
-    /// returns a codegen error so the match stays exhaustive and the crate
-    /// compiles between tasks; no Task-2 test exercises these arms.
+    /// the placeholder for the `Comptime` arm until Task 5 wires the
+    /// [`ComptimeInterpreter`]. returns a codegen error so the match stays
+    /// exhaustive and the crate compiles between tasks.
     fn unsupported_expr(&mut self, e: &TypedExpr) -> Result<(), QalaError> {
         Err(QalaError::Type {
             span: e.span(),
-            message: "codegen: expression kind not yet supported".to_string(),
+            message: "codegen: comptime is wired up in a later step".to_string(),
         })
+    }
+
+    // ---- compound-expression helpers ---------------------------------------
+
+    /// compile a pipeline `lhs |> call`: desugar to a call with `lhs`
+    /// prepended to the call's arguments. the `call` node is either a bare
+    /// `Ident` (a unary call -- `lhs` is the only argument) or a `Call` (its
+    /// args follow `lhs`). the emitted CALL's source line is the pipeline's
+    /// own span -- a runtime error in the callee then points at the `|>`.
+    fn compile_pipeline(
+        &mut self,
+        lhs: &TypedExpr,
+        call: &TypedExpr,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        match call {
+            // `lhs |> f` -- f takes lhs as its single argument.
+            TypedExpr::Ident { name, .. } => {
+                self.compile_expr(lhs)?;
+                self.dispatch_named_call(name, 1, line, span)
+            }
+            // `lhs |> f(a, b)` -- lhs is prepended: f(lhs, a, b).
+            TypedExpr::Call { callee, args, .. } => {
+                let name = match callee.as_ref() {
+                    TypedExpr::Ident { name, .. } => name.clone(),
+                    _ => {
+                        return Err(QalaError::Type {
+                            span,
+                            message: "codegen: pipeline callee must be a named function"
+                                .to_string(),
+                        });
+                    }
+                };
+                self.compile_expr(lhs)?;
+                for arg in args {
+                    self.compile_expr(arg)?;
+                }
+                self.dispatch_named_call(&name, (args.len() + 1) as u8, line, span)
+            }
+            _ => Err(QalaError::Type {
+                span,
+                message: "codegen: pipeline right-hand side must be a call".to_string(),
+            }),
+        }
+    }
+
+    /// emit the dispatch for a named call whose arguments are already on the
+    /// stack. resolves the name as an enum-variant constructor first, then a
+    /// user / stdlib function. `argc` is the count of values on the stack.
+    fn dispatch_named_call(
+        &mut self,
+        name: &str,
+        argc: u8,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        if let Some(&variant_id) = self.enum_variant_lookup(name) {
+            self.chunk_mut().write_op(Opcode::MakeEnumVariant, line);
+            self.chunk_mut().write_u16(variant_id, line);
+            let chunk = self.chunk_mut();
+            chunk.code.push(argc);
+            chunk.source_lines.push(line);
+            return Ok(());
+        }
+        if let Some(fn_id) = self.resolve_callee_fn_id(name) {
+            self.emit_call(fn_id, argc, line);
+            return Ok(());
+        }
+        Err(QalaError::Type {
+            span,
+            message: format!("codegen: unresolved callee `{name}`"),
+        })
+    }
+
+    /// compile a string interpolation. each literal part emits a `CONST(Str)`;
+    /// each expression part emits the expression then `TO_STR` when its type
+    /// is not already `str`; a `CONCAT_N(part_count)` joins them. an
+    /// all-literal interpolation folds to a single `CONST` at codegen time.
+    fn compile_interpolation(
+        &mut self,
+        parts: &[TypedInterpPart],
+        line: u32,
+    ) -> Result<(), QalaError> {
+        // all-literal fast path: concatenate at codegen time.
+        if parts
+            .iter()
+            .all(|p| matches!(p, TypedInterpPart::Literal(_)))
+        {
+            let mut s = String::new();
+            for part in parts {
+                if let TypedInterpPart::Literal(text) = part {
+                    s.push_str(text);
+                }
+            }
+            self.emit_const(Value::Str(s), line);
+            return Ok(());
+        }
+        // emit each non-empty part; an empty literal (the parser always
+        // brackets an interpolation with literal text, often empty) adds no
+        // useful CONST and would inflate the CONCAT_N count.
+        let mut emitted = 0u16;
+        for part in parts {
+            match part {
+                TypedInterpPart::Literal(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    self.emit_const(Value::Str(text.clone()), line);
+                    emitted += 1;
+                }
+                TypedInterpPart::Expr(e) => {
+                    self.compile_expr(e)?;
+                    if !matches!(e.ty(), QalaType::Str) {
+                        self.chunk_mut().write_op(Opcode::ToStr, line);
+                    }
+                    emitted += 1;
+                }
+            }
+        }
+        // a single emitted part is already the whole string -- no CONCAT_N.
+        if emitted == 1 {
+            return Ok(());
+        }
+        // zero parts (an empty interpolated string) -> the empty string.
+        if emitted == 0 {
+            self.emit_const(Value::Str(String::new()), line);
+            return Ok(());
+        }
+        self.chunk_mut().write_op(Opcode::ConcatN, line);
+        self.chunk_mut().write_u16(emitted, line);
+        Ok(())
+    }
+
+    /// compile a `?` propagation. the inner expression yields a `Result` or
+    /// `Option`; on the success variant the payload is unwrapped to the
+    /// stack, on the failure variant the scope's defers fire and the original
+    /// `Err` / `None` is returned.
+    fn compile_try(
+        &mut self,
+        inner: &TypedExpr,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        self.compile_expr(inner)?;
+        // the success-variant id: Ok (0) for Result, Some (2) for Option.
+        let ok_id = match inner.ty() {
+            QalaType::Result(_, _) => 0u16,
+            QalaType::Option(_) => 2u16,
+            _ => {
+                return Err(QalaError::Type {
+                    span,
+                    message: "codegen: `?` operand is not a Result or Option".to_string(),
+                });
+            }
+        };
+        // DUP the scrutinee so the Err/None branch still has it to RETURN.
+        self.chunk_mut().write_op(Opcode::Dup, line);
+        // MATCH_VARIANT(ok_id, miss-> err_branch): on a hit it consumes the
+        // dup and pushes the Ok/Some payload; on a miss it leaves the dup.
+        self.chunk_mut().write_op(Opcode::MatchVariant, line);
+        self.chunk_mut().write_u16(ok_id, line);
+        let miss_patch = self.chunk_mut().code.len();
+        self.chunk_mut().write_i16(i16::MAX, line);
+        // on a hit, MATCH_VARIANT left the payload; the original scrutinee
+        // copy (the one DUP made) is still below it -- pop it so only the
+        // unwrapped payload remains.
+        self.chunk_mut().write_op(Opcode::Pop, line);
+        let skip_err = self.chunk_mut().emit_jump(Opcode::Jump, line);
+        // err branch: the MATCH_VARIANT missed and left the scrutinee dup on
+        // the stack. fire the defers up to the fn body, then RETURN -- the
+        // dup IS the Err/None value the function returns.
+        self.chunk_mut().patch_jump(miss_patch)?;
+        self.emit_defers_for_exit(ExitKind::QuestionProp, line)?;
+        self.chunk_mut().write_op(Opcode::Return, line);
+        // end of try: the unwrapped success payload is on the stack.
+        self.chunk_mut().patch_jump(skip_err)?;
+        Ok(())
+    }
+
+    /// compile an `expr or fallback`. on the success variant the payload is
+    /// unwrapped; on the failure variant the fallback expression's value is
+    /// used instead.
+    fn compile_or_else(
+        &mut self,
+        expr: &TypedExpr,
+        fallback: &TypedExpr,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        self.compile_expr(expr)?;
+        let ok_id = match expr.ty() {
+            QalaType::Result(_, _) => 0u16,
+            QalaType::Option(_) => 2u16,
+            _ => {
+                return Err(QalaError::Type {
+                    span,
+                    message: "codegen: `or` operand is not a Result or Option".to_string(),
+                });
+            }
+        };
+        self.chunk_mut().write_op(Opcode::Dup, line);
+        self.chunk_mut().write_op(Opcode::MatchVariant, line);
+        self.chunk_mut().write_u16(ok_id, line);
+        let miss_patch = self.chunk_mut().code.len();
+        self.chunk_mut().write_i16(i16::MAX, line);
+        // hit: pop the scrutinee dup, leaving the unwrapped success payload.
+        self.chunk_mut().write_op(Opcode::Pop, line);
+        let skip_fallback = self.chunk_mut().emit_jump(Opcode::Jump, line);
+        // miss: pop the scrutinee dup, then evaluate the fallback.
+        self.chunk_mut().patch_jump(miss_patch)?;
+        self.chunk_mut().write_op(Opcode::Pop, line);
+        self.compile_expr(fallback)?;
+        self.chunk_mut().patch_jump(skip_fallback)?;
+        Ok(())
+    }
+
+    /// compile a method call `receiver.name(args)`. the receiver is emitted
+    /// as the first argument, then the explicit args; the method resolves to
+    /// a `fn Type.name` via the receiver's type.
+    fn compile_method_call(
+        &mut self,
+        receiver: &TypedExpr,
+        name: &str,
+        args: &[TypedExpr],
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        // the receiver type's name keys the method lookup.
+        let type_name = match receiver.ty() {
+            QalaType::Named(Symbol(s)) => s.clone(),
+            QalaType::FileHandle => "FileHandle".to_string(),
+            other => {
+                return Err(QalaError::Type {
+                    span,
+                    message: format!(
+                        "codegen: method call on non-named type `{}`",
+                        other.display()
+                    ),
+                });
+            }
+        };
+        let key = FnKey {
+            type_name: Some(type_name.clone()),
+            name: name.to_string(),
+        };
+        let fn_id = self
+            .fn_table
+            .get(&key)
+            .copied()
+            .or_else(|| self.stdlib_table.get(&key).map(|(id, _)| *id))
+            .ok_or_else(|| QalaError::Type {
+                span,
+                message: format!("codegen: unresolved method `{type_name}.{name}`"),
+            })?;
+        // the receiver is argument 0; the explicit args follow.
+        self.compile_expr(receiver)?;
+        for arg in args {
+            self.compile_expr(arg)?;
+        }
+        self.emit_call(fn_id, (args.len() + 1) as u8, line);
+        Ok(())
+    }
+
+    /// resolve a `struct.field` access to the `FIELD` operand index. the
+    /// index is the field's declaration order within the struct.
+    fn resolve_field_index(
+        &self,
+        obj_ty: &QalaType,
+        field_name: &str,
+        span: Span,
+    ) -> Result<u16, QalaError> {
+        let struct_name = match obj_ty {
+            QalaType::Named(Symbol(s)) => s.clone(),
+            other => {
+                return Err(QalaError::Type {
+                    span,
+                    message: format!(
+                        "codegen: field access on non-struct type `{}`",
+                        other.display()
+                    ),
+                });
+            }
+        };
+        self.struct_field_index
+            .get(&(struct_name.clone(), field_name.to_string()))
+            .copied()
+            .ok_or_else(|| QalaError::Type {
+                span,
+                message: format!("codegen: no field `{field_name}` on `{struct_name}`"),
+            })
+    }
+
+    /// compile an array-repeat `[value; count]`. v1 requires the count to be
+    /// a literal `i64`; the value is emitted `count` times then a
+    /// `MAKE_ARRAY(count)`. the count is capped at 1024 -- a larger repeat is
+    /// a v1 limitation, a future `MAKE_ARRAY_REPEAT` opcode lifts it.
+    fn compile_array_repeat(
+        &mut self,
+        value: &TypedExpr,
+        count: &TypedExpr,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        let n = match count {
+            TypedExpr::Int { value: n, .. } if *n >= 0 => *n,
+            _ => {
+                return Err(QalaError::Parse {
+                    span,
+                    message: "array repeat count must be a non-negative integer literal (v1)"
+                        .to_string(),
+                });
+            }
+        };
+        if n > 1024 {
+            return Err(QalaError::Parse {
+                span,
+                message: "array repeat count too large (v1 limit is 1024)".to_string(),
+            });
+        }
+        for _ in 0..n {
+            self.compile_expr(value)?;
+        }
+        self.chunk_mut().write_op(Opcode::MakeArray, line);
+        self.chunk_mut().write_u16(n as u16, line);
+        Ok(())
+    }
+
+    /// compile a range `start..end` / `start..=end`. v1 materializes the
+    /// range to a fixed array of `i64`s -- it requires literal bounds and
+    /// caps the length at 1024. a real lazy range iterator is a v2 concern.
+    fn compile_range(
+        &mut self,
+        start: Option<&TypedExpr>,
+        end: Option<&TypedExpr>,
+        inclusive: bool,
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        let bound = |e: Option<&TypedExpr>| match e {
+            Some(TypedExpr::Int { value, .. }) => Some(*value),
+            _ => None,
+        };
+        let (Some(lo), Some(hi)) = (bound(start), bound(end)) else {
+            return Err(QalaError::Parse {
+                span,
+                message: "range bounds must be integer literals in v1 (a runtime range \
+                          iterator is a v2 feature)"
+                    .to_string(),
+            });
+        };
+        let last = if inclusive { hi } else { hi - 1 };
+        if last < lo {
+            // an empty range materializes to an empty array.
+            self.chunk_mut().write_op(Opcode::MakeArray, line);
+            self.chunk_mut().write_u16(0, line);
+            return Ok(());
+        }
+        let count = last - lo + 1;
+        if count > 1024 {
+            return Err(QalaError::Parse {
+                span,
+                message: "range too large to materialize (v1 limit is 1024 elements)"
+                    .to_string(),
+            });
+        }
+        for v in lo..=last {
+            self.emit_const(Value::I64(v), line);
+        }
+        self.chunk_mut().write_op(Opcode::MakeArray, line);
+        self.chunk_mut().write_u16(count as u16, line);
+        Ok(())
+    }
+
+    // ---- control-flow statement helpers ------------------------------------
+
+    /// compile an `if` statement. a literal-`true` / literal-`false` condition
+    /// is dead-code-eliminated: only the taken branch compiles, no JUMP is
+    /// emitted. a runtime condition emits the JUMP_IF_FALSE / JUMP pattern.
+    fn compile_if(
+        &mut self,
+        cond: &TypedExpr,
+        then_block: &TypedBlock,
+        else_branch: Option<&TypedElseBranch>,
+        span: Span,
+    ) -> Result<bool, QalaError> {
+        let line = self.line_at(span);
+        // DCE: a compile-time-constant condition emits only the taken branch.
+        match cond {
+            TypedExpr::Bool { value: true, .. } => {
+                self.compile_block(then_block)?;
+                return Ok(false);
+            }
+            TypedExpr::Bool { value: false, .. } => {
+                match else_branch {
+                    Some(TypedElseBranch::Block(b)) => {
+                        self.compile_block(b)?;
+                    }
+                    Some(TypedElseBranch::If(s)) => {
+                        self.compile_stmt(s)?;
+                    }
+                    None => {}
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+        // a runtime condition.
+        self.compile_expr(cond)?;
+        let jmp_else = self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line);
+        let then_terminated = self.compile_block(then_block)?;
+        let jmp_end = if !then_terminated && else_branch.is_some() {
+            Some(self.chunk_mut().emit_jump(Opcode::Jump, line))
+        } else {
+            None
+        };
+        self.chunk_mut().patch_jump(jmp_else)?;
+        match else_branch {
+            Some(TypedElseBranch::Block(b)) => {
+                self.compile_block(b)?;
+            }
+            Some(TypedElseBranch::If(s)) => {
+                self.compile_stmt(s)?;
+            }
+            None => {}
+        }
+        if let Some(je) = jmp_end {
+            self.chunk_mut().patch_jump(je)?;
+        }
+        // an `if` statement does not terminate the surrounding block in v1;
+        // the typechecker handles fn-level missing-return separately.
+        Ok(false)
+    }
+
+    /// compile a `while` loop: `loop_start` records the condition, a
+    /// `JUMP_IF_FALSE` exits, and an `emit_loop` jumps back. `break` and
+    /// `continue` patch through the loop scope's `LoopMeta`.
+    fn compile_while(
+        &mut self,
+        cond: &TypedExpr,
+        body: &TypedBlock,
+        span: Span,
+    ) -> Result<bool, QalaError> {
+        let line = self.line_at(span);
+        let loop_start = self.chunk_mut().code.len();
+        self.compile_expr(cond)?;
+        let jmp_end = self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line);
+        // the loop scope: `continue` jumps to loop_start (re-test the cond).
+        self.push_loop_scope(loop_start);
+        self.compile_block(body)?;
+        self.chunk_mut().emit_loop(loop_start, line)?;
+        self.chunk_mut().patch_jump(jmp_end)?;
+        // patch every `break` jump to land here, past the loop.
+        self.patch_loop_breaks()?;
+        self.pop_scope_no_defers();
+        Ok(false)
+    }
+
+    /// compile a `for var in iter` loop. v1 lowers it to an indexed walk over
+    /// the materialized `iter` array: a hidden array slot, a hidden index
+    /// slot, a `GET_LOCAL idx; GET_LOCAL arr; LEN; LT` guard, and an
+    /// increment. each iteration pushes a fresh body scope so loop-body
+    /// defers fire per iteration.
+    fn compile_for(
+        &mut self,
+        var: &str,
+        iter: &TypedExpr,
+        body: &TypedBlock,
+        span: Span,
+    ) -> Result<bool, QalaError> {
+        let line = self.line_at(span);
+        // the iterable lands on the stack, then is stored in a hidden slot.
+        self.compile_expr(iter)?;
+        let arr_slot = self.next_slot();
+        self.bind_hidden_slot(arr_slot);
+        self.chunk_mut().write_op(Opcode::SetLocal, line);
+        self.chunk_mut().write_u16(arr_slot, line);
+        // the index counter starts at 0.
+        self.emit_const(Value::I64(0), line);
+        let idx_slot = self.next_slot();
+        self.bind_hidden_slot(idx_slot);
+        self.chunk_mut().write_op(Opcode::SetLocal, line);
+        self.chunk_mut().write_u16(idx_slot, line);
+        // loop_start: the bounds check `idx < len(arr)`.
+        let loop_start = self.chunk_mut().code.len();
+        self.chunk_mut().write_op(Opcode::GetLocal, line);
+        self.chunk_mut().write_u16(idx_slot, line);
+        self.chunk_mut().write_op(Opcode::GetLocal, line);
+        self.chunk_mut().write_u16(arr_slot, line);
+        self.chunk_mut().write_op(Opcode::Len, line);
+        self.chunk_mut().write_op(Opcode::Lt, line);
+        let jmp_end = self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line);
+        // the loop scope. `continue_target` is patched after the body to
+        // point at the increment, so a `continue` still runs the increment.
+        self.push_loop_scope(loop_start);
+        // the loop variable's slot, bound in the loop scope so it survives
+        // the per-iteration body scope `compile_block` pushes.
+        let var_slot = self.next_slot();
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.locals.push((var.to_string(), var_slot));
+        }
+        // `var = arr[idx]`.
+        self.chunk_mut().write_op(Opcode::GetLocal, line);
+        self.chunk_mut().write_u16(arr_slot, line);
+        self.chunk_mut().write_op(Opcode::GetLocal, line);
+        self.chunk_mut().write_u16(idx_slot, line);
+        self.chunk_mut().write_op(Opcode::Index, line);
+        self.chunk_mut().write_op(Opcode::SetLocal, line);
+        self.chunk_mut().write_u16(var_slot, line);
+        // the body -- compile_block pushes its own per-iteration scope.
+        self.compile_block(body)?;
+        // the increment is the `continue` target: patch the loop scope.
+        let increment_label = self.chunk_mut().code.len();
+        self.set_loop_continue_target(increment_label);
+        self.chunk_mut().write_op(Opcode::GetLocal, line);
+        self.chunk_mut().write_u16(idx_slot, line);
+        self.emit_const(Value::I64(1), line);
+        self.chunk_mut().write_op(Opcode::Add, line);
+        self.chunk_mut().write_op(Opcode::SetLocal, line);
+        self.chunk_mut().write_u16(idx_slot, line);
+        self.chunk_mut().emit_loop(loop_start, line)?;
+        self.chunk_mut().patch_jump(jmp_end)?;
+        self.patch_loop_breaks()?;
+        self.pop_scope_no_defers();
+        Ok(false)
+    }
+
+    /// bind a hidden (compiler-generated) local slot in the topmost scope so
+    /// [`Codegen::next_slot`] does not hand the same slot out twice. the name
+    /// is empty -- a hidden slot is never resolved by an identifier.
+    fn bind_hidden_slot(&mut self, slot: u16) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.locals.push((String::new(), slot));
+        }
+    }
+
+    /// patch every `break` jump recorded on the innermost loop scope to land
+    /// at the current end of `code`.
+    fn patch_loop_breaks(&mut self) -> Result<(), QalaError> {
+        let patches: Vec<usize> = self
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.loop_meta.as_ref().map(|m| m.break_patches.clone()))
+            .unwrap_or_default();
+        for pos in patches {
+            self.chunk_mut().patch_jump(pos)?;
+        }
+        Ok(())
+    }
+
+    /// set the innermost loop scope's `continue` target.
+    fn set_loop_continue_target(&mut self, target: usize) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(meta) = &mut scope.loop_meta {
+                meta.continue_target = target;
+                return;
+            }
+        }
+    }
+
+    /// compile a `match`. each arm tests the scrutinee and, on a match, runs
+    /// its body; the body's value is the match's value. variant patterns use
+    /// `MATCH_VARIANT`, literal patterns a `DUP; CONST; EQ` test, binding and
+    /// wildcard patterns match unconditionally. each arm body runs in its own
+    /// `LocalsScope` so a `defer` inside an arm fires at arm exit.
+    ///
+    /// the precise stack discipline of `MATCH_VARIANT` is finalized by the
+    /// Phase 5 VM; codegen emits the locked DUP / MATCH_VARIANT / POP shape
+    /// per arm so the bytecode is well-formed for that VM to interpret.
+    fn compile_match(
+        &mut self,
+        scrutinee: &TypedExpr,
+        arms: &[TypedMatchArm],
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        self.compile_expr(scrutinee)?;
+        // the enum name (for variant-id lookup) when the scrutinee is an enum.
+        let enum_name = match scrutinee.ty() {
+            QalaType::Named(Symbol(s)) => Some(s.clone()),
+            _ => None,
+        };
+        // the byte positions of each arm's jump-to-end, patched at the end.
+        let mut end_jumps: Vec<usize> = Vec::new();
+        for (i, arm) in arms.iter().enumerate() {
+            let is_last = i + 1 == arms.len();
+            // every byte position that should jump to the NEXT arm when this
+            // arm fails to match (the pattern test and/or the guard).
+            let mut fail_jumps: Vec<usize> = Vec::new();
+            // an optional `(name, slot)` a binding pattern introduces.
+            let mut binding: Option<(String, u16)> = None;
+            match &arm.pattern {
+                Pattern::Wildcard { .. } => {
+                    // `_` matches anything: consume the scrutinee, run body.
+                    self.chunk_mut().write_op(Opcode::Pop, line);
+                }
+                Pattern::Binding { name, .. } => {
+                    // a bare uppercase name is ambiguous in the grammar: it
+                    // parses as a binding, but may name a zero-payload enum
+                    // variant (`Triangle`, `None`). when the scrutinee's enum
+                    // has a variant by this name, treat it as a variant
+                    // pattern -- a MATCH_VARIANT test -- not a binding.
+                    if let Some(variant_id) =
+                        self.maybe_variant_id(enum_name.as_deref(), name)
+                    {
+                        if !is_last {
+                            self.chunk_mut().write_op(Opcode::Dup, line);
+                        }
+                        self.chunk_mut().write_op(Opcode::MatchVariant, line);
+                        self.chunk_mut().write_u16(variant_id, line);
+                        let patch = self.chunk_mut().code.len();
+                        self.chunk_mut().write_i16(i16::MAX, line);
+                        fail_jumps.push(patch);
+                    } else {
+                        // a genuine binding: matches anything, binds the
+                        // scrutinee value.
+                        let slot = self.next_slot();
+                        self.bind_hidden_slot(slot);
+                        self.chunk_mut().write_op(Opcode::SetLocal, line);
+                        self.chunk_mut().write_u16(slot, line);
+                        binding = Some((name.clone(), slot));
+                    }
+                }
+                Pattern::Variant { name, .. } => {
+                    // DUP so MATCH_VARIANT consumes a copy and the original
+                    // survives for the next arm on a miss.
+                    if !is_last {
+                        self.chunk_mut().write_op(Opcode::Dup, line);
+                    }
+                    let variant_id = self.variant_id_for(enum_name.as_deref(), name, span)?;
+                    self.chunk_mut().write_op(Opcode::MatchVariant, line);
+                    self.chunk_mut().write_u16(variant_id, line);
+                    let patch = self.chunk_mut().code.len();
+                    self.chunk_mut().write_i16(i16::MAX, line);
+                    fail_jumps.push(patch);
+                }
+                Pattern::Int { value, .. } => {
+                    fail_jumps
+                        .push(self.emit_literal_pattern_test(Value::I64(*value), is_last, line));
+                }
+                Pattern::Bool { value, .. } => {
+                    fail_jumps
+                        .push(self.emit_literal_pattern_test(Value::Bool(*value), is_last, line));
+                }
+                Pattern::Byte { value, .. } => {
+                    fail_jumps
+                        .push(self.emit_literal_pattern_test(Value::Byte(*value), is_last, line));
+                }
+                Pattern::Str { value, .. } => {
+                    fail_jumps.push(self.emit_literal_pattern_test(
+                        Value::Str(value.clone()),
+                        is_last,
+                        line,
+                    ));
+                }
+                Pattern::Float { value, .. } => {
+                    fail_jumps
+                        .push(self.emit_literal_pattern_test(Value::F64(*value), is_last, line));
+                }
+            }
+            // the arm body runs in its own scope so an arm-local `defer`
+            // fires at arm exit. a binding pattern's name lives in it.
+            self.push_scope();
+            if let (Some((bind_name, bind_slot)), Some(scope)) =
+                (binding, self.scopes.last_mut())
+            {
+                scope.locals.push((bind_name, bind_slot));
+            }
+            // an optional guard: when false, fall through to the next arm.
+            if let Some(guard) = &arm.guard {
+                self.compile_expr(guard)?;
+                fail_jumps.push(self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line));
+            }
+            self.compile_match_arm_body(&arm.body)?;
+            self.pop_scope_and_emit_defers(line)?;
+            // jump past the remaining arms to the end of the match.
+            end_jumps.push(self.chunk_mut().emit_jump(Opcode::Jump, line));
+            // the next arm starts here: patch every fail jump for this arm.
+            for pf in fail_jumps {
+                self.chunk_mut().patch_jump(pf)?;
+            }
+        }
+        // every arm's jump-to-end lands here, past the last arm body.
+        for je in end_jumps {
+            self.chunk_mut().patch_jump(je)?;
+        }
+        Ok(())
+    }
+
+    /// emit a literal-pattern equality test: `DUP` (for a non-final arm so
+    /// the scrutinee survives a miss), `CONST(lit)`, `EQ`, then a
+    /// `JUMP_IF_FALSE` placeholder. returns the placeholder's byte position.
+    fn emit_literal_pattern_test(&mut self, lit: Value, is_last: bool, line: u32) -> usize {
+        if !is_last {
+            self.chunk_mut().write_op(Opcode::Dup, line);
+        }
+        self.emit_const(lit, line);
+        self.chunk_mut().write_op(Opcode::Eq, line);
+        self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line)
+    }
+
+    /// the non-erroring form of [`Codegen::variant_id_for`]: `Some(id)` when
+    /// `variant_name` names a variant of the scrutinee's enum (or, if the
+    /// enum is unknown, any variant), `None` otherwise. used to disambiguate
+    /// a bare-name binding pattern from a zero-payload variant pattern.
+    fn maybe_variant_id(&self, enum_name: Option<&str>, variant_name: &str) -> Option<u16> {
+        if let Some(en) = enum_name {
+            if let Some(&id) = self
+                .enum_variant_table
+                .get(&(en.to_string(), variant_name.to_string()))
+            {
+                return Some(id);
+            }
+            // a known enum that lacks this variant -- it is a real binding.
+            return None;
+        }
+        // no enum context: a bare uppercase name that matches some variant.
+        self.enum_variant_lookup(variant_name).copied()
+    }
+
+    /// resolve a variant pattern's name to a variant id. when the scrutinee's
+    /// enum name is known, the `(enum, variant)` pair keys the lookup
+    /// directly; otherwise fall back to the bare-name search.
+    fn variant_id_for(
+        &self,
+        enum_name: Option<&str>,
+        variant_name: &str,
+        span: Span,
+    ) -> Result<u16, QalaError> {
+        if let Some(en) = enum_name
+            && let Some(&id) = self
+                .enum_variant_table
+                .get(&(en.to_string(), variant_name.to_string()))
+        {
+            return Ok(id);
+        }
+        self.enum_variant_lookup(variant_name)
+            .copied()
+            .ok_or_else(|| QalaError::Type {
+                span,
+                message: format!("codegen: unknown variant `{variant_name}` in match"),
+            })
+    }
+
+    /// compile a match-arm body -- a bare expression or a block.
+    fn compile_match_arm_body(&mut self, body: &TypedMatchArmBody) -> Result<(), QalaError> {
+        match body {
+            TypedMatchArmBody::Expr(e) => self.compile_expr(e),
+            TypedMatchArmBody::Block(b) => {
+                self.compile_block(b)?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1607,5 +2603,286 @@ mod tests {
         assert_eq!(chunk.code.len(), chunk.source_lines.len());
         // every emitted byte for the trailing expr is on line 2.
         assert!(chunk.source_lines.iter().all(|&l| l == 2));
+    }
+
+    // ===== Task 3: compound expressions + match ==============================
+
+    // Test 1: a simple pipeline `5 |> double` desugars to `double(5)`.
+    #[test]
+    fn compile_expr_pipeline_desugars_to_call() {
+        let src = "fn double(x: i64) -> i64 is pure { return x * 2 }\n\
+                   fn f() -> i64 is pure { 5 |> double }";
+        let (code, _) = compile_expr_of(src, "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const, Opcode::Call]);
+        // the CALL targets `double` (fn-id 0) with argc 1.
+        assert_eq!(code[3], Opcode::Call as u8);
+        assert_eq!(u16::from_le_bytes([code[4], code[5]]), 0);
+        assert_eq!(code[6], 1);
+    }
+
+    // Test 2: a pipeline chain `5 |> double |> add_one`.
+    #[test]
+    fn compile_expr_pipeline_chain() {
+        let src = "fn double(x: i64) -> i64 is pure { return x * 2 }\n\
+                   fn add_one(x: i64) -> i64 is pure { return x + 1 }\n\
+                   fn f() -> i64 is pure { 5 |> double |> add_one }";
+        let (code, _) = compile_expr_of(src, "f");
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::Const, Opcode::Call, Opcode::Call]
+        );
+    }
+
+    // Test 3: a pipeline with extra args prepends the lhs as the first
+    // argument. (a user fn with extra args fails the Phase 3 pipeline arity
+    // check; only the generic stdlib functions accept the form, and only in
+    // a `let` binding -- a pipeline as a fn trailing-return-value hits a
+    // stricter check path. so this mirrors the bundled `pipeline.qala`:
+    // `let evens = numbers |> filter(is_even)`.)
+    #[test]
+    fn compile_expr_pipeline_with_extra_args() {
+        let src = "fn is_even(x: i64) -> bool is pure { return x % 2 == 0 }\n\
+                   fn main() is io {\n\
+                     let numbers = [1, 2, 3]\n\
+                     let evens = numbers |> filter(is_even)\n\
+                   }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let ops = opcodes(&p.chunks[main_id].code);
+        // the pipeline desugars to a CALL of `filter`; its argc is 2 (the
+        // piped array plus the `is_even` function argument).
+        assert!(ops.contains(&Opcode::Call), "pipeline emits a CALL");
+        // find the CALL and check its argc operand is 2.
+        let mut off = 0;
+        let mut found_argc2 = false;
+        let code = &p.chunks[main_id].code;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call && code[off + 3] == 2 {
+                found_argc2 = true;
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        assert!(found_argc2, "the filter CALL should have argc 2");
+    }
+
+    // Test 4: a simple interpolation `"hi {name}"` with name already str.
+    #[test]
+    fn compile_expr_interpolation_no_conversion() {
+        let src = "fn f(name: str) -> str is pure { \"hi {name}\" }";
+        let (code, _) = compile_expr_of(src, "f");
+        // CONST("hi ") + GET_LOCAL(name) + CONCAT_N -- no TO_STR (str arg).
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::Const, Opcode::GetLocal, Opcode::ConcatN]
+        );
+    }
+
+    // Test 5: an interpolation with a non-str expr emits TO_STR.
+    #[test]
+    fn compile_expr_interpolation_with_conversion() {
+        let src = "fn f(x: i64) -> str is pure { \"got: {x}\" }";
+        let (code, _) = compile_expr_of(src, "f");
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::Const, Opcode::GetLocal, Opcode::ToStr, Opcode::ConcatN]
+        );
+    }
+
+    // Test 6: an all-literal "interpolation" folds to a single CONST.
+    #[test]
+    fn compile_expr_all_literal_string_is_one_const() {
+        let (code, consts) =
+            compile_expr_of("fn f() -> str is pure { \"hello, world!\" }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::Str("hello, world!".to_string())));
+    }
+
+    // Test 7: `?` propagation emits DUP + MATCH_VARIANT + RETURN.
+    #[test]
+    fn compile_expr_try_emits_match_variant_and_return() {
+        let src = "fn get() -> Result<i64, str> is pure { return Ok(1) }\n\
+                   fn f() -> Result<i64, str> is pure { let x = get()?\n return Ok(x) }";
+        let p = compile_ok(src);
+        let f_id = p.fn_names.iter().position(|n| n == "f").unwrap();
+        let ops = opcodes(&p.chunks[f_id].code);
+        assert!(ops.contains(&Opcode::MatchVariant), "try should MATCH_VARIANT");
+        assert!(ops.contains(&Opcode::Dup), "try should DUP the scrutinee");
+        assert!(ops.contains(&Opcode::Return), "try should RETURN on the err path");
+    }
+
+    // Test 8: `or` fallback emits DUP + MATCH_VARIANT + the fallback.
+    #[test]
+    fn compile_expr_or_else_emits_match_variant_and_fallback() {
+        let src = "fn get() -> Result<i64, str> is pure { return Ok(1) }\n\
+                   fn f() -> i64 is pure { get() or 0 }";
+        let (code, _) = compile_expr_of(src, "f");
+        let ops = opcodes(&code);
+        assert!(ops.contains(&Opcode::MatchVariant));
+        assert!(ops.contains(&Opcode::Dup));
+        // the fallback `0` is a CONST somewhere after the MATCH_VARIANT.
+        assert!(ops.contains(&Opcode::Const));
+    }
+
+    // Test 9: a method call emits the receiver then CALL.
+    #[test]
+    fn compile_expr_method_call_emits_receiver_then_call() {
+        let src = "fn f(h: FileHandle) -> Result<str, str> is io { h.read_all() }";
+        let (code, _) = compile_expr_of(src, "f");
+        // GET_LOCAL(h) + CALL(FileHandle.read_all stdlib id).
+        assert_eq!(opcodes(&code), vec![Opcode::GetLocal, Opcode::Call]);
+        // the receiver counts as argc 1.
+        let call_off = 3;
+        assert_eq!(code[call_off + 3], 1);
+    }
+
+    // Test 10: field access emits the object then FIELD with the field idx.
+    #[test]
+    fn compile_expr_field_access_emits_field_opcode() {
+        let src = "struct Point { x: i64, y: i64 }\n\
+                   fn f(p: Point) -> i64 is pure { p.y }";
+        let (code, _) = compile_expr_of(src, "f");
+        assert_eq!(opcodes(&code), vec![Opcode::GetLocal, Opcode::Field]);
+        // `y` is field index 1.
+        assert_eq!(u16::from_le_bytes([code[4], code[5]]), 1);
+    }
+
+    // Test 11: indexing emits obj + index + INDEX.
+    #[test]
+    fn compile_expr_index_emits_index_opcode() {
+        let src = "fn f(arr: [i64]) -> i64 is pure { arr[0] }";
+        let (code, _) = compile_expr_of(src, "f");
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::GetLocal, Opcode::Const, Opcode::Index]
+        );
+    }
+
+    // Test 12: a tuple literal emits its elements then MAKE_TUPLE.
+    #[test]
+    fn compile_expr_tuple_emits_make_tuple() {
+        let (code, _) = compile_expr_of("fn f() -> (i64, i64, i64) is pure { (1, 2, 3) }", "f");
+        let ops = opcodes(&code);
+        assert_eq!(ops.last(), Some(&Opcode::MakeTuple));
+        // the operand is the element count, 3.
+        let mt = code.len() - 3;
+        assert_eq!(u16::from_le_bytes([code[mt + 1], code[mt + 2]]), 3);
+    }
+
+    // Test 13: an array literal emits its elements then MAKE_ARRAY. an array
+    // literal types as a fixed `[i64; 3]`, so the wrapper fn returns that.
+    #[test]
+    fn compile_expr_array_lit_emits_make_array() {
+        let (code, _) = compile_expr_of("fn f() -> [i64; 3] is pure { [1, 2, 3] }", "f");
+        let ops = opcodes(&code);
+        assert_eq!(ops.last(), Some(&Opcode::MakeArray));
+        let ma = code.len() - 3;
+        assert_eq!(u16::from_le_bytes([code[ma + 1], code[ma + 2]]), 3);
+    }
+
+    // Test 14: an array-repeat `[0; 5]` emits the value 5 times + MAKE_ARRAY.
+    #[test]
+    fn compile_expr_array_repeat_materializes() {
+        let (code, _) = compile_expr_of("fn f() -> [i64] is pure { [0; 5] }", "f");
+        let ops = opcodes(&code);
+        // five CONSTs then MAKE_ARRAY.
+        assert_eq!(ops.iter().filter(|o| **o == Opcode::Const).count(), 5);
+        assert_eq!(ops.last(), Some(&Opcode::MakeArray));
+    }
+
+    // Test 15: a struct literal emits its field values then MAKE_STRUCT.
+    #[test]
+    fn compile_expr_struct_lit_emits_make_struct() {
+        let src = "struct Point { x: f64, y: f64 }\n\
+                   fn f() -> Point is pure { Point { x: 1.0, y: 2.0 } }";
+        let (code, _) = compile_expr_of(src, "f");
+        let ops = opcodes(&code);
+        assert_eq!(ops.last(), Some(&Opcode::MakeStruct));
+        let ms = code.len() - 3;
+        assert_eq!(u16::from_le_bytes([code[ms + 1], code[ms + 2]]), 2);
+    }
+
+    // Test 16: an enum-variant constructor emits MAKE_ENUM_VARIANT.
+    #[test]
+    fn compile_expr_enum_variant_constructor() {
+        let src = "enum Shape { Circle(f64), Rect(f64, f64) }\n\
+                   fn f() -> Shape is pure { Circle(5.0) }";
+        let (code, _) = compile_expr_of(src, "f");
+        let ops = opcodes(&code);
+        assert_eq!(ops, vec![Opcode::Const, Opcode::MakeEnumVariant]);
+        // the payload count operand is 1.
+        let mev = 3;
+        assert_eq!(code[mev + 3], 1);
+    }
+
+    // Test 17: a three-variant match emits MATCH_VARIANT per variant arm.
+    #[test]
+    fn compile_expr_match_with_variants() {
+        let src = "enum Shape { Circle(f64), Rect(f64, f64), Triangle }\n\
+                   fn f(s: Shape) -> f64 is pure {\n\
+                     match s { Circle(r) => 1.0, Rect(w, h) => 2.0, Triangle => 0.0 }\n\
+                   }";
+        let (code, _) = compile_expr_of(src, "f");
+        let ops = opcodes(&code);
+        // three variant arms -> three MATCH_VARIANT opcodes.
+        assert_eq!(
+            ops.iter().filter(|o| **o == Opcode::MatchVariant).count(),
+            3
+        );
+        // the scrutinee is loaded once via GET_LOCAL.
+        assert!(ops.contains(&Opcode::GetLocal));
+    }
+
+    // Test 18: a match with a wildcard uses POP for the `_` arm.
+    #[test]
+    fn compile_expr_match_with_wildcard() {
+        let src = "fn f(v: i64) -> str is pure {\n\
+                     match v { 0 => \"zero\", _ => \"other\" }\n\
+                   }";
+        let (code, _) = compile_expr_of(src, "f");
+        let ops = opcodes(&code);
+        // the literal arm uses DUP + CONST + EQ; the wildcard uses POP.
+        assert!(ops.contains(&Opcode::Eq), "literal arm should test via EQ");
+        assert!(ops.contains(&Opcode::Pop), "wildcard arm should POP scrutinee");
+    }
+
+    // Test 19: a match with guards (the classify example shape) compiles.
+    #[test]
+    fn compile_expr_match_with_guards() {
+        let src = "fn classify(value: i64) -> str is pure {\n\
+                     match value {\n\
+                       v if v > 0 => \"positive\",\n\
+                       v if v < 0 => \"negative\",\n\
+                       _ => \"zero\",\n\
+                     }\n\
+                   }";
+        let (code, _) = compile_expr_of(src, "classify");
+        let ops = opcodes(&code);
+        // each guard compiles to a comparison + JUMP_IF_FALSE.
+        assert!(ops.contains(&Opcode::JumpIfFalse), "guards emit JUMP_IF_FALSE");
+        assert!(!code.is_empty());
+    }
+
+    // Test 20: a range `0..3` materializes to CONSTs + MAKE_ARRAY.
+    #[test]
+    fn compile_expr_range_materializes_to_array() {
+        let src = "fn f() -> void is pure { for i in 0..3 { } }";
+        // the range is inside the for; compile the whole fn and inspect.
+        let p = compile_ok(src);
+        let ops = opcodes(&p.chunks[0].code);
+        // 0..3 -> CONST(0) CONST(1) CONST(2) MAKE_ARRAY(3) at the loop head.
+        assert!(ops.contains(&Opcode::MakeArray));
+    }
+
+    // Test 21: a block expression compiles its statements + trailing value.
+    #[test]
+    fn compile_expr_block_expression() {
+        let src = "fn f() -> i64 is pure { let y = { let x = 1\n x + 1 }\n return y }";
+        let p = compile_ok(src);
+        // the block's `let x = 1` + `x + 1` + the outer `let y` all compile.
+        assert!(!p.chunks[0].code.is_empty());
+        let ops = opcodes(&p.chunks[0].code);
+        assert!(ops.contains(&Opcode::SetLocal));
+        assert!(ops.contains(&Opcode::Return));
     }
 }
