@@ -34,6 +34,7 @@
 //! [`Chunk::write_u16`] / [`Chunk::write_i16`] so the lockstep invariant
 //! `chunk.code.len() == chunk.source_lines.len()` survives codegen.
 
+use crate::ast::{BinOp, UnaryOp};
 use crate::chunk::{Chunk, Program};
 use crate::effects::EffectSet;
 use crate::errors::QalaError;
@@ -41,6 +42,7 @@ use crate::opcode::Opcode;
 use crate::span::{LineIndex, Span};
 use crate::typed_ast::{TypedAst, TypedBlock, TypedExpr, TypedItem, TypedStmt};
 use crate::types::QalaType;
+use crate::value::Value;
 use std::collections::HashMap;
 
 /// the fn-id base at which the stdlib namespace begins. user functions get
@@ -511,16 +513,478 @@ impl<'a> Codegen<'a> {
         Ok(false)
     }
 
-    // ---- expression dispatch (placeholder; Tasks 2-5 implement) ------------
+    // ---- expression emission helpers ---------------------------------------
+
+    /// emit `CONST idx` for `value` on `line`: append the value to the
+    /// current chunk's constant pool, then the opcode + u16 index.
+    fn emit_const(&mut self, value: Value, line: u32) {
+        let idx = self.chunk_mut().add_constant(value);
+        self.chunk_mut().write_op(Opcode::Const, line);
+        self.chunk_mut().write_u16(idx, line);
+    }
+
+    /// emit a `CALL fn_id argc` instruction. CALL carries a `u16` fn-id plus
+    /// a `u8` argc; there is no `write_u8` helper, so the one-byte argc is
+    /// pushed directly with a matching `source_lines` entry to keep the
+    /// `code.len() == source_lines.len()` invariant.
+    fn emit_call(&mut self, fn_id: u16, argc: u8, line: u32) {
+        self.chunk_mut().write_op(Opcode::Call, line);
+        self.chunk_mut().write_u16(fn_id, line);
+        let chunk = self.chunk_mut();
+        chunk.code.push(argc);
+        chunk.source_lines.push(line);
+    }
+
+    /// resolve an identifier in callee position to its fn-id, checking the
+    /// user `fn_table` first, then the stdlib table. returns `None` when the
+    /// name is neither (an enum-variant constructor or a local-bound function
+    /// value -- the caller handles those).
+    fn resolve_callee_fn_id(&self, name: &str) -> Option<u16> {
+        let key = FnKey {
+            type_name: None,
+            name: name.to_string(),
+        };
+        if let Some(&fn_id) = self.fn_table.get(&key) {
+            return Some(fn_id);
+        }
+        self.stdlib_table.get(&key).map(|(fn_id, _)| *fn_id)
+    }
+
+    /// look up a local by name, walking scopes from innermost to outermost so
+    /// an inner binding shadows an outer one. returns the slot index.
+    fn resolve_local(&self, name: &str) -> Option<u16> {
+        for scope in self.scopes.iter().rev() {
+            for (local_name, slot) in scope.locals.iter().rev() {
+                if local_name == name {
+                    return Some(*slot);
+                }
+            }
+        }
+        None
+    }
+
+    /// pick the arithmetic / comparison opcode for a binary operator given
+    /// the OPERAND type (`i64` vs `f64`). `&&` / `||` never reach this -- they
+    /// compile to short-circuit jump patterns in the `Binary` arm. string
+    /// `+` lowers to `CONCAT_N 2` and is handled inline by the caller.
+    fn emit_binop(&mut self, op: &BinOp, operand_ty: &QalaType, line: u32) {
+        let is_float = matches!(operand_ty, QalaType::F64);
+        let opcode = match (op, is_float) {
+            (BinOp::Add, false) => Opcode::Add,
+            (BinOp::Add, true) => Opcode::FAdd,
+            (BinOp::Sub, false) => Opcode::Sub,
+            (BinOp::Sub, true) => Opcode::FSub,
+            (BinOp::Mul, false) => Opcode::Mul,
+            (BinOp::Mul, true) => Opcode::FMul,
+            (BinOp::Div, false) => Opcode::Div,
+            (BinOp::Div, true) => Opcode::FDiv,
+            (BinOp::Rem, _) => Opcode::Mod,
+            (BinOp::Eq, false) => Opcode::Eq,
+            (BinOp::Eq, true) => Opcode::FEq,
+            (BinOp::Ne, false) => Opcode::Ne,
+            (BinOp::Ne, true) => Opcode::FNe,
+            (BinOp::Lt, false) => Opcode::Lt,
+            (BinOp::Lt, true) => Opcode::FLt,
+            (BinOp::Le, false) => Opcode::Le,
+            (BinOp::Le, true) => Opcode::FLe,
+            (BinOp::Gt, false) => Opcode::Gt,
+            (BinOp::Gt, true) => Opcode::FGt,
+            (BinOp::Ge, false) => Opcode::Ge,
+            (BinOp::Ge, true) => Opcode::FGe,
+            // And / Or never reach emit_binop; if they somehow do, NOT is a
+            // harmless no-payload placeholder. the Binary arm prevents this.
+            (BinOp::And, _) | (BinOp::Or, _) => Opcode::Not,
+        };
+        self.chunk_mut().write_op(opcode, line);
+    }
+
+    /// emit the opcode for a unary operator given the operand type.
+    fn emit_unop(&mut self, op: &UnaryOp, operand_ty: &QalaType, line: u32) {
+        let opcode = match op {
+            UnaryOp::Not => Opcode::Not,
+            UnaryOp::Neg => {
+                if matches!(operand_ty, QalaType::F64) {
+                    Opcode::FNeg
+                } else {
+                    Opcode::Neg
+                }
+            }
+        };
+        self.chunk_mut().write_op(opcode, line);
+    }
+
+    /// try to constant-fold a binary operator whose two operands were just
+    /// emitted as CONSTs. returns `Ok(true)` when a fold happened (the two
+    /// source CONSTs are rewound and a single result CONST emitted on
+    /// `line`), `Ok(false)` when no fold applies (the caller emits the
+    /// opcode), `Err` on an i64 overflow.
+    fn try_fold_binary(
+        &mut self,
+        op: &BinOp,
+        operand_ty: &QalaType,
+        line: u32,
+        span: Span,
+    ) -> Result<bool, QalaError> {
+        // peek both operand CONSTs; bail if either is missing.
+        let (b_off, b_idx) = match self.chunk_mut().last_const() {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        let (a_off, a_idx) = match self.chunk_mut().second_to_last_const() {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        // the two CONSTs must be adjacent in the byte stream -- if anything
+        // intervened, folding them is unsound.
+        if a_off + 3 != b_off {
+            return Ok(false);
+        }
+        let a = self.chunk_mut().constants[a_idx as usize].clone();
+        let b = self.chunk_mut().constants[b_idx as usize].clone();
+        let result = match fold_binary_value(&a, &b, op, operand_ty, span)? {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        // rewind both source CONSTs, then emit the folded result.
+        let chunk = self.chunk_mut();
+        chunk.code.truncate(a_off);
+        chunk.source_lines.truncate(a_off);
+        self.emit_const(result, line);
+        Ok(true)
+    }
+
+    /// try to constant-fold a unary operator whose operand was just emitted
+    /// as a CONST. returns `Ok(true)` on a fold, `Ok(false)` when none
+    /// applies, `Err` on an i64 negation overflow (`-i64::MIN`).
+    fn try_fold_unary(
+        &mut self,
+        op: &UnaryOp,
+        line: u32,
+        span: Span,
+    ) -> Result<bool, QalaError> {
+        let (off, idx) = match self.chunk_mut().last_const() {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        let v = self.chunk_mut().constants[idx as usize].clone();
+        let result = match (op, &v) {
+            (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
+            (UnaryOp::Neg, Value::I64(n)) => {
+                // -x overflows only at i64::MIN; surface as IntegerOverflow.
+                // the synthetic op is Sub because `-x` equals `0 - x`; a
+                // future enhancement could widen IntegerOverflow to carry a
+                // UnaryOp.
+                let r = n.checked_neg().ok_or(QalaError::IntegerOverflow {
+                    span,
+                    op: BinOp::Sub,
+                    lhs: 0,
+                    rhs: *n,
+                })?;
+                Value::I64(r)
+            }
+            (UnaryOp::Neg, Value::F64(x)) => Value::F64(-x),
+            // any other operand: no fold.
+            _ => return Ok(false),
+        };
+        let chunk = self.chunk_mut();
+        chunk.code.truncate(off);
+        chunk.source_lines.truncate(off);
+        self.emit_const(result, line);
+        Ok(true)
+    }
+
+    // ---- expression dispatch -----------------------------------------------
 
     /// compile one expression, leaving its value on the stack.
     ///
-    /// PLACEHOLDER for Task 1: emits nothing. Tasks 2-5 replace the body
-    /// with the per-variant arms (primitives, folding, match, comptime, ...).
+    /// Task 2 covers primitives, identifiers, parenthesized expressions,
+    /// unary / binary operators (with inline constant folding), and the
+    /// simple ident-callee call. Task 3 adds the compound expressions and
+    /// `match`; Task 5 adds `comptime`.
     fn compile_expr(&mut self, e: &TypedExpr) -> Result<(), QalaError> {
-        let _ = e;
-        Ok(())
+        match e {
+            TypedExpr::Int { value, span, .. } => {
+                let line = self.line_at(*span);
+                self.emit_const(Value::I64(*value), line);
+                Ok(())
+            }
+            TypedExpr::Float { value, span, .. } => {
+                let line = self.line_at(*span);
+                self.emit_const(Value::F64(*value), line);
+                Ok(())
+            }
+            TypedExpr::Byte { value, span, .. } => {
+                let line = self.line_at(*span);
+                self.emit_const(Value::Byte(*value), line);
+                Ok(())
+            }
+            TypedExpr::Str { value, span, .. } => {
+                let line = self.line_at(*span);
+                self.emit_const(Value::Str(value.clone()), line);
+                Ok(())
+            }
+            TypedExpr::Bool { value, span, .. } => {
+                let line = self.line_at(*span);
+                self.emit_const(Value::Bool(*value), line);
+                Ok(())
+            }
+            TypedExpr::Ident { name, span, .. } => {
+                let line = self.line_at(*span);
+                if let Some(slot) = self.resolve_local(name) {
+                    self.chunk_mut().write_op(Opcode::GetLocal, line);
+                    self.chunk_mut().write_u16(slot, line);
+                } else if let Some(fn_id) = self.resolve_callee_fn_id(name) {
+                    // a bare function name used as a value -- a function
+                    // reference. emitted as a CONST of Value::Function.
+                    self.emit_const(Value::Function(fn_id), line);
+                } else {
+                    // the typechecker would have rejected an unresolved name;
+                    // defense-in-depth.
+                    return Err(QalaError::Type {
+                        span: *span,
+                        message: format!("codegen: unresolved name `{name}`"),
+                    });
+                }
+                Ok(())
+            }
+            TypedExpr::Paren { inner, .. } => self.compile_expr(inner),
+            TypedExpr::Unary { op, operand, span, .. } => {
+                self.compile_expr(operand)?;
+                let line = self.line_at(*span);
+                if !self.try_fold_unary(op, line, *span)? {
+                    self.emit_unop(op, operand.ty(), line);
+                }
+                Ok(())
+            }
+            TypedExpr::Binary { op, lhs, rhs, span, .. } => {
+                let line = self.line_at(*span);
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    // short-circuit: compile lhs, DUP it, conditionally jump
+                    // past rhs, otherwise POP the lhs copy and evaluate rhs.
+                    // `&&` jumps past on a false lhs; `||` jumps past on true.
+                    self.compile_expr(lhs)?;
+                    // a literal lhs+rhs both-CONST case still folds: peek.
+                    if self.try_fold_short_circuit(op, rhs, line)? {
+                        return Ok(());
+                    }
+                    self.chunk_mut().write_op(Opcode::Dup, line);
+                    let skip = if matches!(op, BinOp::And) {
+                        self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line)
+                    } else {
+                        self.chunk_mut().emit_jump(Opcode::JumpIfTrue, line)
+                    };
+                    self.chunk_mut().write_op(Opcode::Pop, line);
+                    self.compile_expr(rhs)?;
+                    self.chunk_mut().patch_jump(skip)?;
+                    Ok(())
+                } else {
+                    self.compile_expr(lhs)?;
+                    self.compile_expr(rhs)?;
+                    if !self.try_fold_binary(op, lhs.ty(), line, *span)? {
+                        self.emit_binop(op, lhs.ty(), line);
+                    }
+                    Ok(())
+                }
+            }
+            TypedExpr::Call { callee, args, span, .. } => {
+                let line = self.line_at(*span);
+                self.compile_call(callee, args, line, *span)
+            }
+            // Task 3 + Task 5 fill these arms in.
+            other => self.unsupported_expr(other),
+        }
     }
+
+    /// compile an `&&` / `||` whose operands are both literal CONSTs: peek
+    /// the already-emitted lhs CONST, compile rhs (which may itself be a
+    /// CONST), then fold via [`try_fold_binary`]. returns `Ok(true)` when the
+    /// whole short-circuit folded to one CONST. when the lhs is not a CONST
+    /// this returns `Ok(false)` without emitting `rhs`.
+    fn try_fold_short_circuit(
+        &mut self,
+        op: &BinOp,
+        rhs: &TypedExpr,
+        line: u32,
+    ) -> Result<bool, QalaError> {
+        // only attempt the fold when the lhs is already a single CONST.
+        if self.chunk_mut().last_const().is_none() {
+            return Ok(false);
+        }
+        let lhs_len = self.chunk_mut().code.len();
+        self.compile_expr(rhs)?;
+        // rhs must have emitted exactly one CONST after the lhs CONST.
+        if self.try_fold_binary(op, &QalaType::Bool, line, rhs.span())? {
+            return Ok(true);
+        }
+        // no fold: rewind rhs's emission so the caller emits the
+        // short-circuit jump pattern from a clean state (just the lhs CONST).
+        let chunk = self.chunk_mut();
+        chunk.code.truncate(lhs_len);
+        chunk.source_lines.truncate(lhs_len);
+        Ok(false)
+    }
+
+    /// compile a call: emit the arguments left-to-right then dispatch. the
+    /// callee is always a [`TypedExpr::Ident`] in v1 -- either an enum-variant
+    /// constructor (`Circle(5.0)`, `Ok(x)`), a user / stdlib function, or a
+    /// local-bound function value.
+    fn compile_call(
+        &mut self,
+        callee: &TypedExpr,
+        args: &[TypedExpr],
+        line: u32,
+        span: Span,
+    ) -> Result<(), QalaError> {
+        let name = match callee {
+            TypedExpr::Ident { name, .. } => name.clone(),
+            // a non-ident callee: compile it as a function value, emit args,
+            // then CALL via the value on the stack. v1's typechecker makes
+            // this rare; treat the callee's resolved fn-id as unavailable.
+            _ => {
+                return Err(QalaError::Type {
+                    span,
+                    message: "codegen: only named callees are supported in v1".to_string(),
+                });
+            }
+        };
+        // enum-variant constructor: emit args, then MAKE_ENUM_VARIANT.
+        // covers user enum variants AND the built-in Ok / Err / Some / None.
+        if let Some(&variant_id) = self.enum_variant_lookup(&name) {
+            for arg in args {
+                self.compile_expr(arg)?;
+            }
+            let payload = args.len() as u8;
+            self.chunk_mut().write_op(Opcode::MakeEnumVariant, line);
+            self.chunk_mut().write_u16(variant_id, line);
+            let chunk = self.chunk_mut();
+            chunk.code.push(payload);
+            chunk.source_lines.push(line);
+            return Ok(());
+        }
+        // a user or stdlib function call.
+        if let Some(fn_id) = self.resolve_callee_fn_id(&name) {
+            for arg in args {
+                self.compile_expr(arg)?;
+            }
+            self.emit_call(fn_id, args.len() as u8, line);
+            return Ok(());
+        }
+        Err(QalaError::Type {
+            span,
+            message: format!("codegen: unresolved callee `{name}`"),
+        })
+    }
+
+    /// look up an enum-variant id by the variant's bare name -- the form a
+    /// constructor call uses. searches every `(enum, variant)` pair for a
+    /// matching variant name. ambiguous names (the same variant name in two
+    /// enums) resolve to the first match; the typechecker has already pinned
+    /// the concrete enum, so v1's bundled examples never collide.
+    fn enum_variant_lookup(&self, variant_name: &str) -> Option<&u16> {
+        self.enum_variant_table
+            .iter()
+            .find(|((_, v), _)| v == variant_name)
+            .map(|(_, id)| id)
+    }
+
+    /// the placeholder for expression kinds Task 3 and Task 5 implement.
+    /// returns a codegen error so the match stays exhaustive and the crate
+    /// compiles between tasks; no Task-2 test exercises these arms.
+    fn unsupported_expr(&mut self, e: &TypedExpr) -> Result<(), QalaError> {
+        Err(QalaError::Type {
+            span: e.span(),
+            message: "codegen: expression kind not yet supported".to_string(),
+        })
+    }
+}
+
+/// compute the constant-folded value of a binary operator on two literal
+/// operands. returns `Ok(Some(v))` on a successful fold, `Ok(None)` when the
+/// operand/operator combination has no fold rule (the caller emits the
+/// opcode), `Err` on an i64 arithmetic overflow.
+///
+/// i64 arithmetic uses `checked_*` so an overflow is an error, not a wrap.
+/// f64 arithmetic follows IEEE 754 -- `inf` / `NaN` are valid results, never
+/// an error. string `+` of two literals folds to the joined string. integer
+/// division / remainder by a zero literal does NOT fold (the runtime VM
+/// raises the division-by-zero error so the diagnostic points at the source).
+fn fold_binary_value(
+    a: &Value,
+    b: &Value,
+    op: &BinOp,
+    operand_ty: &QalaType,
+    span: Span,
+) -> Result<Option<Value>, QalaError> {
+    let overflow = |op: BinOp, lhs: i64, rhs: i64| QalaError::IntegerOverflow {
+        span,
+        op,
+        lhs,
+        rhs,
+    };
+    let folded = match (a, b, op) {
+        // ---- i64 arithmetic: checked, overflow is an error ----
+        (Value::I64(x), Value::I64(y), BinOp::Add) if matches!(operand_ty, QalaType::I64) => {
+            Value::I64(x.checked_add(*y).ok_or_else(|| overflow(BinOp::Add, *x, *y))?)
+        }
+        (Value::I64(x), Value::I64(y), BinOp::Sub) if matches!(operand_ty, QalaType::I64) => {
+            Value::I64(x.checked_sub(*y).ok_or_else(|| overflow(BinOp::Sub, *x, *y))?)
+        }
+        (Value::I64(x), Value::I64(y), BinOp::Mul) if matches!(operand_ty, QalaType::I64) => {
+            Value::I64(x.checked_mul(*y).ok_or_else(|| overflow(BinOp::Mul, *x, *y))?)
+        }
+        (Value::I64(x), Value::I64(y), BinOp::Div) if matches!(operand_ty, QalaType::I64) => {
+            if *y == 0 {
+                return Ok(None);
+            }
+            Value::I64(x.checked_div(*y).ok_or_else(|| overflow(BinOp::Div, *x, *y))?)
+        }
+        (Value::I64(x), Value::I64(y), BinOp::Rem) if matches!(operand_ty, QalaType::I64) => {
+            if *y == 0 {
+                return Ok(None);
+            }
+            Value::I64(x.checked_rem(*y).ok_or_else(|| overflow(BinOp::Rem, *x, *y))?)
+        }
+        // ---- f64 arithmetic: IEEE 754, no overflow error ----
+        (Value::F64(x), Value::F64(y), BinOp::Add) => Value::F64(x + y),
+        (Value::F64(x), Value::F64(y), BinOp::Sub) => Value::F64(x - y),
+        (Value::F64(x), Value::F64(y), BinOp::Mul) => Value::F64(x * y),
+        (Value::F64(x), Value::F64(y), BinOp::Div) => Value::F64(x / y),
+        // ---- string concatenation of two literals ----
+        (Value::Str(x), Value::Str(y), BinOp::Add) => {
+            let mut s = String::with_capacity(x.len() + y.len());
+            s.push_str(x);
+            s.push_str(y);
+            Value::Str(s)
+        }
+        // ---- i64 comparisons ----
+        (Value::I64(x), Value::I64(y), BinOp::Eq) => Value::Bool(x == y),
+        (Value::I64(x), Value::I64(y), BinOp::Ne) => Value::Bool(x != y),
+        (Value::I64(x), Value::I64(y), BinOp::Lt) => Value::Bool(x < y),
+        (Value::I64(x), Value::I64(y), BinOp::Le) => Value::Bool(x <= y),
+        (Value::I64(x), Value::I64(y), BinOp::Gt) => Value::Bool(x > y),
+        (Value::I64(x), Value::I64(y), BinOp::Ge) => Value::Bool(x >= y),
+        // ---- f64 comparisons (IEEE 754: NaN compares unequal) ----
+        (Value::F64(x), Value::F64(y), BinOp::Eq) => Value::Bool(x == y),
+        (Value::F64(x), Value::F64(y), BinOp::Ne) => Value::Bool(x != y),
+        (Value::F64(x), Value::F64(y), BinOp::Lt) => Value::Bool(x < y),
+        (Value::F64(x), Value::F64(y), BinOp::Le) => Value::Bool(x <= y),
+        (Value::F64(x), Value::F64(y), BinOp::Gt) => Value::Bool(x > y),
+        (Value::F64(x), Value::F64(y), BinOp::Ge) => Value::Bool(x >= y),
+        // ---- byte comparisons ----
+        (Value::Byte(x), Value::Byte(y), BinOp::Eq) => Value::Bool(x == y),
+        (Value::Byte(x), Value::Byte(y), BinOp::Ne) => Value::Bool(x != y),
+        // ---- bool logic + equality ----
+        (Value::Bool(x), Value::Bool(y), BinOp::And) => Value::Bool(*x && *y),
+        (Value::Bool(x), Value::Bool(y), BinOp::Or) => Value::Bool(*x || *y),
+        (Value::Bool(x), Value::Bool(y), BinOp::Eq) => Value::Bool(x == y),
+        (Value::Bool(x), Value::Bool(y), BinOp::Ne) => Value::Bool(x != y),
+        // ---- string equality ----
+        (Value::Str(x), Value::Str(y), BinOp::Eq) => Value::Bool(x == y),
+        (Value::Str(x), Value::Str(y), BinOp::Ne) => Value::Bool(x != y),
+        // anything else: no fold rule.
+        _ => return Ok(None),
+    };
+    Ok(Some(folded))
 }
 
 #[cfg(test)]
@@ -543,6 +1007,102 @@ mod tests {
     /// like [`compile`] but panics on any codegen error -- happy-path tests.
     fn compile_ok(src: &str) -> Program {
         compile(src).unwrap_or_else(|e| panic!("codegen errors: {e:?}"))
+    }
+
+    /// typecheck `src` and return the typed AST plus the source. shared by
+    /// the expression-level test helpers below.
+    fn typecheck(src: &str) -> TypedAst {
+        let tokens = Lexer::tokenize(src).expect("lex failed");
+        let ast = Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        typed
+    }
+
+    /// compile a single expression directly into a fresh chunk and return
+    /// `(code_bytes, constants)`. the expression is the trailing value of
+    /// `fn main`'s body in the wrapper program -- so test sources are
+    /// written as `fn main() is io { EXPR }` (or include the helper fns the
+    /// expression needs). `compile_block` / `compile_stmt` are still
+    /// placeholders in Task 2, so the public entry cannot be used yet;
+    /// running `compile_expr` directly is the Task-2 / Task-3 test path.
+    fn compile_expr_of(src: &str, fn_name: &str) -> (Vec<u8>, Vec<Value>) {
+        let typed = typecheck(src);
+        let mut cg = Codegen::new(src);
+        cg.build_tables(&typed);
+        // find the named function and its trailing-value expression.
+        let decl = typed
+            .iter()
+            .find_map(|item| match item {
+                TypedItem::Fn(d) if d.name == fn_name => Some(d),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("function `{fn_name}` not found"));
+        let fn_id = cg.fn_table[&FnKey {
+            type_name: None,
+            name: fn_name.to_string(),
+        }];
+        cg.current_fn_id = fn_id;
+        cg.push_scope();
+        for (i, param) in decl.params.iter().enumerate() {
+            if let Some(scope) = cg.scopes.last_mut() {
+                scope.locals.push((param.name.clone(), i as u16));
+            }
+        }
+        let value = decl
+            .body
+            .value
+            .as_ref()
+            .unwrap_or_else(|| panic!("function `{fn_name}` body has no trailing value"));
+        cg.compile_expr(value).expect("compile_expr failed");
+        let chunk = &cg.program.chunks[fn_id as usize];
+        (chunk.code.clone(), chunk.constants.clone())
+    }
+
+    /// like [`compile_expr_of`] but returns the codegen error rather than
+    /// panicking -- used by the fold-overflow tests.
+    fn compile_expr_err(src: &str, fn_name: &str) -> QalaError {
+        let typed = typecheck(src);
+        let mut cg = Codegen::new(src);
+        cg.build_tables(&typed);
+        let decl = typed
+            .iter()
+            .find_map(|item| match item {
+                TypedItem::Fn(d) if d.name == fn_name => Some(d),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("function `{fn_name}` not found"));
+        let fn_id = cg.fn_table[&FnKey {
+            type_name: None,
+            name: fn_name.to_string(),
+        }];
+        cg.current_fn_id = fn_id;
+        cg.push_scope();
+        for (i, param) in decl.params.iter().enumerate() {
+            if let Some(scope) = cg.scopes.last_mut() {
+                scope.locals.push((param.name.clone(), i as u16));
+            }
+        }
+        let value = decl.body.value.as_ref().expect("body has no trailing value");
+        cg.compile_expr(value)
+            .expect_err("expected a codegen error")
+    }
+
+    /// the opcodes (no operands) appearing in `code`, in order -- a coarse
+    /// shape check for tests that do not need exact operand bytes.
+    fn opcodes(code: &[u8]) -> Vec<Opcode> {
+        let mut ops = Vec::new();
+        let mut off = 0;
+        while off < code.len() {
+            match Opcode::from_u8(code[off]) {
+                Some(op) => {
+                    ops.push(op);
+                    off += 1 + op.operand_bytes() as usize;
+                }
+                None => break,
+            }
+        }
+        ops
     }
 
     // Test 1: an empty program compiles to an empty Program.
@@ -697,9 +1257,9 @@ mod tests {
         cg.build_tables(&typed);
         cg.current_fn_id = 0;
         cg.push_scope();
-        // a Void-typed Call -- the defer body. with Task 1's placeholder
-        // compile_expr emitting nothing, the helper still runs and pops the
-        // scope without a POP (Void result).
+        // a Void-typed Call -- the defer body. `pop_scope_and_emit_defers`
+        // compiles it (the arg CONST + the CALL) and pops the scope. a Void
+        // result needs no trailing POP.
         let call = TypedExpr::Call {
             callee: Box::new(TypedExpr::Ident {
                 name: "println".to_string(),
@@ -722,10 +1282,14 @@ mod tests {
         }
         cg.pop_scope_and_emit_defers(1).expect("emit defers");
         assert!(cg.scopes.is_empty(), "scope should be popped");
-        // a Void defer body adds no POP; placeholder compile_expr emits
-        // nothing, so the chunk stays empty -- the helper itself did not
-        // panic and the scope is gone, which is what Task 1 verifies.
-        assert!(cg.program.chunks[0].code.is_empty());
+        // the defer body emitted: CONST("a") then CALL(println). a Void
+        // result adds no POP.
+        let ops = opcodes(&cg.program.chunks[0].code);
+        assert_eq!(ops, vec![Opcode::Const, Opcode::Call]);
+        assert!(
+            !ops.contains(&Opcode::Pop),
+            "a Void defer body needs no POP"
+        );
     }
 
     // Test 8: a fn with two params has them in slots 0 and 1.
@@ -777,5 +1341,271 @@ mod tests {
         let cg2 = Codegen::new("abc\ndef");
         // byte 4 is the 'd' on line 2.
         assert_eq!(cg2.line_at(Span::new(4, 3)), 2);
+    }
+
+    // ===== Task 2: compile_expr literals / locals / binary / unary / calls ===
+
+    // Test 1: an integer literal expression compiles to one CONST(I64). the
+    // wrapper fn returns i64 so the literal is the body's trailing value.
+    #[test]
+    fn compile_expr_int_literal_emits_one_const() {
+        let (code, consts) = compile_expr_of("fn f() -> i64 is pure { 42 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts, vec![Value::I64(42)]);
+    }
+
+    // Test 2: a float literal compiles to one CONST(F64).
+    #[test]
+    fn compile_expr_float_literal_emits_one_const() {
+        let (code, consts) = compile_expr_of("fn f() -> f64 is pure { 3.5 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts, vec![Value::F64(3.5)]);
+    }
+
+    // Test 3: a bool literal compiles to CONST(Bool).
+    #[test]
+    fn compile_expr_bool_literal_emits_one_const() {
+        let (_, consts) = compile_expr_of("fn f() -> bool is pure { true }", "f");
+        assert_eq!(consts, vec![Value::Bool(true)]);
+    }
+
+    // Test 4: a byte literal compiles to CONST(Byte).
+    #[test]
+    fn compile_expr_byte_literal_emits_one_const() {
+        let (_, consts) = compile_expr_of("fn f() -> byte is pure { b'A' }", "f");
+        assert_eq!(consts, vec![Value::Byte(0x41)]);
+    }
+
+    // Test 5: a string literal compiles to CONST(Str).
+    #[test]
+    fn compile_expr_str_literal_emits_one_const() {
+        let (_, consts) = compile_expr_of("fn f() -> str is pure { \"hi\" }", "f");
+        assert_eq!(consts, vec![Value::Str("hi".to_string())]);
+    }
+
+    // Test 6: an identifier bound as a parameter compiles to GET_LOCAL.
+    #[test]
+    fn compile_expr_ident_param_emits_get_local() {
+        let (code, _) = compile_expr_of("fn f(x: i64) -> i64 is pure { x }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::GetLocal]);
+        // the GET_LOCAL operand is slot 0 (the first parameter).
+        assert_eq!(code[0], Opcode::GetLocal as u8);
+        assert_eq!(u16::from_le_bytes([code[1], code[2]]), 0);
+    }
+
+    // Test 7: `1 + 2` folds at codegen to a single CONST(I64(3)) -- two
+    // operand CONSTs + ADD collapse to one CONST.
+    #[test]
+    fn compile_expr_binary_arith_folds_to_one_const() {
+        let (code, consts) = compile_expr_of("fn f() -> i64 is pure { 1 + 2 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const], "1+2 should fold");
+        // the folded pool entry is I64(3); the two source CONSTs were rewound
+        // (orphans 0 and 1 remain in the pool, the live CONST points at 2).
+        assert_eq!(consts.last(), Some(&Value::I64(3)));
+    }
+
+    // Test 8: `1 + 2 + 3` folds bottom-up to a single CONST(I64(6)).
+    #[test]
+    fn compile_expr_binary_chain_folds_bottom_up() {
+        let (code, consts) = compile_expr_of("fn f() -> i64 is pure { 1 + 2 + 3 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::I64(6)));
+    }
+
+    // Test 9: `x + 1` with x a local does NOT fold.
+    #[test]
+    fn compile_expr_binary_with_local_does_not_fold() {
+        let (code, _) = compile_expr_of("fn f(x: i64) -> i64 is pure { x + 1 }", "f");
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::GetLocal, Opcode::Const, Opcode::Add]
+        );
+    }
+
+    // Test 10: `i64::MAX + 1` is a fold-time IntegerOverflow.
+    #[test]
+    fn compile_expr_fold_add_overflow_is_an_error() {
+        let err = compile_expr_err(
+            "fn f() -> i64 is pure { 9223372036854775807 + 1 }",
+            "f",
+        );
+        match err {
+            QalaError::IntegerOverflow { op, lhs, rhs, .. } => {
+                assert_eq!(op, BinOp::Add);
+                assert_eq!(lhs, i64::MAX);
+                assert_eq!(rhs, 1);
+            }
+            other => panic!("expected IntegerOverflow, got {other:?}"),
+        }
+    }
+
+    // Test 11: `i64::MAX * 2` overflows on fold.
+    #[test]
+    fn compile_expr_fold_mul_overflow_is_an_error() {
+        let err = compile_expr_err(
+            "fn f() -> i64 is pure { 9223372036854775807 * 2 }",
+            "f",
+        );
+        match err {
+            QalaError::IntegerOverflow { op, lhs, rhs, .. } => {
+                assert_eq!(op, BinOp::Mul);
+                assert_eq!(lhs, i64::MAX);
+                assert_eq!(rhs, 2);
+            }
+            other => panic!("expected IntegerOverflow, got {other:?}"),
+        }
+    }
+
+    // Test 12: `1e300 * 1e300` folds to F64(inf) with NO error.
+    #[test]
+    fn compile_expr_fold_f64_overflow_yields_infinity() {
+        let (code, consts) = compile_expr_of("fn f() -> f64 is pure { 1e300 * 1e300 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        match consts.last() {
+            Some(Value::F64(x)) => assert!(x.is_infinite() && *x > 0.0),
+            other => panic!("expected F64(inf), got {other:?}"),
+        }
+    }
+
+    // Test 13: `0.0 / 0.0` folds to F64(NaN) with NO error.
+    #[test]
+    fn compile_expr_fold_f64_div_zero_yields_nan() {
+        let (code, consts) = compile_expr_of("fn f() -> f64 is pure { 0.0 / 0.0 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        match consts.last() {
+            Some(Value::F64(x)) => assert!(x.is_nan()),
+            other => panic!("expected F64(NaN), got {other:?}"),
+        }
+    }
+
+    // Test 14: `"a" + "b"` folds to a single CONST(Str("ab")).
+    #[test]
+    fn compile_expr_fold_string_concat() {
+        let (code, consts) = compile_expr_of("fn f() -> str is pure { \"a\" + \"b\" }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::Str("ab".to_string())));
+    }
+
+    // Test 15: `1 < 2` folds to CONST(Bool(true)).
+    #[test]
+    fn compile_expr_fold_comparison() {
+        let (code, consts) = compile_expr_of("fn f() -> bool is pure { 1 < 2 }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::Bool(true)));
+    }
+
+    // Test 16: `x < 2` with x a local emits GET_LOCAL + CONST + LT.
+    #[test]
+    fn compile_expr_comparison_with_local_does_not_fold() {
+        let (code, _) = compile_expr_of("fn f(x: i64) -> bool is pure { x < 2 }", "f");
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::GetLocal, Opcode::Const, Opcode::Lt]
+        );
+    }
+
+    // Test 17: `true && false` folds to CONST(Bool(false)).
+    #[test]
+    fn compile_expr_fold_boolean_and() {
+        let (code, consts) = compile_expr_of("fn f() -> bool is pure { true && false }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::Bool(false)));
+    }
+
+    // Test 18: unary fold -- `!true`, `!false`, `-(42)` all collapse to one
+    // CONST. (the `-(i64::MIN)` overflow case is unreachable from source --
+    // the lexer caps integer literals at the i64::MAX magnitude, so a
+    // literal i64::MIN cannot be written and then negated. the `checked_neg`
+    // overflow path in `try_fold_unary` is still exercised by the
+    // ComptimeInterpreter's NEG opcode test in Task 5.)
+    #[test]
+    fn compile_expr_fold_unary() {
+        let (code, consts) = compile_expr_of("fn f() -> bool is pure { !true }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::Bool(false)));
+        let (_, consts) = compile_expr_of("fn f() -> bool is pure { !false }", "f");
+        assert_eq!(consts.last(), Some(&Value::Bool(true)));
+        let (code, consts) = compile_expr_of("fn f() -> i64 is pure { -(42) }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::I64(-42)));
+    }
+
+    // Test 19: `-(3.5)` folds to CONST(F64(-3.5)).
+    #[test]
+    fn compile_expr_fold_f64_unary() {
+        let (code, consts) = compile_expr_of("fn f() -> f64 is pure { -(3.5) }", "f");
+        assert_eq!(opcodes(&code), vec![Opcode::Const]);
+        assert_eq!(consts.last(), Some(&Value::F64(-3.5)));
+    }
+
+    // Test 20: mixed i64/f64 with locals picks ADD vs F_ADD by operand type.
+    #[test]
+    fn compile_expr_picks_int_vs_float_opcode() {
+        let (code, _) = compile_expr_of("fn f(a: i64, b: i64) -> i64 is pure { a + b }", "f");
+        assert!(opcodes(&code).contains(&Opcode::Add));
+        let (code, _) = compile_expr_of("fn f(a: f64, b: f64) -> f64 is pure { a + b }", "f");
+        assert!(opcodes(&code).contains(&Opcode::FAdd));
+    }
+
+    // Test 21: a user-fn call emits args then CALL(fn_id, argc).
+    #[test]
+    fn compile_expr_user_call_emits_args_then_call() {
+        let src = "fn add(a: i64, b: i64) -> i64 is pure { return a + b }\n\
+                   fn main() -> i64 is pure { add(1, 2) }";
+        let (code, _) = compile_expr_of(src, "main");
+        assert_eq!(
+            opcodes(&code),
+            vec![Opcode::Const, Opcode::Const, Opcode::Call]
+        );
+        // CALL operand: fn-id of `add` (0), argc 2.
+        let call_off = 6; // two CONSTs (3 bytes each) precede CALL.
+        assert_eq!(code[call_off], Opcode::Call as u8);
+        assert_eq!(u16::from_le_bytes([code[call_off + 1], code[call_off + 2]]), 0);
+        assert_eq!(code[call_off + 3], 2);
+    }
+
+    // Test 22: a stdlib call emits the arg then CALL(stdlib_id, argc).
+    #[test]
+    fn compile_expr_stdlib_call_emits_arg_then_call() {
+        let (code, _) = compile_expr_of("fn main() is io { println(\"hi\") }", "main");
+        assert_eq!(opcodes(&code), vec![Opcode::Const, Opcode::Call]);
+        // the CALL fn-id is println's stdlib id (STDLIB_FN_BASE + 1).
+        assert_eq!(code[3], Opcode::Call as u8);
+        assert_eq!(
+            u16::from_le_bytes([code[4], code[5]]),
+            STDLIB_FN_BASE + 1
+        );
+        assert_eq!(code[6], 1);
+    }
+
+    // Test 23: every emission records its source line; lockstep holds.
+    #[test]
+    fn compile_expr_records_source_lines_in_lockstep() {
+        // a two-line body: the trailing expr is on line 2.
+        let src = "fn f() -> i64 is pure {\n    x_helper() + 1\n}\n\
+                   fn x_helper() -> i64 is pure { 5 }";
+        let typed = typecheck(src);
+        let mut cg = Codegen::new(src);
+        cg.build_tables(&typed);
+        let fn_id = cg.fn_table[&FnKey {
+            type_name: None,
+            name: "f".to_string(),
+        }];
+        cg.current_fn_id = fn_id;
+        cg.push_scope();
+        let decl = typed
+            .iter()
+            .find_map(|i| match i {
+                TypedItem::Fn(d) if d.name == "f" => Some(d),
+                _ => None,
+            })
+            .unwrap();
+        cg.compile_expr(decl.body.value.as_ref().unwrap())
+            .expect("compile_expr");
+        let chunk = &cg.program.chunks[fn_id as usize];
+        // lockstep invariant.
+        assert_eq!(chunk.code.len(), chunk.source_lines.len());
+        // every emitted byte for the trailing expr is on line 2.
+        assert!(chunk.source_lines.iter().all(|&l| l == 2));
     }
 }
