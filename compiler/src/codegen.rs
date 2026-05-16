@@ -46,7 +46,7 @@ use crate::typed_ast::{
 };
 use crate::types::{QalaType, Symbol};
 use crate::value::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// the fn-id base at which the stdlib namespace begins. user functions get
 /// dense ids `0..user_count` into [`Program::chunks`]; stdlib functions get
@@ -130,8 +130,10 @@ struct Codegen<'a> {
     /// `STDLIB_FN_BASE..` namespace; the effect drives the comptime CALL gate.
     stdlib_table: HashMap<FnKey, (u16, EffectSet)>,
     /// `(enum_name, variant_name)` -> variant id (parallel to
-    /// [`Program::enum_variant_names`]).
-    enum_variant_table: HashMap<(String, String), u16>,
+    /// [`Program::enum_variant_names`]). `BTreeMap` so `enum_variant_lookup`'s
+    /// `.iter().find(...)` walks in sorted key order and two enums with a
+    /// same-named variant always resolve to the same id across runs.
+    enum_variant_table: BTreeMap<(String, String), u16>,
     /// `(enum_name, variant_name)` -> the variant's payload field count.
     enum_variant_payload_count: HashMap<(String, String), u8>,
     /// `(struct_name, field_name)` -> the field's stable index within the
@@ -234,7 +236,7 @@ impl<'a> Codegen<'a> {
                 .enum_variant_names
                 .push((enum_name.to_string(), variant_name.to_string()));
         }
-        let mut enum_variant_table: HashMap<(String, String), u16> = HashMap::new();
+        let mut enum_variant_table: BTreeMap<(String, String), u16> = BTreeMap::new();
         let mut enum_variant_payload_count: HashMap<(String, String), u8> = HashMap::new();
         for (i, (enum_name, variant_name, _)) in BUILTIN_VARIANTS.iter().enumerate() {
             enum_variant_table
@@ -2761,6 +2763,28 @@ mod tests {
             cg.program.enum_variant_names[circle_id as usize],
             ("Shape".to_string(), "Circle".to_string())
         );
+    }
+
+    // Test 4b: enum_variant_lookup resolves deterministically when two enums
+    // share a variant name. the BTreeMap walk visits keys in sorted order, so
+    // the result is the same across every run regardless of HashMap seed.
+    #[test]
+    fn enum_variant_lookup_is_deterministic_with_shared_variant_name() {
+        let src = "enum A { Done }\nenum B { Done }\nfn main() is io { }";
+        let tokens = Lexer::tokenize(src).expect("lex");
+        let ast = Parser::parse(&tokens).expect("parse");
+        let (typed, terrors, _) = check_program(&ast, src);
+        assert!(terrors.is_empty(), "{terrors:?}");
+        let mut cg1 = Codegen::new(src);
+        cg1.build_tables(&typed);
+        let mut cg2 = Codegen::new(src);
+        cg2.build_tables(&typed);
+        // both independent Codegen instances must resolve "Done" to the
+        // same variant id on every call.
+        let id1 = cg1.enum_variant_lookup("Done").copied();
+        let id2 = cg2.enum_variant_lookup("Done").copied();
+        assert!(id1.is_some(), "lookup should find a variant named Done");
+        assert_eq!(id1, id2, "variant id must be deterministic across instances");
     }
 
     // Test 5: stdlib fn-ids live in the STDLIB_FN_BASE namespace; user fns
