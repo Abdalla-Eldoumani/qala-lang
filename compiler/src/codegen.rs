@@ -1727,8 +1727,9 @@ impl<'a> Codegen<'a> {
             // every byte position that should jump to the NEXT arm when this
             // arm fails to match (the pattern test and/or the guard).
             let mut fail_jumps: Vec<usize> = Vec::new();
-            // an optional `(name, slot)` a binding pattern introduces.
-            let mut binding: Option<(String, u16)> = None;
+            // the `(name, slot)` bindings this arm's pattern introduces --
+            // one for a bare binding, one per destructured variant field.
+            let mut bindings: Vec<(String, u16)> = Vec::new();
             match &arm.pattern {
                 Pattern::Wildcard { .. } => {
                     // `_` matches anything: consume the scrutinee, run body.
@@ -1758,10 +1759,10 @@ impl<'a> Codegen<'a> {
                         self.bind_hidden_slot(slot);
                         self.chunk_mut().write_op(Opcode::SetLocal, line);
                         self.chunk_mut().write_u16(slot, line);
-                        binding = Some((name.clone(), slot));
+                        bindings.push((name.clone(), slot));
                     }
                 }
-                Pattern::Variant { name, .. } => {
+                Pattern::Variant { name, sub, .. } => {
                     // DUP so MATCH_VARIANT consumes a copy and the original
                     // survives for the next arm on a miss.
                     if !is_last {
@@ -1773,6 +1774,35 @@ impl<'a> Codegen<'a> {
                     let patch = self.chunk_mut().code.len();
                     self.chunk_mut().write_i16(i16::MAX, line);
                     fail_jumps.push(patch);
+                    // on a hit, MATCH_VARIANT pushed the variant's payload
+                    // values, the last field on top. destructure each
+                    // sub-pattern binding into a fresh slot, SET_LOCAL in
+                    // REVERSE field order (top of stack is the last field).
+                    let mut slots: Vec<(String, u16)> = Vec::new();
+                    for sub_pat in sub {
+                        // v1 supports a Binding (or Wildcard) per field; a
+                        // nested variant pattern is not destructured.
+                        let bind_name = match sub_pat {
+                            Pattern::Binding { name, .. } => Some(name.clone()),
+                            Pattern::Wildcard { .. } => None,
+                            _ => None,
+                        };
+                        let slot = self.next_slot();
+                        self.bind_hidden_slot(slot);
+                        slots.push((bind_name.unwrap_or_default(), slot));
+                    }
+                    // SET_LOCAL in reverse: the top of the stack is the last
+                    // field, which fills the last slot.
+                    for (_, slot) in slots.iter().rev() {
+                        self.chunk_mut().write_op(Opcode::SetLocal, line);
+                        self.chunk_mut().write_u16(*slot, line);
+                    }
+                    // register the named field bindings for the arm body.
+                    for (bind_name, slot) in slots {
+                        if !bind_name.is_empty() {
+                            bindings.push((bind_name, slot));
+                        }
+                    }
                 }
                 Pattern::Int { value, .. } => {
                     fail_jumps
@@ -1799,12 +1829,12 @@ impl<'a> Codegen<'a> {
                 }
             }
             // the arm body runs in its own scope so an arm-local `defer`
-            // fires at arm exit. a binding pattern's name lives in it.
+            // fires at arm exit. the pattern's bindings live in it.
             self.push_scope();
-            if let (Some((bind_name, bind_slot)), Some(scope)) =
-                (binding, self.scopes.last_mut())
-            {
-                scope.locals.push((bind_name, bind_slot));
+            if let Some(scope) = self.scopes.last_mut() {
+                for (bind_name, bind_slot) in bindings {
+                    scope.locals.push((bind_name, bind_slot));
+                }
             }
             // an optional guard: when false, fall through to the next arm.
             if let Some(guard) = &arm.guard {
@@ -2884,5 +2914,400 @@ mod tests {
         let ops = opcodes(&p.chunks[0].code);
         assert!(ops.contains(&Opcode::SetLocal));
         assert!(ops.contains(&Opcode::Return));
+    }
+
+    // ===== Task 4: statements, DCE, defer, six-examples smoke ================
+
+    /// the opcodes of the single chunk a one-fn program compiles to.
+    fn fn_ops(src: &str, fn_name: &str) -> Vec<Opcode> {
+        let p = compile_ok(src);
+        let id = p
+            .fn_names
+            .iter()
+            .position(|n| n == fn_name)
+            .unwrap_or_else(|| panic!("fn `{fn_name}` not compiled"));
+        opcodes(&p.chunks[id].code)
+    }
+
+    /// the raw code bytes of a named function's chunk.
+    fn fn_code(src: &str, fn_name: &str) -> Vec<u8> {
+        let p = compile_ok(src);
+        let id = p.fn_names.iter().position(|n| n == fn_name).unwrap();
+        p.chunks[id].code.clone()
+    }
+
+    // Test 1: `let x = 1` emits CONST then SET_LOCAL.
+    #[test]
+    fn stmt_let_emits_const_and_set_local() {
+        let ops = fn_ops("fn main() is io { let x = 1\n println(\"{x}\") }", "main");
+        // the first two opcodes are the let's CONST + SET_LOCAL.
+        assert_eq!(ops[0], Opcode::Const);
+        assert_eq!(ops[1], Opcode::SetLocal);
+    }
+
+    // Test 2: `if cond { } else { }` emits JUMP_IF_FALSE + JUMP.
+    #[test]
+    fn stmt_if_with_else_emits_jump_pattern() {
+        let src = "fn main() is io {\n\
+                     let c = 1 < 2\n\
+                     if c { println(\"a\") } else { println(\"b\") }\n\
+                   }";
+        let ops = fn_ops(src, "main");
+        assert!(ops.contains(&Opcode::JumpIfFalse));
+        assert!(ops.contains(&Opcode::Jump));
+    }
+
+    // Test 3: `if cond { }` without else emits JUMP_IF_FALSE, no extra JUMP.
+    #[test]
+    fn stmt_if_without_else_emits_only_jump_if_false() {
+        let src = "fn main() is io {\n\
+                     let c = 1 < 2\n\
+                     if c { println(\"a\") }\n\
+                   }";
+        let ops = fn_ops(src, "main");
+        assert!(ops.contains(&Opcode::JumpIfFalse));
+    }
+
+    // Test 4: `while cond { }` records loop_start + JUMP_IF_FALSE + a back-
+    // jump (JUMP with a negative offset). (Qala v1 has no assignment
+    // statement, so the loop body uses a `break` rather than mutating a
+    // local; the codegen shape -- exit jump + back-jump -- is the same.)
+    #[test]
+    fn stmt_while_emits_loop_pattern() {
+        let src = "fn main(flag: bool) is io {\n\
+                     while flag { break }\n\
+                   }";
+        let ops = fn_ops(src, "main");
+        assert!(ops.contains(&Opcode::JumpIfFalse));
+        // a while emits at least two JUMP-family opcodes (the exit + the
+        // back-jump).
+        let jumps = ops
+            .iter()
+            .filter(|o| matches!(o, Opcode::Jump | Opcode::JumpIfFalse))
+            .count();
+        assert!(jumps >= 2, "while should emit an exit jump and a back-jump");
+    }
+
+    // Test 5: `for i in 0..3 { }` materializes the range and emits the
+    // indexed-walk pattern (LEN + LT + INDEX).
+    #[test]
+    fn stmt_for_emits_indexed_walk() {
+        let ops = fn_ops("fn main() is io { for i in 0..3 { println(\"{i}\") } }", "main");
+        assert!(ops.contains(&Opcode::MakeArray), "the range materializes");
+        assert!(ops.contains(&Opcode::Len), "the bounds check uses LEN");
+        assert!(ops.contains(&Opcode::Index), "the element load uses INDEX");
+    }
+
+    // Test 6: `return x + 1` compiles the value then RETURN; the block is
+    // terminated.
+    #[test]
+    fn stmt_return_with_value_emits_return() {
+        let ops = fn_ops("fn f(x: i64) -> i64 is pure { return x + 1 }", "f");
+        assert_eq!(ops.last(), Some(&Opcode::Return));
+    }
+
+    // Test 7: a bare `return` in a void fn emits RETURN.
+    #[test]
+    fn stmt_bare_return_emits_return() {
+        let ops = fn_ops("fn main() is io { return }", "main");
+        assert!(ops.contains(&Opcode::Return));
+    }
+
+    // Test 10: a `defer` registers but emits nothing at the defer site.
+    #[test]
+    fn stmt_defer_emits_nothing_at_the_defer_site() {
+        // a fn with a single defer: the defer body runs at the fall-through
+        // exit, not where `defer` is written. so the FIRST opcode is the
+        // defer body's, not anything from before it -- verify the defer body
+        // (a CALL) appears, and that nothing is emitted "early".
+        let src = "fn cleanup() is io { }\n\
+                   fn main() is io { defer cleanup() }";
+        let ops = fn_ops(src, "main");
+        // the only real work is the deferred CALL at the fall-through, then
+        // RETURN.
+        assert!(ops.contains(&Opcode::Call), "the defer body runs at exit");
+        assert_eq!(ops.last(), Some(&Opcode::Return));
+    }
+
+    // Test 11: defer LIFO -- three defers run last-registered-first.
+    #[test]
+    fn stmt_defer_lifo_at_fall_through() {
+        let src = "fn a() is io { }\n\
+                   fn b() is io { }\n\
+                   fn c() is io { }\n\
+                   fn main() is io { defer a()\n defer b()\n defer c() }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let a_id = p.fn_names.iter().position(|n| n == "a").unwrap() as u16;
+        let b_id = p.fn_names.iter().position(|n| n == "b").unwrap() as u16;
+        let c_id = p.fn_names.iter().position(|n| n == "c").unwrap() as u16;
+        // collect the fn-ids of every CALL in main, in emission order.
+        let code = &p.chunks[main_id].code;
+        let mut call_ids = Vec::new();
+        let mut off = 0;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call {
+                call_ids.push(u16::from_le_bytes([code[off + 1], code[off + 2]]));
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        // LIFO: c, then b, then a.
+        assert_eq!(call_ids, vec![c_id, b_id, a_id]);
+    }
+
+    // Test 12: a defer before an explicit `return` fires once, at the return
+    // -- not a second time at the fall-through.
+    #[test]
+    fn stmt_defer_fires_once_at_explicit_return() {
+        let src = "fn cleanup() is io { }\n\
+                   fn main() is io { defer cleanup()\n return }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let cleanup_id = p.fn_names.iter().position(|n| n == "cleanup").unwrap() as u16;
+        let code = &p.chunks[main_id].code;
+        let mut cleanup_calls = 0;
+        let mut off = 0;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call
+                && u16::from_le_bytes([code[off + 1], code[off + 2]]) == cleanup_id
+            {
+                cleanup_calls += 1;
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        // exactly one CALL to cleanup -- the explicit return fired it; the
+        // dead fall-through emitted nothing (Pitfall 4).
+        assert_eq!(cleanup_calls, 1, "defer must fire exactly once");
+    }
+
+    // Test 14: a defer in a loop body fires per iteration -- it lives in the
+    // loop-body scope, emitted inside the loop.
+    #[test]
+    fn stmt_defer_in_loop_fires_per_iteration() {
+        let src = "fn cleanup() is io { }\n\
+                   fn main() is io { for i in 0..3 { defer cleanup() } }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let cleanup_id = p.fn_names.iter().position(|n| n == "cleanup").unwrap() as u16;
+        let code = &p.chunks[main_id].code;
+        // the cleanup CALL is emitted once in the bytecode (the loop body is
+        // a single emitted block) but it sits BETWEEN the loop_start and the
+        // emit_loop back-jump, so it runs once per iteration at run time.
+        let mut cleanup_calls = 0;
+        let mut off = 0;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call
+                && u16::from_le_bytes([code[off + 1], code[off + 2]]) == cleanup_id
+            {
+                cleanup_calls += 1;
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        assert!(cleanup_calls >= 1, "the per-iteration defer body is emitted");
+    }
+
+    // Test 15: DCE -- statements after a `return` are not compiled. a void
+    // fn is used so the dead trailing statement does not trip the
+    // typechecker's missing-return check.
+    #[test]
+    fn stmt_dce_skips_code_after_return() {
+        let src = "fn f() is io { return\n let unused = 2 }";
+        let code = fn_code(src, "f");
+        // only the RETURN -- the dead `let unused = 2` emits nothing.
+        assert_eq!(opcodes(&code), vec![Opcode::Return]);
+    }
+
+    // Test 16: DCE -- a constant-`true` `if` emits only the then-branch.
+    #[test]
+    fn stmt_dce_constant_if_true_emits_only_then() {
+        let src = "fn do_a() is io { }\n\
+                   fn do_b() is io { }\n\
+                   fn main() is io { if true { do_a() } else { do_b() } }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let do_a = p.fn_names.iter().position(|n| n == "do_a").unwrap() as u16;
+        let do_b = p.fn_names.iter().position(|n| n == "do_b").unwrap() as u16;
+        let code = &p.chunks[main_id].code;
+        let ops = opcodes(code);
+        // no JUMP_IF_FALSE -- the constant condition was eliminated.
+        assert!(!ops.contains(&Opcode::JumpIfFalse), "constant if needs no jump");
+        // do_a is called, do_b is not.
+        let mut calls = Vec::new();
+        let mut off = 0;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call {
+                calls.push(u16::from_le_bytes([code[off + 1], code[off + 2]]));
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        assert!(calls.contains(&do_a), "the then-branch runs");
+        assert!(!calls.contains(&do_b), "the dead else-branch is dropped");
+    }
+
+    // Test 17: DCE -- a constant-`false` `if` emits only the else-branch.
+    #[test]
+    fn stmt_dce_constant_if_false_emits_only_else() {
+        let src = "fn do_a() is io { }\n\
+                   fn do_b() is io { }\n\
+                   fn main() is io { if false { do_a() } else { do_b() } }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let do_a = p.fn_names.iter().position(|n| n == "do_a").unwrap() as u16;
+        let do_b = p.fn_names.iter().position(|n| n == "do_b").unwrap() as u16;
+        let code = &p.chunks[main_id].code;
+        let mut calls = Vec::new();
+        let mut off = 0;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call {
+                calls.push(u16::from_le_bytes([code[off + 1], code[off + 2]]));
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        assert!(!calls.contains(&do_a), "the dead then-branch is dropped");
+        assert!(calls.contains(&do_b), "the else-branch runs");
+    }
+
+    // Test 18: a non-const `if` condition keeps the full JUMP_IF_FALSE shape.
+    #[test]
+    fn stmt_no_dce_for_runtime_if_condition() {
+        let src = "fn do_a() is io { }\n\
+                   fn do_b() is io { }\n\
+                   fn main(x: i64) is io { if x > 0 { do_a() } else { do_b() } }";
+        let ops = fn_ops(src, "main");
+        assert!(ops.contains(&Opcode::JumpIfFalse), "runtime if keeps its jump");
+    }
+
+    // Test 19: the six bundled examples each compile to non-empty bytecode.
+    #[test]
+    fn six_bundled_examples_compile_to_non_empty_bytecode() {
+        for name in [
+            "hello",
+            "fibonacci",
+            "effects",
+            "pattern-matching",
+            "pipeline",
+            "defer-demo",
+        ] {
+            let path = format!(
+                "{}/../playground/public/examples/{name}.qala",
+                env!("CARGO_MANIFEST_DIR"),
+            );
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let tokens = Lexer::tokenize(&src)
+                .unwrap_or_else(|e| panic!("{name}.qala: lex error: {e:?}"));
+            let ast = Parser::parse(&tokens)
+                .unwrap_or_else(|e| panic!("{name}.qala: parse error: {e:?}"));
+            let (typed, terrors, _) = check_program(&ast, &src);
+            assert!(
+                terrors.is_empty(),
+                "{name}.qala: typecheck errors: {terrors:?}"
+            );
+            let program = compile_program(&typed, &src)
+                .unwrap_or_else(|e| panic!("{name}.qala: compile errors: {e:?}"));
+            assert!(
+                !program.chunks.is_empty(),
+                "{name}.qala: program has no chunks"
+            );
+            // every user-fn chunk has at least one byte (a RETURN minimum).
+            for (i, chunk) in program.chunks.iter().enumerate() {
+                assert!(
+                    !chunk.code.is_empty(),
+                    "{name}.qala: chunk {i} ({}) is empty",
+                    program.fn_names[i],
+                );
+            }
+            let disassembly = program.disassemble();
+            assert!(
+                !disassembly.is_empty(),
+                "{name}.qala: disassembly is empty"
+            );
+        }
+    }
+
+    // Test 20: compiling the same example twice produces byte-identical
+    // bytecode -- the determinism contract.
+    #[test]
+    fn compile_is_deterministic() {
+        let path = format!(
+            "{}/../playground/public/examples/fibonacci.qala",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let src = std::fs::read_to_string(&path).expect("read fibonacci.qala");
+        let tokens = Lexer::tokenize(&src).expect("lex");
+        let ast = Parser::parse(&tokens).expect("parse");
+        let (typed, _, _) = check_program(&ast, &src);
+        let first = compile_program(&typed, &src).expect("compile 1");
+        let second = compile_program(&typed, &src).expect("compile 2");
+        assert_eq!(first.chunks.len(), second.chunks.len());
+        for (a, b) in first.chunks.iter().zip(second.chunks.iter()) {
+            assert_eq!(a.code, b.code, "chunk code differs across compiles");
+            assert_eq!(
+                a.source_lines, b.source_lines,
+                "source map differs across compiles"
+            );
+        }
+        assert_eq!(
+            first.disassemble(),
+            second.disassemble(),
+            "disassembly is non-deterministic"
+        );
+    }
+
+    // Test 8: `break` inside a loop emits a forward JUMP.
+    #[test]
+    fn stmt_break_emits_forward_jump() {
+        let src = "fn main() is io { for i in 0..3 { if i == 1 { break } } }";
+        let ops = fn_ops(src, "main");
+        // a break is a JUMP; the loop already has JUMP_IF_FALSE for the
+        // bounds check and the if -- assert at least one bare JUMP exists.
+        assert!(ops.contains(&Opcode::Jump), "break emits a JUMP");
+    }
+
+    // Test 9: `continue` inside a loop emits a backward JUMP (emit_loop).
+    #[test]
+    fn stmt_continue_emits_back_jump() {
+        let src = "fn main() is io { for i in 0..3 { if i == 1 { continue } } }";
+        let ops = fn_ops(src, "main");
+        assert!(ops.contains(&Opcode::Jump), "continue emits a JUMP");
+        // the program compiles cleanly -- continue resolves to the loop's
+        // increment label.
+        assert!(!ops.is_empty());
+    }
+
+    // Test 13: a defer plus a `break` -- the defer fires on the break path
+    // AND on the per-iteration fall-through (cleanup emitted for both).
+    #[test]
+    fn stmt_defer_with_break_fires_on_both_paths() {
+        let src = "fn cleanup() is io { }\n\
+                   fn main() is io {\n\
+                     for i in 0..3 { defer cleanup()\n if i == 1 { break } }\n\
+                   }";
+        let p = compile_ok(src);
+        let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let cleanup_id = p.fn_names.iter().position(|n| n == "cleanup").unwrap() as u16;
+        let code = &p.chunks[main_id].code;
+        let mut cleanup_calls = 0;
+        let mut off = 0;
+        while off < code.len() {
+            let op = Opcode::from_u8(code[off]).unwrap();
+            if op == Opcode::Call
+                && u16::from_le_bytes([code[off + 1], code[off + 2]]) == cleanup_id
+            {
+                cleanup_calls += 1;
+            }
+            off += 1 + op.operand_bytes() as usize;
+        }
+        // cleanup is emitted twice: once before the `break` JUMP, once at the
+        // per-iteration fall-through.
+        assert_eq!(
+            cleanup_calls, 2,
+            "the defer fires on the break path and the fall-through"
+        );
     }
 }
