@@ -12,3 +12,6 @@ tsconfig.tsbuildinfo
 
 # wasm artifact copied from the gitignored lib/wasm/ by copy-wasm.mjs
 public/wasm
+
+# responsive-verification screenshots
+.playwright-mcp
