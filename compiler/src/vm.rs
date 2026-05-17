@@ -63,6 +63,13 @@ const MAX_STACK: usize = 65536;
 /// WASM memory-exhaustion guard; raising it is a v2 concern.
 const MAX_HEAP: usize = 1_000_000;
 
+/// the maximum nesting depth for [`Vm::value_to_string`] and
+/// [`Vm::runtime_type_name`]. beyond this depth the helpers emit `"<...>"`
+/// (display) or `"..."` (type name) rather than recursing further. this
+/// prevents a pathologically deep user value (an array of arrays of ... of
+/// arrays) from overflowing the Rust/WASM call stack and trapping the host.
+const MAX_DISPLAY_DEPTH: u32 = 64;
+
 /// a value living on the VM heap, reached through a `TAG_PTR` [`Value`].
 ///
 /// every variant a `MAKE_*` opcode builds, plus [`HeapObject::Int`] -- because
@@ -1565,7 +1572,8 @@ impl Vm {
     ///   string shows the string itself, not a quoted literal.
     /// - an array `[a, b, c]`, a tuple `(a, b, c)`, a struct
     ///   `Name { f0, f1 }`, an enum variant `Enum::Variant(p0, p1)` (or just
-    ///   `Enum::Variant` with no payload) -- rendered recursively.
+    ///   `Enum::Variant` with no payload) -- rendered recursively, up to
+    ///   [`MAX_DISPLAY_DEPTH`] levels deep; beyond that, `"<...>"` is emitted.
     /// - a file handle: a `<file "path">` placeholder; the VM does no real I/O.
     ///
     /// reused by [`Vm::op_to_str`], [`Vm::op_concat_n`], and the native stdlib's
@@ -1575,6 +1583,14 @@ impl Vm {
     /// `pub(crate)` so `crate::stdlib`'s `print` / `println` render their
     /// argument through the one display routine the rest of the VM uses.
     pub(crate) fn value_to_string(&self, v: Value) -> String {
+        self.value_to_string_depth(v, 0)
+    }
+
+    /// depth-bounded inner worker for [`Vm::value_to_string`].
+    fn value_to_string_depth(&self, v: Value, depth: u32) -> String {
+        if depth > MAX_DISPLAY_DEPTH {
+            return "<...>".to_string();
+        }
         // a tagged scalar: bool / byte / void / function decode directly.
         if let Some(b) = v.as_bool() {
             return if b { "true".to_string() } else { "false".to_string() };
@@ -1594,18 +1610,24 @@ impl Vm {
                 Some(HeapObject::Int(n)) => n.to_string(),
                 Some(HeapObject::Str(s)) => s.clone(),
                 Some(HeapObject::Array(items)) => {
-                    let parts: Vec<String> =
-                        items.iter().map(|e| self.value_to_string(*e)).collect();
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|e| self.value_to_string_depth(*e, depth + 1))
+                        .collect();
                     format!("[{}]", parts.join(", "))
                 }
                 Some(HeapObject::Tuple(items)) => {
-                    let parts: Vec<String> =
-                        items.iter().map(|e| self.value_to_string(*e)).collect();
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|e| self.value_to_string_depth(*e, depth + 1))
+                        .collect();
                     format!("({})", parts.join(", "))
                 }
                 Some(HeapObject::Struct { type_name, fields }) => {
-                    let parts: Vec<String> =
-                        fields.iter().map(|e| self.value_to_string(*e)).collect();
+                    let parts: Vec<String> = fields
+                        .iter()
+                        .map(|e| self.value_to_string_depth(*e, depth + 1))
+                        .collect();
                     format!("{type_name} {{ {} }}", parts.join(", "))
                 }
                 Some(HeapObject::EnumVariant {
@@ -1616,8 +1638,10 @@ impl Vm {
                     if payload.is_empty() {
                         format!("{type_name}::{variant}")
                     } else {
-                        let parts: Vec<String> =
-                            payload.iter().map(|e| self.value_to_string(*e)).collect();
+                        let parts: Vec<String> = payload
+                            .iter()
+                            .map(|e| self.value_to_string_depth(*e, depth + 1))
+                            .collect();
                         format!("{type_name}::{variant}({})", parts.join(", "))
                     }
                 }
@@ -3725,6 +3749,34 @@ fn main() -> i64 is pure {
             "Color::Red",
             "a payload-less variant renders without parentheses"
         );
+    }
+
+    #[test]
+    fn value_to_string_depth_limit_prevents_stack_overflow() {
+        // build a chain of arrays nested deeper than MAX_DISPLAY_DEPTH.
+        // value_to_string must return without panicking (no stack overflow)
+        // and the deeply-nested innermost level must render as "<...>".
+        let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
+        // start with an i64 leaf.
+        let leaf = vm.heap.alloc(HeapObject::Int(1)).expect("alloc");
+        let mut inner = Value::pointer(leaf);
+        // wrap it in (MAX_DISPLAY_DEPTH + 2) layers of single-element arrays,
+        // which is two more than the cut-off.
+        for _ in 0..(MAX_DISPLAY_DEPTH + 2) {
+            let slot = vm
+                .heap
+                .alloc(HeapObject::Array(vec![inner]))
+                .expect("alloc");
+            inner = Value::pointer(slot);
+        }
+        let result = vm.value_to_string(inner);
+        // the outermost levels render normally; somewhere inside we hit "<...>".
+        assert!(
+            result.contains("<...>"),
+            "expected depth sentinel in output, got: {result}"
+        );
+        // no panic means the Rust stack did not overflow -- the test passing is
+        // the safety proof.
     }
 
     #[test]
