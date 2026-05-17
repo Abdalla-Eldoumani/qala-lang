@@ -38,7 +38,7 @@ function EditorHeader({
         <span className="font-[family-name:var(--font-display)] text-[28px] font-normal leading-[1.2] text-text-primary">
           Qala
         </span>
-        <span className="hidden text-[12px] font-medium leading-[1.4] text-text-secondary sm:inline">
+        <span className="hidden text-[12px] font-medium leading-[1.4] text-text-secondary min-[640px]:inline">
           a language that means what it says
         </span>
       </div>
@@ -47,7 +47,7 @@ function EditorHeader({
         type="button"
         onClick={onToggleBytecode}
         aria-pressed={bytecodeShown}
-        className={`hidden rounded-[var(--radius-button)] border px-[var(--space-3)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent md:block min-[1200px]:hidden ${
+        className={`hidden rounded-[var(--radius-button)] border px-[var(--space-3)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent min-[768px]:block min-[1200px]:hidden ${
           bytecodeShown
             ? "border-accent text-accent"
             : "border-border text-text-secondary hover:border-text-secondary"
@@ -151,10 +151,14 @@ export default function Page() {
 
   // the desktop grid columns. when the bytecode panel is collapsed its
   // track shrinks to auto (the slim re-expand rail) and the editor and
-  // state columns take the freed width.
+  // state columns take the freed width. every breakpoint in this file
+  // uses the arbitrary min-[..px] variant family so tailwind sorts them
+  // purely by min-width -- mixing a named md variant with an arbitrary
+  // min-[1200px] variant sorts them into separate groups and the wrong
+  // rule wins at desktop widths.
   const desktopColumns = bytecodeCollapsed
-    ? "min-[1200px]:[grid-template-columns:50fr_auto_50fr]"
-    : "min-[1200px]:[grid-template-columns:50fr_25fr_25fr]";
+    ? "min-[1200px]:grid-cols-[50fr_auto_50fr]"
+    : "min-[1200px]:grid-cols-[50fr_25fr_25fr]";
 
   return (
     <div className="flex h-dvh flex-col bg-bg min-[1920px]:mx-auto min-[1920px]:max-w-[1920px] min-[1920px]:px-[var(--space-8)]">
@@ -162,7 +166,7 @@ export default function Page() {
           on mobile the controls bar below is the last flex child, so the
           h-dvh shrink when the keyboard opens keeps it visible. */}
       <main
-        className={`grid min-h-0 flex-1 grid-cols-1 gap-[var(--space-2)] p-[var(--space-2)] md:grid-cols-[60fr_40fr] md:gap-[var(--space-6)] min-[1200px]:gap-[var(--space-2)] ${desktopColumns}`}
+        className={`grid min-h-0 flex-1 grid-cols-1 gap-[var(--space-2)] p-[var(--space-2)] min-[768px]:grid-cols-[60fr_40fr] min-[768px]:gap-[var(--space-6)] min-[1200px]:gap-[var(--space-2)] ${desktopColumns}`}
       >
         {/* the editor column: header, editor surface, controls bar
             (the bar is in-column from tablet up; on mobile it is pinned
@@ -173,7 +177,7 @@ export default function Page() {
             onToggleBytecode={() => setBytecodeShown((v) => !v)}
           />
           <div className="min-h-0 flex-1 overflow-hidden">{editorRegion}</div>
-          <div className="hidden md:block">
+          <div className="hidden min-[768px]:block">
             <Controls status={status} onRun={run} onStep={step} />
           </div>
         </section>
@@ -193,31 +197,32 @@ export default function Page() {
             </span>
           </button>
         ) : (
-          <div className="hidden min-h-0 min-[1200px]:flex min-[1200px]:flex-col">
-            <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={() => setBytecodeCollapsed(true)}
-                aria-label="collapse the bytecode panel"
-                className="mb-[var(--space-1)] rounded-[var(--radius-button)] border border-border bg-surface px-[var(--space-2)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] text-text-secondary transition-colors duration-150 ease-out hover:border-text-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
-              >
-                collapse
-              </button>
-            </div>
+          <div className="relative hidden min-h-0 min-[1200px]:flex min-[1200px]:flex-col">
+            {/* the collapse control is positioned over the panel header so
+                the bytecode panel still starts at the top of the column,
+                aligned with the editor and the state panels. */}
+            <button
+              type="button"
+              onClick={() => setBytecodeCollapsed(true)}
+              aria-label="collapse the bytecode panel"
+              className="absolute right-[var(--space-3)] top-[var(--space-2)] z-10 rounded-[var(--radius-button)] border border-border bg-surface px-[var(--space-2)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] text-text-secondary transition-colors duration-150 ease-out hover:border-text-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+            >
+              collapse
+            </button>
             <BytecodePanel className="min-h-0 flex-1" />
           </div>
         )}
 
         {/* the state panels: Variables, Stack, Console stacked on
             desktop/tablet; tabbed on mobile */}
-        <aside className="hidden min-h-0 md:flex md:flex-col md:gap-[var(--space-2)]">
+        <aside className="hidden min-h-0 min-[768px]:flex min-[768px]:flex-col min-[768px]:gap-[var(--space-2)]">
           <VariablesPanel className="min-h-0 flex-1" />
           <StackPanel className="min-h-0 flex-1" />
           <ConsolePanel className="min-h-0 flex-1" />
         </aside>
 
         {/* mobile: the same three panels behind a tab switcher */}
-        <section className="flex min-h-0 flex-col overflow-hidden rounded-[var(--radius-panel)] border border-border bg-surface md:hidden">
+        <section className="flex min-h-0 flex-col overflow-hidden rounded-[var(--radius-panel)] border border-border bg-surface min-[768px]:hidden">
           <MobileTabs active={mobileTab} onSelect={setMobileTab} />
           <div className="min-h-0 flex-1 overflow-auto">
             {mobileTab === "stack" && <StackPanel className="border-0" />}
@@ -233,7 +238,7 @@ export default function Page() {
           viewport. it is the last flex child of the h-dvh column, so the
           dynamic viewport unit reflows it above the keyboard rather than
           hiding it. from tablet up the bar lives inside the editor column. */}
-      <div className="md:hidden">
+      <div className="min-[768px]:hidden">
         <Controls status={status} onRun={run} onStep={step} />
       </div>
     </div>
