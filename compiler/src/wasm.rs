@@ -177,6 +177,17 @@ pub struct Qala {
     last_src: String,
 }
 
+impl Default for Qala {
+    /// a default session is a fresh one -- delegates to [`Qala::new`].
+    ///
+    /// `new` carries `#[wasm_bindgen(constructor)]` and is the real entry
+    /// point; this impl exists so a default-constructible bound is satisfiable
+    /// in plain Rust.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Qala {
     /// run the full compile pipeline on `source` and return a `CompileResult`.
     ///
