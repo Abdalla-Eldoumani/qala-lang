@@ -327,16 +327,26 @@ export function useQala(): UseQala {
   const reset = useCallback(() => {
     const s = sessionRef.current;
     if (!s) return;
-    // stop the run loop first, then reset the bridge and clear the
-    // snapshots. reset does NOT set dirty -- editing invalidates the
-    // program, a reset does not.
+    // stop the run loop first, then reset the bridge. reset does NOT set
+    // dirty -- editing invalidates the program, a reset does not.
     clearLoop();
+    // the bridge reset nulls both the program and the VM, so a re-run
+    // after a reset needs a fresh compile. when a program was compiled,
+    // recompile the current source so the bridge holds a fresh VM at the
+    // entry point and keep lastCompile -- the program stays re-runnable,
+    // the controls stay enabled, and the console stays in program mode.
+    // when no program was ever compiled there is nothing to rebuild.
     s.reset();
-    setLastCompile(null);
+    if (lastCompile?.ok) {
+      setLastCompile(s.compile(source));
+      setLastState(s.getState());
+    } else {
+      setLastCompile(null);
+      setLastState(null);
+    }
     setLastRun(null);
-    setLastState(null);
     setVersion((v) => v + 1);
-  }, [clearLoop]);
+  }, [clearLoop, lastCompile, source]);
 
   const replEval = useCallback((line: string): ReplResult | null => {
     const s = sessionRef.current;
