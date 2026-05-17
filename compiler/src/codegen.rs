@@ -38,7 +38,7 @@ use crate::ast::{BinOp, Pattern, UnaryOp};
 use crate::chunk::{Chunk, Program, StructInfo};
 use crate::effects::EffectSet;
 use crate::errors::QalaError;
-use crate::opcode::Opcode;
+use crate::opcode::{Opcode, STDLIB_FN_BASE};
 use crate::span::{LineIndex, Span};
 use crate::typed_ast::{
     TypedAst, TypedBlock, TypedElseBranch, TypedExpr, TypedInterpPart, TypedItem, TypedMatchArm,
@@ -47,14 +47,6 @@ use crate::typed_ast::{
 use crate::types::{QalaType, Symbol};
 use crate::value::ConstValue;
 use std::collections::{BTreeMap, HashMap};
-
-/// the fn-id base at which the stdlib namespace begins. user functions get
-/// dense ids `0..user_count` into [`Program::chunks`]; stdlib functions get
-/// ids `STDLIB_FN_BASE + index` so the two spaces never collide and the
-/// Phase 5 VM dispatches a CALL by `fn_id >= STDLIB_FN_BASE`. keeping the
-/// stdlib out of `program.chunks` keeps the chunks vector dense and lets an
-/// empty program produce an empty `chunks`.
-const STDLIB_FN_BASE: u16 = 40_000;
 
 /// the comptime interpreter's instruction budget. hitting it produces
 /// [`QalaError::ComptimeBudgetExceeded`]; raising it is a v2 concern.
