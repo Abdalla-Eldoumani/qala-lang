@@ -244,8 +244,12 @@ export function useQala(): UseQala {
           setSource(text);
           setLoadedExample(file);
         })
-        .catch(() => {
-          // a failed fetch leaves the editor as it was -- nothing to surface.
+        .catch((error: unknown) => {
+          // a failed fetch leaves the editor as it was -- there is no
+          // user-facing surface for it (the examples are bundled assets,
+          // a failure is a transient network error). log it so a
+          // transient failure is still diagnosable from the console.
+          console.warn(`could not load the ${file} example`, error);
         });
     },
     [setSource],
@@ -279,8 +283,11 @@ export function useQala(): UseQala {
           setSourceState(text);
           setLoadedExample("fibonacci");
         })
-        .catch(() => {
-          // the fetch failed -- leave the editor empty, no surface needed.
+        .catch((error: unknown) => {
+          // the fetch failed -- leave the editor empty, no user-facing
+          // surface. log it so a failed first-visit preload is
+          // diagnosable rather than a silent blank editor.
+          console.warn("could not preload the fibonacci example", error);
         });
     }
   }, []);
