@@ -40,6 +40,7 @@ export interface NamedValue {
 export interface VmState {
   chunk_index: number;
   ip: number; // instruction pointer (byte offset into the chunk)
+  current_line: number; // 1-based source line of the instruction at ip; 0 = none
   stack: StateValue[]; // value stack, bottom to top
   variables: NamedValue[]; // current frame's in-scope variables
   console: string[]; // accumulated print/println output
