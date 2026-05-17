@@ -49,7 +49,9 @@ export default function QalaEditor(props: {
       options={{
         fontFamily: "var(--font-mono)",
         fontSize: 13,
-        lineHeight: 1.6 * 13,
+        // monaco reads lineHeight >= 8 as a pixel value and floors a
+        // fraction. 1.6 * 13 is 20.8, so use the nearest integer, 21.
+        lineHeight: 21,
         minimap: { enabled: false },
         scrollBeyondLastLine: false,
       }}
