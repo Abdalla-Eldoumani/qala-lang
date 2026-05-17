@@ -45,7 +45,7 @@ use crate::typed_ast::{
     TypedMatchArmBody, TypedStmt,
 };
 use crate::types::{QalaType, Symbol};
-use crate::value::Value;
+use crate::value::ConstValue;
 use std::collections::{BTreeMap, HashMap};
 
 /// the fn-id base at which the stdlib namespace begins. user functions get
@@ -654,7 +654,7 @@ impl<'a> Codegen<'a> {
 
     /// emit `CONST idx` for `value` on `line`: append the value to the
     /// current chunk's constant pool, then the opcode + u16 index.
-    fn emit_const(&mut self, value: Value, line: u32) {
+    fn emit_const(&mut self, value: ConstValue, line: u32) {
         let idx = self.chunk_mut().add_constant(value);
         self.chunk_mut().write_op(Opcode::Const, line);
         self.chunk_mut().write_u16(idx, line);
@@ -827,8 +827,8 @@ impl<'a> Codegen<'a> {
         let off = operand_start;
         let v = chunk.constants[idx as usize].clone();
         let result = match (op, &v) {
-            (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
-            (UnaryOp::Neg, Value::I64(n)) => {
+            (UnaryOp::Not, ConstValue::Bool(b)) => ConstValue::Bool(!b),
+            (UnaryOp::Neg, ConstValue::I64(n)) => {
                 // -x overflows only at i64::MIN; surface as IntegerOverflow.
                 // the synthetic op is Sub because `-x` equals `0 - x`; a
                 // future enhancement could widen IntegerOverflow to carry a
@@ -839,9 +839,9 @@ impl<'a> Codegen<'a> {
                     lhs: 0,
                     rhs: *n,
                 })?;
-                Value::I64(r)
+                ConstValue::I64(r)
             }
-            (UnaryOp::Neg, Value::F64(x)) => Value::F64(-x),
+            (UnaryOp::Neg, ConstValue::F64(x)) => ConstValue::F64(-x),
             // any other operand: no fold.
             _ => return Ok(false),
         };
@@ -864,27 +864,27 @@ impl<'a> Codegen<'a> {
         match e {
             TypedExpr::Int { value, span, .. } => {
                 let line = self.line_at(*span);
-                self.emit_const(Value::I64(*value), line);
+                self.emit_const(ConstValue::I64(*value), line);
                 Ok(())
             }
             TypedExpr::Float { value, span, .. } => {
                 let line = self.line_at(*span);
-                self.emit_const(Value::F64(*value), line);
+                self.emit_const(ConstValue::F64(*value), line);
                 Ok(())
             }
             TypedExpr::Byte { value, span, .. } => {
                 let line = self.line_at(*span);
-                self.emit_const(Value::Byte(*value), line);
+                self.emit_const(ConstValue::Byte(*value), line);
                 Ok(())
             }
             TypedExpr::Str { value, span, .. } => {
                 let line = self.line_at(*span);
-                self.emit_const(Value::Str(value.clone()), line);
+                self.emit_const(ConstValue::Str(value.clone()), line);
                 Ok(())
             }
             TypedExpr::Bool { value, span, .. } => {
                 let line = self.line_at(*span);
-                self.emit_const(Value::Bool(*value), line);
+                self.emit_const(ConstValue::Bool(*value), line);
                 Ok(())
             }
             TypedExpr::Ident { name, span, .. } => {
@@ -894,8 +894,8 @@ impl<'a> Codegen<'a> {
                     self.chunk_mut().write_u16(slot, line);
                 } else if let Some(fn_id) = self.resolve_callee_fn_id(name) {
                     // a bare function name used as a value -- a function
-                    // reference. emitted as a CONST of Value::Function.
-                    self.emit_const(Value::Function(fn_id), line);
+                    // reference. emitted as a CONST of ConstValue::Function.
+                    self.emit_const(ConstValue::Function(fn_id), line);
                 } else {
                     // the typechecker would have rejected an unresolved name;
                     // defense-in-depth.
@@ -1290,7 +1290,7 @@ impl<'a> Codegen<'a> {
                     s.push_str(text);
                 }
             }
-            self.emit_const(Value::Str(s), line);
+            self.emit_const(ConstValue::Str(s), line);
             return Ok(());
         }
         // emit each non-empty part; an empty literal (the parser always
@@ -1303,7 +1303,7 @@ impl<'a> Codegen<'a> {
                     if text.is_empty() {
                         continue;
                     }
-                    self.emit_const(Value::Str(text.clone()), line);
+                    self.emit_const(ConstValue::Str(text.clone()), line);
                     emitted += 1;
                 }
                 TypedInterpPart::Expr(e) => {
@@ -1321,7 +1321,7 @@ impl<'a> Codegen<'a> {
         }
         // zero parts (an empty interpolated string) -> the empty string.
         if emitted == 0 {
-            self.emit_const(Value::Str(String::new()), line);
+            self.emit_const(ConstValue::Str(String::new()), line);
             return Ok(());
         }
         self.chunk_mut().write_op(Opcode::ConcatN, line);
@@ -1562,7 +1562,7 @@ impl<'a> Codegen<'a> {
             });
         }
         for v in lo..=last {
-            self.emit_const(Value::I64(v), line);
+            self.emit_const(ConstValue::I64(v), line);
         }
         self.chunk_mut().write_op(Opcode::MakeArray, line);
         self.chunk_mut().write_u16(count as u16, line);
@@ -1673,7 +1673,7 @@ impl<'a> Codegen<'a> {
         self.chunk_mut().write_op(Opcode::SetLocal, line);
         self.chunk_mut().write_u16(arr_slot, line);
         // the index counter starts at 0.
-        self.emit_const(Value::I64(0), line);
+        self.emit_const(ConstValue::I64(0), line);
         let idx_slot = self.next_slot();
         self.bind_hidden_slot(idx_slot);
         self.chunk_mut().write_op(Opcode::SetLocal, line);
@@ -1712,7 +1712,7 @@ impl<'a> Codegen<'a> {
         self.patch_loop_continues()?;
         self.chunk_mut().write_op(Opcode::GetLocal, line);
         self.chunk_mut().write_u16(idx_slot, line);
-        self.emit_const(Value::I64(1), line);
+        self.emit_const(ConstValue::I64(1), line);
         self.chunk_mut().write_op(Opcode::Add, line);
         self.chunk_mut().write_op(Opcode::SetLocal, line);
         self.chunk_mut().write_u16(idx_slot, line);
@@ -1871,26 +1871,26 @@ impl<'a> Codegen<'a> {
                 }
                 Pattern::Int { value, .. } => {
                     fail_jumps
-                        .push(self.emit_literal_pattern_test(Value::I64(*value), is_last, line));
+                        .push(self.emit_literal_pattern_test(ConstValue::I64(*value), is_last, line));
                 }
                 Pattern::Bool { value, .. } => {
                     fail_jumps
-                        .push(self.emit_literal_pattern_test(Value::Bool(*value), is_last, line));
+                        .push(self.emit_literal_pattern_test(ConstValue::Bool(*value), is_last, line));
                 }
                 Pattern::Byte { value, .. } => {
                     fail_jumps
-                        .push(self.emit_literal_pattern_test(Value::Byte(*value), is_last, line));
+                        .push(self.emit_literal_pattern_test(ConstValue::Byte(*value), is_last, line));
                 }
                 Pattern::Str { value, .. } => {
                     fail_jumps.push(self.emit_literal_pattern_test(
-                        Value::Str(value.clone()),
+                        ConstValue::Str(value.clone()),
                         is_last,
                         line,
                     ));
                 }
                 Pattern::Float { value, .. } => {
                     fail_jumps
-                        .push(self.emit_literal_pattern_test(Value::F64(*value), is_last, line));
+                        .push(self.emit_literal_pattern_test(ConstValue::F64(*value), is_last, line));
                 }
             }
             // the arm body runs in its own scope so an arm-local `defer`
@@ -1925,7 +1925,7 @@ impl<'a> Codegen<'a> {
     /// emit a literal-pattern equality test: `DUP` (for a non-final arm so
     /// the scrutinee survives a miss), `CONST(lit)`, `EQ`, then a
     /// `JUMP_IF_FALSE` placeholder. returns the placeholder's byte position.
-    fn emit_literal_pattern_test(&mut self, lit: Value, is_last: bool, line: u32) -> usize {
+    fn emit_literal_pattern_test(&mut self, lit: ConstValue, is_last: bool, line: u32) -> usize {
         if !is_last {
             self.chunk_mut().write_op(Opcode::Dup, line);
         }
@@ -2000,12 +2000,12 @@ impl<'a> Codegen<'a> {
 /// division / remainder by a zero literal does NOT fold (the runtime VM
 /// raises the division-by-zero error so the diagnostic points at the source).
 fn fold_binary_value(
-    a: &Value,
-    b: &Value,
+    a: &ConstValue,
+    b: &ConstValue,
     op: &BinOp,
     operand_ty: &QalaType,
     span: Span,
-) -> Result<Option<Value>, QalaError> {
+) -> Result<Option<ConstValue>, QalaError> {
     let overflow = |op: BinOp, lhs: i64, rhs: i64| QalaError::IntegerOverflow {
         span,
         op,
@@ -2014,64 +2014,64 @@ fn fold_binary_value(
     };
     let folded = match (a, b, op) {
         // ---- i64 arithmetic: checked, overflow is an error ----
-        (Value::I64(x), Value::I64(y), BinOp::Add) if matches!(operand_ty, QalaType::I64) => {
-            Value::I64(x.checked_add(*y).ok_or_else(|| overflow(BinOp::Add, *x, *y))?)
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Add) if matches!(operand_ty, QalaType::I64) => {
+            ConstValue::I64(x.checked_add(*y).ok_or_else(|| overflow(BinOp::Add, *x, *y))?)
         }
-        (Value::I64(x), Value::I64(y), BinOp::Sub) if matches!(operand_ty, QalaType::I64) => {
-            Value::I64(x.checked_sub(*y).ok_or_else(|| overflow(BinOp::Sub, *x, *y))?)
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Sub) if matches!(operand_ty, QalaType::I64) => {
+            ConstValue::I64(x.checked_sub(*y).ok_or_else(|| overflow(BinOp::Sub, *x, *y))?)
         }
-        (Value::I64(x), Value::I64(y), BinOp::Mul) if matches!(operand_ty, QalaType::I64) => {
-            Value::I64(x.checked_mul(*y).ok_or_else(|| overflow(BinOp::Mul, *x, *y))?)
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Mul) if matches!(operand_ty, QalaType::I64) => {
+            ConstValue::I64(x.checked_mul(*y).ok_or_else(|| overflow(BinOp::Mul, *x, *y))?)
         }
-        (Value::I64(x), Value::I64(y), BinOp::Div) if matches!(operand_ty, QalaType::I64) => {
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Div) if matches!(operand_ty, QalaType::I64) => {
             if *y == 0 {
                 return Ok(None);
             }
-            Value::I64(x.checked_div(*y).ok_or_else(|| overflow(BinOp::Div, *x, *y))?)
+            ConstValue::I64(x.checked_div(*y).ok_or_else(|| overflow(BinOp::Div, *x, *y))?)
         }
-        (Value::I64(x), Value::I64(y), BinOp::Rem) if matches!(operand_ty, QalaType::I64) => {
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Rem) if matches!(operand_ty, QalaType::I64) => {
             if *y == 0 {
                 return Ok(None);
             }
-            Value::I64(x.checked_rem(*y).ok_or_else(|| overflow(BinOp::Rem, *x, *y))?)
+            ConstValue::I64(x.checked_rem(*y).ok_or_else(|| overflow(BinOp::Rem, *x, *y))?)
         }
         // ---- f64 arithmetic: IEEE 754, no overflow error ----
-        (Value::F64(x), Value::F64(y), BinOp::Add) => Value::F64(x + y),
-        (Value::F64(x), Value::F64(y), BinOp::Sub) => Value::F64(x - y),
-        (Value::F64(x), Value::F64(y), BinOp::Mul) => Value::F64(x * y),
-        (Value::F64(x), Value::F64(y), BinOp::Div) => Value::F64(x / y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Add) => ConstValue::F64(x + y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Sub) => ConstValue::F64(x - y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Mul) => ConstValue::F64(x * y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Div) => ConstValue::F64(x / y),
         // ---- string concatenation of two literals ----
-        (Value::Str(x), Value::Str(y), BinOp::Add) => {
+        (ConstValue::Str(x), ConstValue::Str(y), BinOp::Add) => {
             let mut s = String::with_capacity(x.len() + y.len());
             s.push_str(x);
             s.push_str(y);
-            Value::Str(s)
+            ConstValue::Str(s)
         }
         // ---- i64 comparisons ----
-        (Value::I64(x), Value::I64(y), BinOp::Eq) => Value::Bool(x == y),
-        (Value::I64(x), Value::I64(y), BinOp::Ne) => Value::Bool(x != y),
-        (Value::I64(x), Value::I64(y), BinOp::Lt) => Value::Bool(x < y),
-        (Value::I64(x), Value::I64(y), BinOp::Le) => Value::Bool(x <= y),
-        (Value::I64(x), Value::I64(y), BinOp::Gt) => Value::Bool(x > y),
-        (Value::I64(x), Value::I64(y), BinOp::Ge) => Value::Bool(x >= y),
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Eq) => ConstValue::Bool(x == y),
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Ne) => ConstValue::Bool(x != y),
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Lt) => ConstValue::Bool(x < y),
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Le) => ConstValue::Bool(x <= y),
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Gt) => ConstValue::Bool(x > y),
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Ge) => ConstValue::Bool(x >= y),
         // ---- f64 comparisons (IEEE 754: NaN compares unequal) ----
-        (Value::F64(x), Value::F64(y), BinOp::Eq) => Value::Bool(x == y),
-        (Value::F64(x), Value::F64(y), BinOp::Ne) => Value::Bool(x != y),
-        (Value::F64(x), Value::F64(y), BinOp::Lt) => Value::Bool(x < y),
-        (Value::F64(x), Value::F64(y), BinOp::Le) => Value::Bool(x <= y),
-        (Value::F64(x), Value::F64(y), BinOp::Gt) => Value::Bool(x > y),
-        (Value::F64(x), Value::F64(y), BinOp::Ge) => Value::Bool(x >= y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Eq) => ConstValue::Bool(x == y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Ne) => ConstValue::Bool(x != y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Lt) => ConstValue::Bool(x < y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Le) => ConstValue::Bool(x <= y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Gt) => ConstValue::Bool(x > y),
+        (ConstValue::F64(x), ConstValue::F64(y), BinOp::Ge) => ConstValue::Bool(x >= y),
         // ---- byte comparisons ----
-        (Value::Byte(x), Value::Byte(y), BinOp::Eq) => Value::Bool(x == y),
-        (Value::Byte(x), Value::Byte(y), BinOp::Ne) => Value::Bool(x != y),
+        (ConstValue::Byte(x), ConstValue::Byte(y), BinOp::Eq) => ConstValue::Bool(x == y),
+        (ConstValue::Byte(x), ConstValue::Byte(y), BinOp::Ne) => ConstValue::Bool(x != y),
         // ---- bool logic + equality ----
-        (Value::Bool(x), Value::Bool(y), BinOp::And) => Value::Bool(*x && *y),
-        (Value::Bool(x), Value::Bool(y), BinOp::Or) => Value::Bool(*x || *y),
-        (Value::Bool(x), Value::Bool(y), BinOp::Eq) => Value::Bool(x == y),
-        (Value::Bool(x), Value::Bool(y), BinOp::Ne) => Value::Bool(x != y),
+        (ConstValue::Bool(x), ConstValue::Bool(y), BinOp::And) => ConstValue::Bool(*x && *y),
+        (ConstValue::Bool(x), ConstValue::Bool(y), BinOp::Or) => ConstValue::Bool(*x || *y),
+        (ConstValue::Bool(x), ConstValue::Bool(y), BinOp::Eq) => ConstValue::Bool(x == y),
+        (ConstValue::Bool(x), ConstValue::Bool(y), BinOp::Ne) => ConstValue::Bool(x != y),
         // ---- string equality ----
-        (Value::Str(x), Value::Str(y), BinOp::Eq) => Value::Bool(x == y),
-        (Value::Str(x), Value::Str(y), BinOp::Ne) => Value::Bool(x != y),
+        (ConstValue::Str(x), ConstValue::Str(y), BinOp::Eq) => ConstValue::Bool(x == y),
+        (ConstValue::Str(x), ConstValue::Str(y), BinOp::Ne) => ConstValue::Bool(x != y),
         // anything else: no fold rule.
         _ => return Ok(None),
     };
@@ -2081,30 +2081,30 @@ fn fold_binary_value(
 /// is `v` a value the constant pool can hold? primitives and strings are;
 /// heap objects (arrays, structs, enum variants) and function references
 /// are not. a `comptime` block whose result is not constable is rejected.
-fn is_constable_primitive(v: &Value) -> bool {
+fn is_constable_primitive(v: &ConstValue) -> bool {
     matches!(
         v,
-        Value::I64(_)
-            | Value::F64(_)
-            | Value::Bool(_)
-            | Value::Byte(_)
-            | Value::Str(_)
-            | Value::Void
+        ConstValue::I64(_)
+            | ConstValue::F64(_)
+            | ConstValue::Bool(_)
+            | ConstValue::Byte(_)
+            | ConstValue::Str(_)
+            | ConstValue::Void
     )
 }
 
-/// the canonical type name of a [`Value`], for the
-/// [`QalaError::ComptimeResultNotConstable`] message. only [`Value::Function`]
+/// the canonical type name of a [`ConstValue`], for the
+/// [`QalaError::ComptimeResultNotConstable`] message. only [`ConstValue::Function`]
 /// reaches this in practice (every other variant is constable).
-fn value_type_name(v: &Value) -> String {
+fn value_type_name(v: &ConstValue) -> String {
     match v {
-        Value::I64(_) => "i64",
-        Value::F64(_) => "f64",
-        Value::Bool(_) => "bool",
-        Value::Byte(_) => "byte",
-        Value::Str(_) => "str",
-        Value::Void => "void",
-        Value::Function(_) => "fn",
+        ConstValue::I64(_) => "i64",
+        ConstValue::F64(_) => "f64",
+        ConstValue::Bool(_) => "bool",
+        ConstValue::Byte(_) => "byte",
+        ConstValue::Str(_) => "str",
+        ConstValue::Void => "void",
+        ConstValue::Function(_) => "fn",
     }
     .to_string()
 }
@@ -2119,7 +2119,7 @@ struct Frame {
     chunk_id: u16,
     /// the frame's local slots, indexed by `GET_LOCAL` / `SET_LOCAL`. a
     /// callee's slots 0..argc are pre-filled with the call arguments.
-    locals: Vec<Value>,
+    locals: Vec<ConstValue>,
     /// the instruction pointer -- a byte offset into the frame's chunk.
     ip: usize,
 }
@@ -2135,7 +2135,7 @@ struct ComptimeInterpreter<'a> {
     /// fn-id -> effect, for the per-CALL purity gate.
     fn_effects: &'a HashMap<u16, EffectSet>,
     /// the value stack.
-    stack: Vec<Value>,
+    stack: Vec<ConstValue>,
     /// the explicit call-frame stack -- no Rust recursion.
     frames: Vec<Frame>,
     /// the remaining instruction budget; ticks down per instruction.
@@ -2172,13 +2172,13 @@ impl<'a> ComptimeInterpreter<'a> {
     }
 
     /// pop one value, or an underflow error.
-    fn pop(&mut self) -> Result<Value, QalaError> {
+    fn pop(&mut self) -> Result<ConstValue, QalaError> {
         self.stack.pop().ok_or_else(|| self.underflow())
     }
 
     /// run the throwaway chunk to completion, returning the value the
     /// outermost `RETURN` leaves on the stack.
-    fn run(&mut self, throwaway: Chunk) -> Result<Value, QalaError> {
+    fn run(&mut self, throwaway: Chunk) -> Result<ConstValue, QalaError> {
         // the initial frame executes the throwaway chunk (chunk_id u16::MAX).
         self.frames.push(Frame {
             chunk_id: u16::MAX,
@@ -2205,9 +2205,9 @@ impl<'a> ComptimeInterpreter<'a> {
             if ip >= chunk.code.len() {
                 self.frames.pop();
                 if self.frames.is_empty() {
-                    return Ok(Value::Void);
+                    return Ok(ConstValue::Void);
                 }
-                self.stack.push(Value::Void);
+                self.stack.push(ConstValue::Void);
                 continue;
             }
             if self.budget == 0 {
@@ -2262,7 +2262,7 @@ impl<'a> ComptimeInterpreter<'a> {
                     let v = self.pop()?;
                     let locals = &mut self.frames[frame_idx].locals;
                     if slot >= locals.len() {
-                        locals.resize(slot + 1, Value::Void);
+                        locals.resize(slot + 1, ConstValue::Void);
                     }
                     locals[slot] = v;
                 }
@@ -2283,14 +2283,14 @@ impl<'a> ComptimeInterpreter<'a> {
                 Opcode::Neg => {
                     let a = self.pop()?;
                     match a {
-                        Value::I64(n) => {
+                        ConstValue::I64(n) => {
                             let r = n.checked_neg().ok_or(QalaError::IntegerOverflow {
                                 span: self.block_span,
                                 op: BinOp::Sub,
                                 lhs: 0,
                                 rhs: n,
                             })?;
-                            self.stack.push(Value::I64(r));
+                            self.stack.push(ConstValue::I64(r));
                         }
                         _ => return Err(self.type_error("NEG expects i64")),
                     }
@@ -2298,7 +2298,7 @@ impl<'a> ComptimeInterpreter<'a> {
                 Opcode::FNeg => {
                     let a = self.pop()?;
                     match a {
-                        Value::F64(x) => self.stack.push(Value::F64(-x)),
+                        ConstValue::F64(x) => self.stack.push(ConstValue::F64(-x)),
                         _ => return Err(self.type_error("F_NEG expects f64")),
                     }
                 }
@@ -2317,12 +2317,12 @@ impl<'a> ComptimeInterpreter<'a> {
                     let b = self.pop()?;
                     let a = self.pop()?;
                     let r = self.eval_compare(op, a, b)?;
-                    self.stack.push(Value::Bool(r));
+                    self.stack.push(ConstValue::Bool(r));
                 }
                 Opcode::Not => {
                     let a = self.pop()?;
                     match a {
-                        Value::Bool(b) => self.stack.push(Value::Bool(!b)),
+                        ConstValue::Bool(b) => self.stack.push(ConstValue::Bool(!b)),
                         _ => return Err(self.type_error("NOT expects bool")),
                     }
                 }
@@ -2333,14 +2333,14 @@ impl<'a> ComptimeInterpreter<'a> {
                 Opcode::JumpIfFalse => {
                     let offset = chunk.read_i16(ip + 1);
                     let cond = self.pop()?;
-                    if matches!(cond, Value::Bool(false)) {
+                    if matches!(cond, ConstValue::Bool(false)) {
                         self.frames[frame_idx].ip = jump_target(next_ip, offset)?;
                     }
                 }
                 Opcode::JumpIfTrue => {
                     let offset = chunk.read_i16(ip + 1);
                     let cond = self.pop()?;
-                    if matches!(cond, Value::Bool(true)) {
+                    if matches!(cond, ConstValue::Bool(true)) {
                         self.frames[frame_idx].ip = jump_target(next_ip, offset)?;
                     }
                 }
@@ -2384,7 +2384,7 @@ impl<'a> ComptimeInterpreter<'a> {
                         });
                     }
                     // pop argc arguments; slot 0 is the first argument.
-                    let mut locals: Vec<Value> = Vec::with_capacity(argc as usize);
+                    let mut locals: Vec<ConstValue> = Vec::with_capacity(argc as usize);
                     for _ in 0..argc {
                         locals.push(self.pop()?);
                     }
@@ -2405,7 +2405,7 @@ impl<'a> ComptimeInterpreter<'a> {
                 }
                 Opcode::ToStr => {
                     let v = self.pop()?;
-                    self.stack.push(Value::Str(v.to_string()));
+                    self.stack.push(ConstValue::Str(v.to_string()));
                 }
                 Opcode::ConcatN => {
                     let count = chunk.read_u16(ip + 1) as usize;
@@ -2416,11 +2416,11 @@ impl<'a> ComptimeInterpreter<'a> {
                     let mut s = String::new();
                     for part in parts {
                         match part {
-                            Value::Str(p) => s.push_str(&p),
+                            ConstValue::Str(p) => s.push_str(&p),
                             other => s.push_str(&other.to_string()),
                         }
                     }
-                    self.stack.push(Value::Str(s));
+                    self.stack.push(ConstValue::Str(s));
                 }
                 // heap-construction and pattern opcodes are not supported in
                 // comptime v1 -- the result must be a primitive or string.
@@ -2472,7 +2472,7 @@ impl<'a> ComptimeInterpreter<'a> {
     /// evaluate an arithmetic opcode on two values. i64 ops are checked --
     /// an overflow is an error; division / remainder by zero is an error.
     /// f64 ops follow IEEE 754.
-    fn eval_arith(&self, op: Opcode, a: Value, b: Value) -> Result<Value, QalaError> {
+    fn eval_arith(&self, op: Opcode, a: ConstValue, b: ConstValue) -> Result<ConstValue, QalaError> {
         let int_overflow = |bin: BinOp, x: i64, y: i64| QalaError::IntegerOverflow {
             span: self.block_span,
             op: bin,
@@ -2480,58 +2480,58 @@ impl<'a> ComptimeInterpreter<'a> {
             rhs: y,
         };
         match (op, a, b) {
-            (Opcode::Add, Value::I64(x), Value::I64(y)) => Ok(Value::I64(
+            (Opcode::Add, ConstValue::I64(x), ConstValue::I64(y)) => Ok(ConstValue::I64(
                 x.checked_add(y).ok_or_else(|| int_overflow(BinOp::Add, x, y))?,
             )),
-            (Opcode::Sub, Value::I64(x), Value::I64(y)) => Ok(Value::I64(
+            (Opcode::Sub, ConstValue::I64(x), ConstValue::I64(y)) => Ok(ConstValue::I64(
                 x.checked_sub(y).ok_or_else(|| int_overflow(BinOp::Sub, x, y))?,
             )),
-            (Opcode::Mul, Value::I64(x), Value::I64(y)) => Ok(Value::I64(
+            (Opcode::Mul, ConstValue::I64(x), ConstValue::I64(y)) => Ok(ConstValue::I64(
                 x.checked_mul(y).ok_or_else(|| int_overflow(BinOp::Mul, x, y))?,
             )),
-            (Opcode::Div, Value::I64(x), Value::I64(y)) => {
+            (Opcode::Div, ConstValue::I64(x), ConstValue::I64(y)) => {
                 if y == 0 {
                     return Err(self.type_error("division by zero"));
                 }
-                Ok(Value::I64(
+                Ok(ConstValue::I64(
                     x.checked_div(y).ok_or_else(|| int_overflow(BinOp::Div, x, y))?,
                 ))
             }
-            (Opcode::Mod, Value::I64(x), Value::I64(y)) => {
+            (Opcode::Mod, ConstValue::I64(x), ConstValue::I64(y)) => {
                 if y == 0 {
                     return Err(self.type_error("remainder by zero"));
                 }
-                Ok(Value::I64(
+                Ok(ConstValue::I64(
                     x.checked_rem(y).ok_or_else(|| int_overflow(BinOp::Rem, x, y))?,
                 ))
             }
-            (Opcode::FAdd, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x + y)),
-            (Opcode::FSub, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x - y)),
-            (Opcode::FMul, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x * y)),
-            (Opcode::FDiv, Value::F64(x), Value::F64(y)) => Ok(Value::F64(x / y)),
+            (Opcode::FAdd, ConstValue::F64(x), ConstValue::F64(y)) => Ok(ConstValue::F64(x + y)),
+            (Opcode::FSub, ConstValue::F64(x), ConstValue::F64(y)) => Ok(ConstValue::F64(x - y)),
+            (Opcode::FMul, ConstValue::F64(x), ConstValue::F64(y)) => Ok(ConstValue::F64(x * y)),
+            (Opcode::FDiv, ConstValue::F64(x), ConstValue::F64(y)) => Ok(ConstValue::F64(x / y)),
             _ => Err(self.type_error("arithmetic operand type mismatch")),
         }
     }
 
     /// evaluate a comparison opcode on two values, returning the bool result.
-    fn eval_compare(&self, op: Opcode, a: Value, b: Value) -> Result<bool, QalaError> {
+    fn eval_compare(&self, op: Opcode, a: ConstValue, b: ConstValue) -> Result<bool, QalaError> {
         match (op, a, b) {
-            (Opcode::Eq, Value::I64(x), Value::I64(y)) => Ok(x == y),
-            (Opcode::Ne, Value::I64(x), Value::I64(y)) => Ok(x != y),
-            (Opcode::Lt, Value::I64(x), Value::I64(y)) => Ok(x < y),
-            (Opcode::Le, Value::I64(x), Value::I64(y)) => Ok(x <= y),
-            (Opcode::Gt, Value::I64(x), Value::I64(y)) => Ok(x > y),
-            (Opcode::Ge, Value::I64(x), Value::I64(y)) => Ok(x >= y),
-            (Opcode::Eq, Value::Bool(x), Value::Bool(y)) => Ok(x == y),
-            (Opcode::Ne, Value::Bool(x), Value::Bool(y)) => Ok(x != y),
-            (Opcode::Eq, Value::Str(x), Value::Str(y)) => Ok(x == y),
-            (Opcode::Ne, Value::Str(x), Value::Str(y)) => Ok(x != y),
-            (Opcode::FEq, Value::F64(x), Value::F64(y)) => Ok(x == y),
-            (Opcode::FNe, Value::F64(x), Value::F64(y)) => Ok(x != y),
-            (Opcode::FLt, Value::F64(x), Value::F64(y)) => Ok(x < y),
-            (Opcode::FLe, Value::F64(x), Value::F64(y)) => Ok(x <= y),
-            (Opcode::FGt, Value::F64(x), Value::F64(y)) => Ok(x > y),
-            (Opcode::FGe, Value::F64(x), Value::F64(y)) => Ok(x >= y),
+            (Opcode::Eq, ConstValue::I64(x), ConstValue::I64(y)) => Ok(x == y),
+            (Opcode::Ne, ConstValue::I64(x), ConstValue::I64(y)) => Ok(x != y),
+            (Opcode::Lt, ConstValue::I64(x), ConstValue::I64(y)) => Ok(x < y),
+            (Opcode::Le, ConstValue::I64(x), ConstValue::I64(y)) => Ok(x <= y),
+            (Opcode::Gt, ConstValue::I64(x), ConstValue::I64(y)) => Ok(x > y),
+            (Opcode::Ge, ConstValue::I64(x), ConstValue::I64(y)) => Ok(x >= y),
+            (Opcode::Eq, ConstValue::Bool(x), ConstValue::Bool(y)) => Ok(x == y),
+            (Opcode::Ne, ConstValue::Bool(x), ConstValue::Bool(y)) => Ok(x != y),
+            (Opcode::Eq, ConstValue::Str(x), ConstValue::Str(y)) => Ok(x == y),
+            (Opcode::Ne, ConstValue::Str(x), ConstValue::Str(y)) => Ok(x != y),
+            (Opcode::FEq, ConstValue::F64(x), ConstValue::F64(y)) => Ok(x == y),
+            (Opcode::FNe, ConstValue::F64(x), ConstValue::F64(y)) => Ok(x != y),
+            (Opcode::FLt, ConstValue::F64(x), ConstValue::F64(y)) => Ok(x < y),
+            (Opcode::FLe, ConstValue::F64(x), ConstValue::F64(y)) => Ok(x <= y),
+            (Opcode::FGt, ConstValue::F64(x), ConstValue::F64(y)) => Ok(x > y),
+            (Opcode::FGe, ConstValue::F64(x), ConstValue::F64(y)) => Ok(x >= y),
             _ => Err(self.type_error("comparison operand type mismatch")),
         }
     }
@@ -2590,7 +2590,7 @@ mod tests {
     /// expression needs). `compile_block` / `compile_stmt` are still
     /// placeholders in Task 2, so the public entry cannot be used yet;
     /// running `compile_expr` directly is the Task-2 / Task-3 test path.
-    fn compile_expr_of(src: &str, fn_name: &str) -> (Vec<u8>, Vec<Value>) {
+    fn compile_expr_of(src: &str, fn_name: &str) -> (Vec<u8>, Vec<ConstValue>) {
         let typed = typecheck(src);
         let mut cg = Codegen::new(src);
         cg.build_tables(&typed);
@@ -2937,7 +2937,7 @@ mod tests {
     fn compile_expr_int_literal_emits_one_const() {
         let (code, consts) = compile_expr_of("fn f() -> i64 is pure { 42 }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts, vec![Value::I64(42)]);
+        assert_eq!(consts, vec![ConstValue::I64(42)]);
     }
 
     // Test 2: a float literal compiles to one CONST(F64).
@@ -2945,28 +2945,28 @@ mod tests {
     fn compile_expr_float_literal_emits_one_const() {
         let (code, consts) = compile_expr_of("fn f() -> f64 is pure { 3.5 }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts, vec![Value::F64(3.5)]);
+        assert_eq!(consts, vec![ConstValue::F64(3.5)]);
     }
 
     // Test 3: a bool literal compiles to CONST(Bool).
     #[test]
     fn compile_expr_bool_literal_emits_one_const() {
         let (_, consts) = compile_expr_of("fn f() -> bool is pure { true }", "f");
-        assert_eq!(consts, vec![Value::Bool(true)]);
+        assert_eq!(consts, vec![ConstValue::Bool(true)]);
     }
 
     // Test 4: a byte literal compiles to CONST(Byte).
     #[test]
     fn compile_expr_byte_literal_emits_one_const() {
         let (_, consts) = compile_expr_of("fn f() -> byte is pure { b'A' }", "f");
-        assert_eq!(consts, vec![Value::Byte(0x41)]);
+        assert_eq!(consts, vec![ConstValue::Byte(0x41)]);
     }
 
     // Test 5: a string literal compiles to CONST(Str).
     #[test]
     fn compile_expr_str_literal_emits_one_const() {
         let (_, consts) = compile_expr_of("fn f() -> str is pure { \"hi\" }", "f");
-        assert_eq!(consts, vec![Value::Str("hi".to_string())]);
+        assert_eq!(consts, vec![ConstValue::Str("hi".to_string())]);
     }
 
     // Test 6: an identifier bound as a parameter compiles to GET_LOCAL.
@@ -2987,7 +2987,7 @@ mod tests {
         assert_eq!(opcodes(&code), vec![Opcode::Const], "1+2 should fold");
         // the folded pool entry is I64(3); the two source CONSTs were rewound
         // (orphans 0 and 1 remain in the pool, the live CONST points at 2).
-        assert_eq!(consts.last(), Some(&Value::I64(3)));
+        assert_eq!(consts.last(), Some(&ConstValue::I64(3)));
     }
 
     // Test 8: `1 + 2 + 3` folds bottom-up to a single CONST(I64(6)).
@@ -2995,7 +2995,7 @@ mod tests {
     fn compile_expr_binary_chain_folds_bottom_up() {
         let (code, consts) = compile_expr_of("fn f() -> i64 is pure { 1 + 2 + 3 }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::I64(6)));
+        assert_eq!(consts.last(), Some(&ConstValue::I64(6)));
     }
 
     // Test 9: `x + 1` with x a local does NOT fold.
@@ -3048,7 +3048,7 @@ mod tests {
         let (code, consts) = compile_expr_of("fn f() -> f64 is pure { 1e300 * 1e300 }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
         match consts.last() {
-            Some(Value::F64(x)) => assert!(x.is_infinite() && *x > 0.0),
+            Some(ConstValue::F64(x)) => assert!(x.is_infinite() && *x > 0.0),
             other => panic!("expected F64(inf), got {other:?}"),
         }
     }
@@ -3059,7 +3059,7 @@ mod tests {
         let (code, consts) = compile_expr_of("fn f() -> f64 is pure { 0.0 / 0.0 }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
         match consts.last() {
-            Some(Value::F64(x)) => assert!(x.is_nan()),
+            Some(ConstValue::F64(x)) => assert!(x.is_nan()),
             other => panic!("expected F64(NaN), got {other:?}"),
         }
     }
@@ -3069,7 +3069,7 @@ mod tests {
     fn compile_expr_fold_string_concat() {
         let (code, consts) = compile_expr_of("fn f() -> str is pure { \"a\" + \"b\" }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::Str("ab".to_string())));
+        assert_eq!(consts.last(), Some(&ConstValue::Str("ab".to_string())));
     }
 
     // Test 15: `1 < 2` folds to CONST(Bool(true)).
@@ -3077,7 +3077,7 @@ mod tests {
     fn compile_expr_fold_comparison() {
         let (code, consts) = compile_expr_of("fn f() -> bool is pure { 1 < 2 }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::Bool(true)));
+        assert_eq!(consts.last(), Some(&ConstValue::Bool(true)));
     }
 
     // Test 16: `x < 2` with x a local emits GET_LOCAL + CONST + LT.
@@ -3095,7 +3095,7 @@ mod tests {
     fn compile_expr_fold_boolean_and() {
         let (code, consts) = compile_expr_of("fn f() -> bool is pure { true && false }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::Bool(false)));
+        assert_eq!(consts.last(), Some(&ConstValue::Bool(false)));
     }
 
     // Test 18: unary fold -- `!true`, `!false`, `-(42)` all collapse to one
@@ -3108,12 +3108,12 @@ mod tests {
     fn compile_expr_fold_unary() {
         let (code, consts) = compile_expr_of("fn f() -> bool is pure { !true }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::Bool(false)));
+        assert_eq!(consts.last(), Some(&ConstValue::Bool(false)));
         let (_, consts) = compile_expr_of("fn f() -> bool is pure { !false }", "f");
-        assert_eq!(consts.last(), Some(&Value::Bool(true)));
+        assert_eq!(consts.last(), Some(&ConstValue::Bool(true)));
         let (code, consts) = compile_expr_of("fn f() -> i64 is pure { -(42) }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::I64(-42)));
+        assert_eq!(consts.last(), Some(&ConstValue::I64(-42)));
     }
 
     // Test 19: `-(3.5)` folds to CONST(F64(-3.5)).
@@ -3121,7 +3121,7 @@ mod tests {
     fn compile_expr_fold_f64_unary() {
         let (code, consts) = compile_expr_of("fn f() -> f64 is pure { -(3.5) }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::F64(-3.5)));
+        assert_eq!(consts.last(), Some(&ConstValue::F64(-3.5)));
     }
 
     // Test 20: mixed i64/f64 with locals picks ADD vs F_ADD by operand type.
@@ -3285,7 +3285,7 @@ mod tests {
         let (code, consts) =
             compile_expr_of("fn f() -> str is pure { \"hello, world!\" }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&Value::Str("hello, world!".to_string())));
+        assert_eq!(consts.last(), Some(&ConstValue::Str("hello, world!".to_string())));
     }
 
     // Test 7: `?` propagation emits DUP + MATCH_VARIANT + RETURN.
@@ -3897,7 +3897,7 @@ mod tests {
         let main_id = p.fn_names.iter().position(|n| n == "main").unwrap();
         // the comptime result CONST(I64(3)) is in main's constant pool.
         assert!(
-            p.chunks[main_id].constants.contains(&Value::I64(3)),
+            p.chunks[main_id].constants.contains(&ConstValue::I64(3)),
             "comptime of 1 + 2 should embed CONST(I64(3))"
         );
     }
@@ -3907,7 +3907,7 @@ mod tests {
     fn comptime_string_result() {
         let src = "fn f() -> str is pure { comptime { \"hello\" } }";
         let p = compile_ok(src);
-        assert!(p.chunks[0].constants.contains(&Value::Str("hello".to_string())));
+        assert!(p.chunks[0].constants.contains(&ConstValue::Str("hello".to_string())));
     }
 
     // Test 3: `comptime { let x = 2; x * x }` evaluates to I64(4).
@@ -3916,7 +3916,7 @@ mod tests {
         let src = "fn f() -> i64 is pure { comptime { let x = 2\n x * x } }";
         let p = compile_ok(src);
         assert!(
-            p.chunks[0].constants.contains(&Value::I64(4)),
+            p.chunks[0].constants.contains(&ConstValue::I64(4)),
             "comptime block result should be I64(4)"
         );
     }
@@ -3928,8 +3928,8 @@ mod tests {
         let program = Program::new();
         let effects: HashMap<u16, EffectSet> = HashMap::new();
         let mut chunk = Chunk::new();
-        let one = chunk.add_constant(Value::I64(1));
-        let zero = chunk.add_constant(Value::I64(0));
+        let one = chunk.add_constant(ConstValue::I64(1));
+        let zero = chunk.add_constant(ConstValue::I64(0));
         let mut body = asm(&[
             (Opcode::Const, &one.to_le_bytes()),
             (Opcode::Const, &zero.to_le_bytes()),
@@ -4019,16 +4019,16 @@ mod tests {
     // Test 7b: the result-constability predicate and its type-name helper.
     #[test]
     fn comptime_constable_primitive_predicate() {
-        assert!(is_constable_primitive(&Value::I64(1)));
-        assert!(is_constable_primitive(&Value::F64(1.0)));
-        assert!(is_constable_primitive(&Value::Bool(true)));
-        assert!(is_constable_primitive(&Value::Byte(0)));
-        assert!(is_constable_primitive(&Value::Str(String::new())));
-        assert!(is_constable_primitive(&Value::Void));
+        assert!(is_constable_primitive(&ConstValue::I64(1)));
+        assert!(is_constable_primitive(&ConstValue::F64(1.0)));
+        assert!(is_constable_primitive(&ConstValue::Bool(true)));
+        assert!(is_constable_primitive(&ConstValue::Byte(0)));
+        assert!(is_constable_primitive(&ConstValue::Str(String::new())));
+        assert!(is_constable_primitive(&ConstValue::Void));
         // a function reference is NOT constable.
-        assert!(!is_constable_primitive(&Value::Function(0)));
-        assert_eq!(value_type_name(&Value::Function(0)), "fn");
-        assert_eq!(value_type_name(&Value::I64(0)), "i64");
+        assert!(!is_constable_primitive(&ConstValue::Function(0)));
+        assert_eq!(value_type_name(&ConstValue::Function(0)), "fn");
+        assert_eq!(value_type_name(&ConstValue::I64(0)), "i64");
     }
 
     // Test 8: the interpreter uses an explicit Vec<Frame>, so deep recursion
@@ -4068,7 +4068,7 @@ mod tests {
         let f_id = p.fn_names.iter().position(|n| n == "f").unwrap();
         // square(5) == 25 -- embedded as a CONST in f's pool.
         assert!(
-            p.chunks[f_id].constants.contains(&Value::I64(25)),
+            p.chunks[f_id].constants.contains(&ConstValue::I64(25)),
             "comptime square(5) should embed CONST(I64(25))"
         );
         // the disassembly of f shows a CONST 25 and no trace of `square`'s
@@ -4084,7 +4084,7 @@ mod tests {
         let src = "fn f() -> i64 is pure { comptime { 10 * 10 } }";
         let p = compile_ok(src);
         assert_eq!(p.chunks.len(), 1);
-        assert!(p.chunks[0].constants.contains(&Value::I64(100)));
+        assert!(p.chunks[0].constants.contains(&ConstValue::I64(100)));
     }
 
     // `continue` in a `for` loop must reach the increment, not the bounds
