@@ -30,6 +30,10 @@ export default function Controls({
   // it stays true after an edit -- the dirty flag is the separate stale
   // signal -- so the needs-compile column of the matrix is covered.
   programCompiled,
+  // true when the program has run to its end. gates Step and Run off so
+  // a manual Step past the last instruction does not fault the VM;
+  // re-running a finished program requires a Reset first.
+  finished,
   // the run-loop speed stop and its setter. the slider reads and writes
   // them; a mid-run change applies on the next tick (the hook).
   speed,
@@ -46,6 +50,7 @@ export default function Controls({
   running: boolean;
   dirty: boolean;
   programCompiled: boolean;
+  finished: boolean;
   speed: RunSpeed;
   setSpeed: (next: RunSpeed) => void;
   onRun: () => void;
@@ -55,15 +60,21 @@ export default function Controls({
 }) {
   const ready = status === "ready";
 
-  // the disabled matrix (UI-SPEC surface 6). Run/Pause: disabled only
-  // when WASM is not ready or there is no program, the loop is not
-  // running, AND the source is not dirty. a dirty source keeps Run
-  // enabled -- pressing it compiles then runs, the needs-compile column
-  // of the matrix. Step: enabled only with a compiled, non-dirty program
-  // and the loop stopped. Reset: enabled once compiled, including while
-  // the loop runs. the slider: enabled whenever a program is compiled.
-  const runDisabled = !ready || (!programCompiled && !running && !dirty);
-  const stepDisabled = !ready || !programCompiled || running || dirty;
+  // the disabled matrix (UI-SPEC surface 6). Run/Pause: disabled when
+  // WASM is not ready, when there is no program with the loop stopped
+  // and the source clean, or when the program has finished -- a dirty
+  // source keeps Run enabled (it compiles then runs, the needs-compile
+  // column), but a finished program needs a Reset before it can re-run.
+  // Step: enabled only with a compiled, non-dirty, unfinished program
+  // and the loop stopped -- stepping a finished program faults the empty
+  // frame stack. Reset: enabled once compiled, including while the loop
+  // runs and after the program finishes -- it is the way back to a
+  // re-runnable state. the slider: enabled whenever a program is
+  // compiled.
+  const runDisabled =
+    !ready || finished || (!programCompiled && !running && !dirty);
+  const stepDisabled =
+    !ready || !programCompiled || running || dirty || finished;
   const resetDisabled = !ready || (!programCompiled && !running);
   const speedDisabled = !ready || !programCompiled;
 
