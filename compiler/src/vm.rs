@@ -48,12 +48,20 @@ use crate::value::Value;
 /// rather than a host stack overflow. 1024 frames is generous for a teaching
 /// language.
 ///
-/// `allow(dead_code)`: the cap is defined here with the value-stack and heap
-/// caps as one locked set, but it is enforced in the `CALL` opcode handler,
-/// which a later commit adds. keeping the constant now makes the cap set
-/// self-documenting and gives the call handler a single source of truth.
-#[allow(dead_code)]
+/// enforced in [`Vm::op_call`] and [`Vm::call_function_value`] -- both check
+/// `frames.len() >= MAX_FRAMES` before pushing a frame.
 const MAX_FRAMES: usize = 1024;
+
+/// the first function id reserved for the stdlib. codegen assigns user
+/// functions dense ids `0..N` (indexes into [`Program::chunks`]) and stdlib
+/// functions ids `STDLIB_FN_BASE + i` -- the two id spaces never collide.
+///
+/// the [`Vm::op_call`] handler branches on this threshold: a `fn_id` at or
+/// above it is a native stdlib call routed to [`Vm::call_stdlib`]; below it is
+/// a user function with a chunk in `Program.chunks`. the value must match
+/// codegen's `STDLIB_FN_BASE` (see `codegen.rs`); changing one without the
+/// other corrupts every stdlib call site.
+const STDLIB_FN_BASE: u16 = 40_000;
 
 /// the value-stack depth cap. [`Vm::push`] errors past it with "value stack
 /// overflow" so a runaway program cannot exhaust WASM memory through the value
@@ -624,11 +632,21 @@ impl Vm {
                     self.do_jump(next, offset)?;
                 }
             }
-            // ---- not implemented by this plan (calls, heap construction,
-            // access, strings, match) -- a later plan replaces these stubs ----
-            Opcode::Call
-            | Opcode::Return
-            | Opcode::MakeArray
+            // ---- calls ----
+            Opcode::Call => {
+                let fn_id = self.read_operand_u16(opcode_pos)?;
+                let argc = self.read_operand_u8(opcode_pos)?;
+                self.op_call(fn_id, argc)?;
+            }
+            Opcode::Return => {
+                // a RETURN from the last frame ends the program.
+                if self.op_return()? {
+                    return Ok(StepOutcome::Halted);
+                }
+            }
+            // ---- not implemented by this plan (heap construction, access,
+            // strings, match) -- a later plan replaces these stubs ----
+            Opcode::MakeArray
             | Opcode::MakeTuple
             | Opcode::MakeStruct
             | Opcode::MakeEnumVariant
@@ -661,6 +679,24 @@ impl Vm {
             return Err(self.runtime_err("truncated operand"));
         }
         Ok(chunk.read_u16(off))
+    }
+
+    /// read the trailing `u8` operand of a three-byte instruction (the `argc`
+    /// of [`Opcode::Call`], the `payload_count` of [`Opcode::MakeEnumVariant`])
+    /// whose opcode byte is at `opcode_pos`.
+    ///
+    /// the byte sits at `opcode_pos + 3` -- after the `u16` that precedes it.
+    /// [`Vm::dispatch_one`] has already bounds-checked the whole three-byte
+    /// operand sequence, but this re-checks defensively so the never-panic
+    /// guarantee stays local to this function.
+    fn read_operand_u8(&self, opcode_pos: usize) -> Result<u8, QalaError> {
+        let chunk = self.chunk()?;
+        let off = opcode_pos + 3;
+        chunk
+            .code
+            .get(off)
+            .copied()
+            .ok_or_else(|| self.runtime_err("truncated operand"))
     }
 
     /// the constant-pool entry at `idx` converted to a runtime [`Value`] and
@@ -921,6 +957,193 @@ impl Vm {
         }
         self.frame_mut()?.ip = target as usize;
         Ok(())
+    }
+
+    // ---- the call machinery -----------------------------------------------
+
+    /// execute a [`Opcode::Call`]: dispatch a user function or seam to the
+    /// stdlib.
+    ///
+    /// `fn_id` is the `u16` from the opcode; a `fn_id >= STDLIB_FN_BASE`
+    /// (40000) is a native stdlib call, handed to [`Vm::call_stdlib`] -- a seam
+    /// plan 05-05 fills in. otherwise `fn_id` indexes [`Program::chunks`]: the
+    /// frame-depth cap is checked, then a fresh [`CallFrame`] is pushed for the
+    /// callee. the `argc` argument values are already on the value stack (the
+    /// topmost is the rightmost argument); they are moved off the stack into
+    /// the new frame's `locals` so `locals[0]` is the leftmost argument --
+    /// matching how `GET_LOCAL` reads `frame.locals` and how codegen numbers
+    /// parameter slots `0..argc`.
+    ///
+    /// the new frame's `base` is the value-stack length AFTER the arguments are
+    /// removed -- the watermark `RETURN` truncates the stack back to. the
+    /// caller frame's `ip` already sits at the instruction after the CALL
+    /// (the ip-advance-first discipline), so `RETURN` resumes it correctly.
+    fn op_call(&mut self, fn_id: u16, argc: u8) -> Result<(), QalaError> {
+        // a stdlib fn-id: hand off to the native-dispatch seam.
+        if fn_id >= STDLIB_FN_BASE {
+            return self.call_stdlib(fn_id, argc);
+        }
+        // a user function: enforce the frame-depth cap before pushing. the VM
+        // is a `while` loop, so a Qala recursion grows `frames`, not the host
+        // Rust stack -- this cap turns unbounded recursion into a clean
+        // `Runtime` error rather than a host stack overflow.
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(self.runtime_err("stack overflow"));
+        }
+        // resolve the callee chunk, fallibly.
+        let chunk_idx = fn_id as usize;
+        if self.program.chunks.get(chunk_idx).is_none() {
+            return Err(self.runtime_err(&format!("call to missing function {fn_id}")));
+        }
+        // move the argc arguments off the value stack into the new frame's
+        // locals. they sit at the top of the stack, the rightmost on top; the
+        // split keeps them in stack order so locals[0] is the leftmost arg.
+        let argc = argc as usize;
+        if self.stack.len() < argc {
+            return Err(self.runtime_err("stack underflow building a call frame"));
+        }
+        let base = self.stack.len() - argc;
+        let locals = self.stack.split_off(base);
+        self.frames.push(CallFrame {
+            chunk_idx,
+            ip: 0,
+            base,
+            locals,
+        });
+        Ok(())
+    }
+
+    /// the stdlib-dispatch seam.
+    ///
+    /// a `CALL` whose `fn_id >= STDLIB_FN_BASE` reaches here. plan 05-05
+    /// replaces this body with the real native dispatch (`print` / `println` /
+    /// `len` / `push` / `pop` / `sqrt` / `abs` / `assert` / `type_of` / `map` /
+    /// `filter` / `reduce` / `open` / `close` / `read_all`). until then it is a
+    /// clean `Runtime` error so the crate compiles and a program that reaches a
+    /// stdlib call fails loudly rather than silently misbehaving.
+    ///
+    /// `allow(unused_variables)` on `argc`: 05-05's body pops `argc` values;
+    /// this stub does not, but the parameter is part of the locked seam
+    /// signature `call_stdlib(fn_id: u16, argc: u8)` 05-05 is written against.
+    #[allow(unused_variables)]
+    fn call_stdlib(&mut self, fn_id: u16, argc: u8) -> Result<(), QalaError> {
+        Err(self.runtime_err(&format!(
+            "stdlib function {fn_id} not yet implemented"
+        )))
+    }
+
+    /// execute a [`Opcode::Return`]: pop the current frame and pass the result
+    /// back.
+    ///
+    /// the value on top of the stack is the call's result. the current
+    /// [`CallFrame`] is popped and the value stack truncated back to that
+    /// frame's `base`, discarding the callee's transient stack. when no frame
+    /// remains the program is finished: returns `Ok(true)` so the caller halts
+    /// the VM. otherwise the result value is pushed onto the (now caller's)
+    /// stack and `Ok(false)` is returned.
+    ///
+    /// codegen emits an explicit `RETURN` at every function exit, including
+    /// `main`'s -- a `RETURN` from the last frame is therefore the normal end
+    /// of a program.
+    fn op_return(&mut self) -> Result<bool, QalaError> {
+        let result = self.pop()?;
+        let frame = self
+            .frames
+            .pop()
+            .ok_or_else(|| self.runtime_err("return with no active call frame"))?;
+        // drop the callee's transient value stack back to its base.
+        if frame.base <= self.stack.len() {
+            self.stack.truncate(frame.base);
+        }
+        if self.frames.is_empty() {
+            // the last frame returned -- the program is done. leave the result
+            // on the stack so a test (or the REPL) can inspect a program's
+            // final value.
+            self.stack.push(result);
+            return Ok(true);
+        }
+        // hand the result back to the caller.
+        self.push(result)?;
+        Ok(false)
+    }
+
+    /// call a function `Value` from native (stdlib) code and run it to its
+    /// `RETURN`, returning the result value.
+    ///
+    /// this is the re-entry point the higher-order stdlib functions
+    /// (`map` / `filter` / `reduce` in 05-05) use to invoke a user callback.
+    /// `callable` must be a [`Value::function`] -- the callbacks those stdlib
+    /// functions receive are user functions; a non-function (or a stdlib fn-id
+    /// callable, unsupported in v1) is a `Runtime` error.
+    ///
+    /// the mechanism: record the current frame depth, push the `args` onto the
+    /// value stack, push a [`CallFrame`] for the callee (frame-depth-capped,
+    /// exactly as [`Vm::op_call`] does), then loop [`Vm::dispatch_one`] until
+    /// the frame stack drops back to the recorded depth -- the callee's
+    /// `RETURN` popped its frame. the callee's result is then on top of the
+    /// stack. every loop local stays in a Rust local, so a callback that
+    /// itself calls `call_function_value` is fully re-entrant.
+    ///
+    /// `allow(dead_code)`: the higher-order stdlib functions a later plan adds
+    /// are the only callers; the helper is part of the locked VM surface and
+    /// is declared now so 05-05 has the re-entry point ready.
+    #[allow(dead_code)]
+    fn call_function_value(
+        &mut self,
+        callable: Value,
+        args: &[Value],
+    ) -> Result<Value, QalaError> {
+        let fn_id = callable
+            .as_function()
+            .ok_or_else(|| self.runtime_err("value is not callable"))?;
+        // a stdlib fn-id as a callback is not supported in v1: the callbacks
+        // map/filter/reduce receive are user functions.
+        if fn_id >= STDLIB_FN_BASE {
+            return Err(self.runtime_err(
+                "a stdlib function cannot be used as a callback in v1",
+            ));
+        }
+        let chunk_idx = fn_id as usize;
+        if self.program.chunks.get(chunk_idx).is_none() {
+            return Err(self.runtime_err(&format!("call to missing function {fn_id}")));
+        }
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(self.runtime_err("stack overflow"));
+        }
+        // the depth the callee's RETURN must drop the frame stack back to.
+        let depth = self.frames.len();
+        // push the arguments, then build the callee frame -- the args become
+        // the frame's locals, locals[0] the first argument.
+        for arg in args {
+            self.push(*arg)?;
+        }
+        let base = self.stack.len() - args.len();
+        let locals = self.stack.split_off(base);
+        self.frames.push(CallFrame {
+            chunk_idx,
+            ip: 0,
+            base,
+            locals,
+        });
+        // run a nested dispatch loop until the callee's frame is popped. a
+        // Halted outcome before the depth drops back means the callee fell off
+        // the end without a RETURN -- a malformed-bytecode Runtime error.
+        loop {
+            if self.frames.len() == depth {
+                break;
+            }
+            match self.dispatch_one()? {
+                StepOutcome::Ran => {}
+                StepOutcome::Halted => {
+                    if self.frames.len() == depth {
+                        break;
+                    }
+                    return Err(self.runtime_err("callback halted without returning"));
+                }
+            }
+        }
+        // the callee's RETURN pushed its result onto the stack.
+        self.pop()
     }
 
     /// run the program from the current state to `Halt` or the first runtime
@@ -1942,6 +2165,240 @@ mod tests {
             }
             Err(other) => panic!("expected a Runtime type error, got {other:?}"),
             Ok(_) => panic!("expected a Runtime type error, the program ran clean"),
+        }
+    }
+
+    // ---- CALL / RETURN / the frame-depth cap ----
+
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use crate::typechecker::check_program;
+
+    /// lex + parse + typecheck + compile a Qala source string into a runnable
+    /// `Program`. panics on any pipeline error -- the compiled-program tests
+    /// below all use known-good source.
+    fn compile_qala(src: &str) -> Program {
+        let tokens = Lexer::tokenize(src).expect("lex failed");
+        let ast = Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        crate::codegen::compile_program(&typed, src)
+            .unwrap_or_else(|e| panic!("codegen errors: {e:?}"))
+    }
+
+    /// the `i64` a finished program left on top of its value stack -- a
+    /// program's `RETURN` from `main` leaves the result there.
+    fn program_result_i64(vm: &Vm) -> i64 {
+        let top = *vm.stack.last().expect("the program left a result value");
+        let slot = top.as_pointer().expect("the result is a heap pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Int(n)) => *n,
+            _ => panic!("the result pointer does not reach a heap Int"),
+        }
+    }
+
+    #[test]
+    fn call_return_a_callee_returns_a_value_onto_the_callers_stack() {
+        // a hand-built two-chunk program: main CALLs chunk 1, which returns the
+        // i64 7; after the CALL main's stack top is that 7.
+        //   chunk 0 (main): CALL fn 1 argc 0 ; RETURN
+        //   chunk 1 (callee): CONST 7 ; RETURN
+        let mut main = Chunk::new();
+        main.write_op(Opcode::Call, 1);
+        main.write_u16(1, 1); // fn-id 1
+        main.code.push(0); // argc 0
+        main.source_lines.push(1);
+        main.write_op(Opcode::Return, 1);
+
+        let mut callee = Chunk::new();
+        emit_const(&mut callee, ConstValue::I64(7), 1);
+        callee.write_op(Opcode::Return, 1);
+
+        let mut p = Program::new();
+        p.chunks.push(main);
+        p.chunks.push(callee);
+        p.fn_names.push("main".to_string());
+        p.fn_names.push("callee".to_string());
+        p.main_index = 0;
+
+        let mut vm = Vm::new(p, "x".to_string());
+        vm.run().expect("the call/return program runs clean");
+        // main's RETURN re-pushed the callee's result; it is the program value.
+        assert_eq!(program_result_i64(&vm), 7);
+    }
+
+    #[test]
+    fn call_passes_arguments_into_the_callee_frames_local_slots() {
+        // chunk 1 takes one argument and returns it via GET_LOCAL 0; main
+        // passes 42 and the program result is 42 -- the arg reached slot 0.
+        //   chunk 0 (main): CONST 42 ; CALL fn 1 argc 1 ; RETURN
+        //   chunk 1 (id):   GET_LOCAL 0 ; RETURN
+        let mut main = Chunk::new();
+        emit_const(&mut main, ConstValue::I64(42), 1);
+        main.write_op(Opcode::Call, 1);
+        main.write_u16(1, 1);
+        main.code.push(1); // argc 1
+        main.source_lines.push(1);
+        main.write_op(Opcode::Return, 1);
+
+        let mut id = Chunk::new();
+        id.write_op(Opcode::GetLocal, 1);
+        id.write_u16(0, 1);
+        id.write_op(Opcode::Return, 1);
+
+        let mut p = Program::new();
+        p.chunks.push(main);
+        p.chunks.push(id);
+        p.fn_names.push("main".to_string());
+        p.fn_names.push("id".to_string());
+        p.main_index = 0;
+
+        let mut vm = Vm::new(p, "x".to_string());
+        vm.run().expect("run");
+        assert_eq!(program_result_i64(&vm), 42, "the argument reached local 0");
+    }
+
+    #[test]
+    fn call_to_a_missing_function_is_a_runtime_error_not_a_panic() {
+        // CALL fn 9 with only one chunk -- fn-id 9 has no chunk.
+        let mut main = Chunk::new();
+        main.write_op(Opcode::Call, 1);
+        main.write_u16(9, 1);
+        main.code.push(0);
+        main.source_lines.push(1);
+        main.write_op(Opcode::Return, 1);
+        // run_chunk's Ok arm is a Vm, which has no Debug -- report in words.
+        match run_chunk(main, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("missing function"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime missing-function error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime missing-function error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn call_to_a_stdlib_fn_id_seams_to_the_unimplemented_stdlib_stub() {
+        // a CALL with fn-id >= STDLIB_FN_BASE routes to call_stdlib, which is
+        // a clean Runtime stub until 05-05 fills it in.
+        let mut main = Chunk::new();
+        main.write_op(Opcode::Call, 1);
+        main.write_u16(STDLIB_FN_BASE, 1);
+        main.code.push(0);
+        main.source_lines.push(1);
+        main.write_op(Opcode::Return, 1);
+        match run_chunk(main, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(
+                    message.contains("stdlib function") && message.contains("not yet implemented"),
+                    "got: {message}"
+                );
+            }
+            Err(other) => panic!("expected a Runtime stdlib-stub error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime stdlib-stub error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn fibonacci_recursion_computes_the_correct_numeric_result() {
+        // the success-criterion smoke test: a recursive fib compiled from Qala
+        // source. fib(10) == 55.
+        let src = "\
+fn fib(n: i64) -> i64 is pure {
+    if n <= 1 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() -> i64 is pure {
+    return fib(10)
+}
+";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the fibonacci program runs clean");
+        assert_eq!(program_result_i64(&vm), 55, "fib(10) must be 55");
+    }
+
+    #[test]
+    fn deep_recursion_is_a_clean_stack_overflow_runtime_error_with_no_host_panic() {
+        // the WASM-safety guarantee: an unbounded recursion hits MAX_FRAMES and
+        // becomes a clean Runtime "stack overflow" -- NOT a host stack overflow
+        // / abort. the recursion grows `frames`, not the host Rust stack,
+        // because the VM is a `while` loop.
+        let src = "\
+fn r(n: i64) -> i64 is pure {
+    return r(n + 1)
+}
+
+fn main() -> i64 is pure {
+    return r(0)
+}
+";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(
+                    message.contains("stack overflow"),
+                    "unbounded recursion must report a stack overflow, got: {message}"
+                );
+            }
+            Err(other) => panic!("expected a Runtime stack-overflow error, got {other:?}"),
+            Ok(_) => panic!("unbounded recursion must error, the program ran clean"),
+        }
+        // reaching this line proves the test process did not panic / abort:
+        // the recursion was caught by the frame cap, the host stack stayed flat.
+    }
+
+    #[test]
+    fn call_function_value_runs_a_user_callback_and_returns_its_result() {
+        // call_function_value is the stdlib's re-entry point. chunk 1 doubles
+        // its argument; calling it via a function Value with arg 21 yields 42.
+        //   chunk 0 (main): RETURN  (a placeholder entry chunk)
+        //   chunk 1 (double): GET_LOCAL 0 ; GET_LOCAL 0 ; ADD ; RETURN
+        let mut main = Chunk::new();
+        emit_const(&mut main, ConstValue::I64(0), 1);
+        main.write_op(Opcode::Return, 1);
+
+        let mut double = Chunk::new();
+        double.write_op(Opcode::GetLocal, 1);
+        double.write_u16(0, 1);
+        double.write_op(Opcode::GetLocal, 1);
+        double.write_u16(0, 1);
+        double.write_op(Opcode::Add, 1);
+        double.write_op(Opcode::Return, 1);
+
+        let mut p = Program::new();
+        p.chunks.push(main);
+        p.chunks.push(double);
+        p.fn_names.push("main".to_string());
+        p.fn_names.push("double".to_string());
+        p.main_index = 0;
+
+        let mut vm = Vm::new(p, "x".to_string());
+        // build the argument 21 as a heap Int, then re-enter chunk 1.
+        let arg_slot = vm.heap.alloc(HeapObject::Int(21)).expect("alloc arg");
+        let result = vm
+            .call_function_value(Value::function(1), &[Value::pointer(arg_slot)])
+            .expect("the callback runs and returns");
+        let result_slot = result.as_pointer().expect("a heap-Int result");
+        assert!(
+            vm.heap.get(result_slot) == Some(&HeapObject::Int(42)),
+            "double(21) must be 42"
+        );
+    }
+
+    #[test]
+    fn call_function_value_of_a_non_function_is_a_runtime_error() {
+        // a bool is not callable.
+        let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
+        // the Ok arm is a Value, which has no Debug -- report in words.
+        match vm.call_function_value(Value::bool(true), &[]) {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("not callable"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime not-callable error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime not-callable error, got a value"),
         }
     }
 }
