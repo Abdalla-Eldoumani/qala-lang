@@ -89,9 +89,14 @@ pub enum HeapObject {
     /// a 64-bit signed integer. `i64` has no NaN-box tag, so every integer
     /// runtime value is one of these, reached through a pointer.
     Int(i64),
-    /// a dynamic array of values, built by `MAKE_ARRAY` (and by `MAKE_TUPLE` --
-    /// a tuple is a fixed-shape array at runtime). `push` / `pop` mutate it.
+    /// a dynamic array of values, built by `MAKE_ARRAY`. `push` / `pop` mutate
+    /// it; `INDEX` reads an element; `LEN` reports the element count.
     Array(Vec<Value>),
+    /// a fixed-shape tuple of values, built by `MAKE_TUPLE`. distinct from
+    /// [`HeapObject::Array`] so the stdlib's `type_of` (plan 05-05) can render
+    /// a tuple's structural type `(i64, str)` rather than an array type. `INDEX`
+    /// reads an element exactly as it does for an array.
+    Tuple(Vec<Value>),
     /// an owned string, built by a `CONST` of a `ConstValue::Str` or by
     /// `CONCAT_N` / `TO_STR`.
     Str(String),
@@ -644,18 +649,34 @@ impl Vm {
                     return Ok(StepOutcome::Halted);
                 }
             }
-            // ---- not implemented by this plan (heap construction, access,
-            // strings, match) -- a later plan replaces these stubs ----
-            Opcode::MakeArray
-            | Opcode::MakeTuple
-            | Opcode::MakeStruct
-            | Opcode::MakeEnumVariant
-            | Opcode::Index
-            | Opcode::Field
-            | Opcode::Len
-            | Opcode::ToStr
-            | Opcode::ConcatN
-            | Opcode::MatchVariant => {
+            // ---- heap construction ----
+            Opcode::MakeArray => {
+                let count = self.read_operand_u16(opcode_pos)?;
+                self.op_make_collection(count, false)?;
+            }
+            Opcode::MakeTuple => {
+                let count = self.read_operand_u16(opcode_pos)?;
+                self.op_make_collection(count, true)?;
+            }
+            Opcode::MakeStruct => {
+                let struct_id = self.read_operand_u16(opcode_pos)?;
+                self.op_make_struct(struct_id)?;
+            }
+            Opcode::MakeEnumVariant => {
+                let variant_id = self.read_operand_u16(opcode_pos)?;
+                let payload_count = self.read_operand_u8(opcode_pos)?;
+                self.op_make_enum_variant(variant_id, payload_count)?;
+            }
+            // ---- access ----
+            Opcode::Index => self.op_index()?,
+            Opcode::Field => {
+                let field_index = self.read_operand_u16(opcode_pos)?;
+                self.op_field(field_index)?;
+            }
+            Opcode::Len => self.op_len()?,
+            // ---- not implemented by this plan (strings, match) -- a later
+            // plan replaces these stubs ----
+            Opcode::ToStr | Opcode::ConcatN | Opcode::MatchVariant => {
                 return Err(self.runtime_err(&format!("opcode {op:?} not yet implemented")));
             }
             // ---- sentinel ----
@@ -1144,6 +1165,178 @@ impl Vm {
         }
         // the callee's RETURN pushed its result onto the stack.
         self.pop()
+    }
+
+    // ---- heap construction + access ---------------------------------------
+
+    /// pop `n` values off the value stack, returned with the deepest popped
+    /// value first.
+    ///
+    /// the `MAKE_*` opcodes push their elements in order, the last on top; a
+    /// plain pop loop would yield them reversed, so this restores source order:
+    /// `result[0]` is the first element / field / payload. a stack with fewer
+    /// than `n` values is a [`QalaError::Runtime`] "stack underflow", never a
+    /// panic.
+    fn pop_n(&mut self, n: usize) -> Result<Vec<Value>, QalaError> {
+        if self.stack.len() < n {
+            return Err(self.runtime_err("stack underflow building a heap object"));
+        }
+        let at = self.stack.len() - n;
+        Ok(self.stack.split_off(at))
+    }
+
+    /// build a [`HeapObject::Array`] (or [`HeapObject::Tuple`] when `tuple`)
+    /// from the top `count` stack values and push a pointer to it.
+    ///
+    /// the values come off the stack in source order via [`Vm::pop_n`], so
+    /// element 0 is the first. a heap exhaustion is a `Runtime` error. `MAKE_*`
+    /// shares this one body because an array and a tuple differ only in which
+    /// heap variant labels them -- the distinction lets 05-05's `type_of` tell
+    /// a tuple from an array.
+    fn op_make_collection(&mut self, count: u16, tuple: bool) -> Result<(), QalaError> {
+        let elements = self.pop_n(count as usize)?;
+        let object = if tuple {
+            HeapObject::Tuple(elements)
+        } else {
+            HeapObject::Array(elements)
+        };
+        let slot = self
+            .heap
+            .alloc(object)
+            .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+        self.push(Value::pointer(slot))
+    }
+
+    /// build a [`HeapObject::Struct`] for the struct whose id is `struct_id`
+    /// and push a pointer to it.
+    ///
+    /// `struct_id` indexes [`Program::structs`]; the [`crate::chunk::StructInfo`]
+    /// there gives the declared `name` (stored as the heap struct's
+    /// `type_name`, so `type_of` returns the declared name) and the
+    /// `field_count` (how many values to pop). the field values come off the
+    /// stack in declaration order. a bad struct id or a heap exhaustion is a
+    /// `Runtime` error.
+    fn op_make_struct(&mut self, struct_id: u16) -> Result<(), QalaError> {
+        let info = self
+            .program
+            .structs
+            .get(struct_id as usize)
+            .ok_or_else(|| self.runtime_err(&format!("bad struct id {struct_id}")))?;
+        let type_name = info.name.clone();
+        let field_count = info.field_count as usize;
+        let fields = self.pop_n(field_count)?;
+        let slot = self
+            .heap
+            .alloc(HeapObject::Struct { type_name, fields })
+            .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+        self.push(Value::pointer(slot))
+    }
+
+    /// build a [`HeapObject::EnumVariant`] for the variant whose id is
+    /// `variant_id` and push a pointer to it.
+    ///
+    /// `variant_id` indexes [`Program::enum_variant_names`], a table of
+    /// `(enum_name, variant_name)` pairs; the heap object carries both names so
+    /// `type_of` and the value-to-string routine can render it, and so
+    /// `MATCH_VARIANT` can compare a scrutinee against an operand variant id by
+    /// resolving that id to the same name pair. `payload_count` values are
+    /// popped in declaration order. a bad variant id or a heap exhaustion is a
+    /// `Runtime` error.
+    fn op_make_enum_variant(
+        &mut self,
+        variant_id: u16,
+        payload_count: u8,
+    ) -> Result<(), QalaError> {
+        let (enum_name, variant_name) = self
+            .program
+            .enum_variant_names
+            .get(variant_id as usize)
+            .ok_or_else(|| self.runtime_err(&format!("bad variant id {variant_id}")))?;
+        let type_name = enum_name.clone();
+        let variant = variant_name.clone();
+        let payload = self.pop_n(payload_count as usize)?;
+        let slot = self
+            .heap
+            .alloc(HeapObject::EnumVariant {
+                type_name,
+                variant,
+                payload,
+            })
+            .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+        self.push(Value::pointer(slot))
+    }
+
+    /// execute [`Opcode::Index`]: pop an `i64` index then an array/tuple
+    /// pointer, push the element at that index.
+    ///
+    /// the index is the topmost value, the collection below it. the pointer
+    /// must reach a [`HeapObject::Array`] or [`HeapObject::Tuple`]; anything
+    /// else is a `Runtime` error. a negative index, or one at or past the
+    /// length, is a `Runtime` "array index N out of bounds for length L" -- the
+    /// message names both the index and the length, and the error span covers
+    /// the `INDEX` opcode's source line, never an out-of-bounds heap read.
+    fn op_index(&mut self) -> Result<(), QalaError> {
+        let index = self.pop_i64()?;
+        let collection = self.pop()?;
+        let slot = collection
+            .as_pointer()
+            .ok_or_else(|| self.runtime_err("expected an array"))?;
+        let element = match self.heap.get(slot) {
+            Some(HeapObject::Array(items)) | Some(HeapObject::Tuple(items)) => {
+                let len = items.len();
+                if index < 0 || index as usize >= len {
+                    return Err(self.runtime_err(&format!(
+                        "array index {index} out of bounds for length {len}"
+                    )));
+                }
+                items[index as usize]
+            }
+            _ => return Err(self.runtime_err("expected an array")),
+        };
+        self.push(element)
+    }
+
+    /// execute [`Opcode::Field`]: pop a struct pointer, push the field at
+    /// `field_index`.
+    ///
+    /// `field_index` is the field's stable position in the struct's
+    /// declaration order -- codegen's `struct_field_index`. the pointer must
+    /// reach a [`HeapObject::Struct`]; a non-struct, or an index past the
+    /// field count, is a `Runtime` error.
+    fn op_field(&mut self, field_index: u16) -> Result<(), QalaError> {
+        let target = self.pop()?;
+        let slot = target
+            .as_pointer()
+            .ok_or_else(|| self.runtime_err("expected a struct"))?;
+        let field = match self.heap.get(slot) {
+            Some(HeapObject::Struct { fields, .. }) => fields
+                .get(field_index as usize)
+                .copied()
+                .ok_or_else(|| self.runtime_err(&format!("bad field index {field_index}")))?,
+            _ => return Err(self.runtime_err("expected a struct")),
+        };
+        self.push(field)
+    }
+
+    /// execute [`Opcode::Len`]: pop an array, tuple, or string, push its length
+    /// as a heap `i64`.
+    ///
+    /// an array's / tuple's length is its element count. a string's length is
+    /// its count of Unicode scalar values (`chars().count()`) -- the
+    /// user-facing "number of characters", not the UTF-8 byte count, matching
+    /// what a teaching language's `len` of a string is expected to mean. any
+    /// other value is a `Runtime` error.
+    fn op_len(&mut self) -> Result<(), QalaError> {
+        let value = self.pop()?;
+        let slot = value
+            .as_pointer()
+            .ok_or_else(|| self.runtime_err("expected an array or string"))?;
+        let len = match self.heap.get(slot) {
+            Some(HeapObject::Array(items)) | Some(HeapObject::Tuple(items)) => items.len(),
+            Some(HeapObject::Str(s)) => s.chars().count(),
+            _ => return Err(self.runtime_err("expected an array or string")),
+        };
+        self.push_i64(len as i64)
     }
 
     /// run the program from the current state to `Halt` or the first runtime
@@ -1699,11 +1892,12 @@ mod tests {
 
     #[test]
     fn malformed_an_unimplemented_opcode_is_a_clean_runtime_stub_not_a_panic() {
-        // MAKE_ARRAY is one of the opcodes a later plan implements; until then
-        // it must be a clean Runtime "not yet implemented" error, not a panic.
+        // TO_STR is still stubbed at this point in the build (Task 3 of this
+        // plan fills it in); until then it must be a clean Runtime "not yet
+        // implemented" error, not a panic. the not-implemented dispatch arm
+        // returns before any stack access, so an empty stack is fine here.
         let mut chunk = Chunk::new();
-        chunk.write_op(Opcode::MakeArray, 1);
-        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::ToStr, 1);
         chunk.write_op(Opcode::Halt, 1);
         let mut vm = Vm::new(program_with(chunk), "x".to_string());
         match vm.run() {
@@ -2399,6 +2593,256 @@ fn main() -> i64 is pure {
             }
             Err(other) => panic!("expected a Runtime not-callable error, got {other:?}"),
             Ok(_) => panic!("expected a Runtime not-callable error, got a value"),
+        }
+    }
+
+    // ---- MAKE_ARRAY / MAKE_TUPLE / MAKE_STRUCT / MAKE_ENUM_VARIANT /
+    // INDEX / FIELD / LEN ----
+
+    #[test]
+    fn make_array_builds_a_heap_array_then_index_and_len_read_it() {
+        // CONST 10 ; CONST 20 ; CONST 30 ; MAKE_ARRAY 3 ; ...
+        // then INDEX 1 -> 20, and (on a second build) LEN -> 3.
+        // element order: MAKE_ARRAY pops in reverse, so the array is [10,20,30].
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(10), 1);
+        emit_const(&mut chunk, ConstValue::I64(20), 1);
+        emit_const(&mut chunk, ConstValue::I64(30), 1);
+        chunk.write_op(Opcode::MakeArray, 1);
+        chunk.write_u16(3, 1);
+        // INDEX needs the array then the index on top: DUP the array, push 1.
+        chunk.write_op(Opcode::Dup, 1);
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        chunk.write_op(Opcode::Index, 1);
+        // stack now: [array_ptr, 20]. LEN the array under the 20 is awkward;
+        // instead just assert the INDEX result and the array's heap shape.
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("make_array");
+        // top is the INDEX result -- element 1 is 20.
+        assert_eq!(top_i64(&vm), 20, "INDEX 1 of [10,20,30] is 20");
+        // under it, the array pointer reaches a 3-element heap Array.
+        let array_ptr = vm.stack[vm.stack.len() - 2];
+        let slot = array_ptr.as_pointer().expect("an array pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Array(items)) => assert_eq!(items.len(), 3),
+            _ => panic!("MAKE_ARRAY must build a heap Array"),
+        }
+    }
+
+    #[test]
+    fn len_of_a_built_array_pushes_the_element_count() {
+        // CONST 1 ; CONST 2 ; MAKE_ARRAY 2 ; LEN ; HALT -> 2.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        emit_const(&mut chunk, ConstValue::I64(2), 1);
+        chunk.write_op(Opcode::MakeArray, 1);
+        chunk.write_u16(2, 1);
+        chunk.write_op(Opcode::Len, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("len");
+        assert_eq!(top_i64(&vm), 2, "LEN of a 2-element array is 2");
+    }
+
+    #[test]
+    fn len_of_a_string_counts_unicode_scalar_values() {
+        // LEN of a 5-char string is 5.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Str("hello".to_string()), 1);
+        chunk.write_op(Opcode::Len, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("len str");
+        assert_eq!(top_i64(&vm), 5, "LEN of \"hello\" is 5");
+    }
+
+    #[test]
+    fn make_tuple_builds_a_distinct_heap_tuple_object() {
+        // MAKE_TUPLE produces a HeapObject::Tuple, not an Array -- the
+        // distinction lets 05-05's type_of tell a tuple from an array.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(7), 1);
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        chunk.write_op(Opcode::MakeTuple, 1);
+        chunk.write_u16(2, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("make_tuple");
+        let top = *vm.stack.last().expect("a tuple pointer");
+        let slot = top.as_pointer().expect("a heap pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Tuple(items)) => {
+                assert_eq!(items.len(), 2, "the tuple has two elements");
+                // element 0 is the first pushed (7), element 1 the bool.
+                assert_eq!(items[1].as_bool(), Some(true));
+            }
+            _ => panic!("MAKE_TUPLE must build a heap Tuple, not an Array"),
+        }
+    }
+
+    #[test]
+    fn index_out_of_bounds_is_a_runtime_error_carrying_the_index_length_and_line() {
+        // a 2-element array indexed at 5: the error names the index AND the
+        // length, and its span covers the INDEX opcode's source line.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(100), 1);
+        emit_const(&mut chunk, ConstValue::I64(200), 1);
+        chunk.write_op(Opcode::MakeArray, 1);
+        chunk.write_u16(2, 1);
+        emit_const(&mut chunk, ConstValue::I64(5), 1);
+        chunk.write_op(Opcode::Index, 4); // the INDEX is on source line 4
+        chunk.write_op(Opcode::Halt, 4);
+        let src = "one\ntwo\nthree\nthe index line\nfive";
+        match run_chunk(chunk, src) {
+            Err(QalaError::Runtime { message, span }) => {
+                assert!(message.contains('5'), "the index is named: {message}");
+                assert!(message.contains('2'), "the length is named: {message}");
+                assert!(message.contains("out of bounds"), "got: {message}");
+                assert_eq!(
+                    span.slice(src),
+                    "the index line",
+                    "the error must point at the INDEX's source line"
+                );
+            }
+            Err(other) => panic!("expected an out-of-bounds Runtime error, got {other:?}"),
+            Ok(_) => panic!("expected an out-of-bounds error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn index_of_a_negative_index_is_a_runtime_error_not_a_panic() {
+        // a negative index must not wrap or panic -- it is a clean error.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        chunk.write_op(Opcode::MakeArray, 1);
+        chunk.write_u16(1, 1);
+        emit_const(&mut chunk, ConstValue::I64(-1), 1);
+        chunk.write_op(Opcode::Index, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("out of bounds"), "got: {message}");
+            }
+            Err(other) => panic!("expected an out-of-bounds Runtime error, got {other:?}"),
+            Ok(_) => panic!("expected an out-of-bounds error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn make_struct_labels_the_struct_with_its_declared_name_and_field_can_read_it() {
+        // a Program with one struct "Point" of 2 fields. build a Point{1,2},
+        // confirm the heap struct's type_name is "Point", then FIELD 1 -> 2.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        emit_const(&mut chunk, ConstValue::I64(2), 1);
+        chunk.write_op(Opcode::MakeStruct, 1);
+        chunk.write_u16(0, 1); // struct id 0
+        // DUP so one copy is FIELD-accessed and one stays for the heap check.
+        chunk.write_op(Opcode::Dup, 1);
+        chunk.write_op(Opcode::Field, 1);
+        chunk.write_u16(1, 1); // field index 1
+        chunk.write_op(Opcode::Halt, 1);
+
+        let mut p = program_with(chunk);
+        p.structs.push(crate::chunk::StructInfo {
+            name: "Point".to_string(),
+            field_count: 2,
+        });
+        let mut vm = Vm::new(p, "x".to_string());
+        vm.run().expect("make_struct");
+        // top is FIELD 1's result -- the second field, 2.
+        assert_eq!(top_i64(&vm), 2, "FIELD 1 of Point{{1,2}} is 2");
+        // under it, the struct pointer reaches a Struct labelled "Point".
+        let struct_ptr = vm.stack[vm.stack.len() - 2];
+        let slot = struct_ptr.as_pointer().expect("a struct pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Struct { type_name, fields }) => {
+                assert_eq!(type_name, "Point", "the struct carries its declared name");
+                assert_eq!(fields.len(), 2);
+            }
+            _ => panic!("MAKE_STRUCT must build a heap Struct"),
+        }
+    }
+
+    #[test]
+    fn make_struct_with_a_bad_struct_id_is_a_runtime_error_not_a_panic() {
+        // MAKE_STRUCT id 9 with an empty structs table.
+        let mut chunk = Chunk::new();
+        chunk.write_op(Opcode::MakeStruct, 1);
+        chunk.write_u16(9, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("bad struct id"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime bad-struct-id error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime bad-struct-id error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn make_enum_variant_builds_a_variant_with_its_enum_and_variant_names() {
+        // a Program whose variant id 0 is (Shape, Circle). build Circle(5),
+        // confirm the heap object's type_name / variant / payload.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(5), 1);
+        chunk.write_op(Opcode::MakeEnumVariant, 1);
+        chunk.write_u16(0, 1); // variant id 0
+        chunk.code.push(1); // payload count 1
+        chunk.source_lines.push(1);
+        chunk.write_op(Opcode::Halt, 1);
+
+        let mut p = program_with(chunk);
+        p.enum_variant_names
+            .push(("Shape".to_string(), "Circle".to_string()));
+        let mut vm = Vm::new(p, "x".to_string());
+        vm.run().expect("make_enum_variant");
+        let top = *vm.stack.last().expect("a variant pointer");
+        let slot = top.as_pointer().expect("a heap pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::EnumVariant {
+                type_name,
+                variant,
+                payload,
+            }) => {
+                assert_eq!(type_name, "Shape", "the enum name");
+                assert_eq!(variant, "Circle", "the variant name");
+                assert_eq!(payload.len(), 1, "Circle carries one payload value");
+            }
+            _ => panic!("MAKE_ENUM_VARIANT must build a heap EnumVariant"),
+        }
+    }
+
+    #[test]
+    fn make_enum_variant_with_a_bad_variant_id_is_a_runtime_error_not_a_panic() {
+        let mut chunk = Chunk::new();
+        chunk.write_op(Opcode::MakeEnumVariant, 1);
+        chunk.write_u16(9, 1);
+        chunk.code.push(0);
+        chunk.source_lines.push(1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("bad variant id"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime bad-variant-id error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime bad-variant-id error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn field_of_a_non_struct_is_a_runtime_error_not_a_panic() {
+        // FIELD on an array pointer -- the pointer does not reach a struct.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        chunk.write_op(Opcode::MakeArray, 1);
+        chunk.write_u16(1, 1);
+        chunk.write_op(Opcode::Field, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("expected a struct"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime not-a-struct error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime not-a-struct error, the program ran clean"),
         }
     }
 }
