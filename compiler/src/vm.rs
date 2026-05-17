@@ -36,8 +36,10 @@
 use crate::chunk::Chunk;
 use crate::chunk::Program;
 use crate::errors::QalaError;
+use crate::opcode::Opcode;
 use crate::span::LineIndex;
 use crate::span::Span;
+use crate::value::ConstValue;
 use crate::value::Value;
 
 /// the call-frame depth cap. a Qala recursion grows the [`Vm::frames`] vec, not
@@ -450,6 +452,268 @@ impl Vm {
         let index = LineIndex::new(&self.src);
         line_span(&index, &self.src, line)
     }
+
+    // ---- dispatch ----------------------------------------------------------
+
+    /// decode and execute exactly one instruction at the current frame's `ip`.
+    ///
+    /// the shared core of [`Vm::run`] and [`Vm::step`]; there is no dispatch
+    /// logic anywhere else. the sequence is: bounds-check `ip < code.len()`,
+    /// decode the opcode byte, bounds-check that the whole operand sequence is
+    /// in range, advance `ip` PAST the whole instruction, then run the handler.
+    ///
+    /// ip-advance discipline: `ip` is advanced to the fall-through position
+    /// (`opcode_pos + 1 + operand_bytes`) BEFORE the handler body runs. a JUMP
+    /// handler then overwrites `ip` with its computed target. every other
+    /// handler leaves the advanced `ip` in place. this is why a JUMP target is
+    /// `fall_through + offset` -- `fall_through` is already `opcode_pos + 1 + 2`,
+    /// exactly the "byte after the operand" the offset is relative to.
+    ///
+    /// every byte read here is bounds-checked; a bad opcode byte or a truncated
+    /// operand is a [`QalaError::Runtime`], never a panic.
+    fn dispatch_one(&mut self) -> Result<StepOutcome, QalaError> {
+        let ip = self.frame()?.ip;
+        let code_len = self.chunk()?.code.len();
+        if ip >= code_len {
+            return Err(self.runtime_err("instruction pointer past end of chunk"));
+        }
+        // decode the opcode byte -- guaranteed in range by the check above.
+        let byte = self.chunk()?.code[ip];
+        let op = Opcode::from_u8(byte)
+            .ok_or_else(|| self.runtime_err(&format!("bad opcode byte {byte:#x}")))?;
+        // bounds-check the operand sequence before any read of it.
+        let operand_len = op.operand_bytes() as usize;
+        if ip + 1 + operand_len > code_len {
+            return Err(self.runtime_err("truncated operand"));
+        }
+        // the fall-through ip: one past the whole instruction.
+        let next = ip + 1 + operand_len;
+        // advance FIRST; a JUMP handler below overwrites this.
+        self.frame_mut()?.ip = next;
+        self.run_opcode(op, ip, next)
+    }
+
+    /// run the handler for `op`, whose opcode byte is at `opcode_pos` and whose
+    /// fall-through ip is `next`. split out of [`Vm::dispatch_one`] so the
+    /// decode-and-bounds-check is one place and the per-opcode logic another.
+    ///
+    /// every opcode this plan does not implement returns a clean `Runtime`
+    /// "opcode not yet implemented" error so the match stays exhaustive and the
+    /// crate compiles; a later commit replaces those arms.
+    fn run_opcode(
+        &mut self,
+        op: Opcode,
+        opcode_pos: usize,
+        next: usize,
+    ) -> Result<StepOutcome, QalaError> {
+        match op {
+            // ---- stack ----
+            Opcode::Const => {
+                let idx = self.read_operand_u16(opcode_pos)?;
+                self.op_const(idx)?;
+            }
+            Opcode::Pop => {
+                self.pop()?;
+            }
+            Opcode::Dup => {
+                // peek the top value and push a copy. a Value is Copy, so the
+                // duplicate is a plain bit copy; refcount bookkeeping for a
+                // duplicated heap pointer is a later commit's concern.
+                let top = *self
+                    .stack
+                    .last()
+                    .ok_or_else(|| self.runtime_err("stack underflow"))?;
+                self.push(top)?;
+            }
+            // ---- locals + globals ----
+            Opcode::GetLocal => {
+                let slot = self.read_operand_u16(opcode_pos)? as usize;
+                let v = *self
+                    .frame()?
+                    .locals
+                    .get(slot)
+                    .ok_or_else(|| self.runtime_err(&format!("bad local slot {slot}")))?;
+                self.push(v)?;
+            }
+            Opcode::SetLocal => {
+                let slot = self.read_operand_u16(opcode_pos)? as usize;
+                let v = self.pop()?;
+                let locals = &mut self.frame_mut()?.locals;
+                // a SET_LOCAL past the current end grows the vec with void
+                // padding -- codegen numbers slots densely from 0, so the only
+                // way a slot lands past the end is the first write to it.
+                if slot >= locals.len() {
+                    locals.resize(slot + 1, Value::void());
+                }
+                locals[slot] = v;
+            }
+            Opcode::GetGlobal => {
+                let idx = self.read_operand_u16(opcode_pos)? as usize;
+                let v = *self
+                    .globals
+                    .get(idx)
+                    .ok_or_else(|| self.runtime_err(&format!("bad global slot {idx}")))?;
+                self.push(v)?;
+            }
+            Opcode::SetGlobal => {
+                let idx = self.read_operand_u16(opcode_pos)? as usize;
+                let v = self.pop()?;
+                if idx >= self.globals.len() {
+                    self.globals.resize(idx + 1, Value::void());
+                }
+                self.globals[idx] = v;
+            }
+            // ---- arithmetic / comparison / logic / jump ----
+            // a later commit fills these in; until then they are clean stubs.
+            Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::Neg
+            | Opcode::FAdd
+            | Opcode::FSub
+            | Opcode::FMul
+            | Opcode::FDiv
+            | Opcode::FNeg
+            | Opcode::Eq
+            | Opcode::Ne
+            | Opcode::Lt
+            | Opcode::Le
+            | Opcode::Gt
+            | Opcode::Ge
+            | Opcode::FEq
+            | Opcode::FNe
+            | Opcode::FLt
+            | Opcode::FLe
+            | Opcode::FGt
+            | Opcode::FGe
+            | Opcode::Not
+            | Opcode::Jump
+            | Opcode::JumpIfFalse
+            | Opcode::JumpIfTrue => {
+                return Err(self.runtime_err(&format!("opcode {op:?} not yet implemented")));
+            }
+            // ---- not implemented by this plan (calls, heap construction,
+            // access, strings, match) -- a later plan replaces these stubs ----
+            Opcode::Call
+            | Opcode::Return
+            | Opcode::MakeArray
+            | Opcode::MakeTuple
+            | Opcode::MakeStruct
+            | Opcode::MakeEnumVariant
+            | Opcode::Index
+            | Opcode::Field
+            | Opcode::Len
+            | Opcode::ToStr
+            | Opcode::ConcatN
+            | Opcode::MatchVariant => {
+                return Err(self.runtime_err(&format!("opcode {op:?} not yet implemented")));
+            }
+            // ---- sentinel ----
+            Opcode::Halt => return Ok(StepOutcome::Halted),
+        }
+        let _ = next;
+        Ok(StepOutcome::Ran)
+    }
+
+    /// read the `u16` operand of the instruction whose opcode byte is at
+    /// `opcode_pos`. the operand sits at `opcode_pos + 1`.
+    ///
+    /// [`Vm::dispatch_one`] has already bounds-checked the whole operand
+    /// sequence, so the two-byte read cannot go out of range -- but this
+    /// re-checks defensively rather than trust the caller, keeping the
+    /// never-panic guarantee local to this function.
+    fn read_operand_u16(&self, opcode_pos: usize) -> Result<u16, QalaError> {
+        let chunk = self.chunk()?;
+        let off = opcode_pos + 1;
+        if off + 2 > chunk.code.len() {
+            return Err(self.runtime_err("truncated operand"));
+        }
+        Ok(chunk.read_u16(off))
+    }
+
+    /// the constant-pool entry at `idx` converted to a runtime [`Value`] and
+    /// pushed onto the stack.
+    ///
+    /// an `i64` constant allocates a [`HeapObject::Int`] and pushes a pointer
+    /// (the uniform-heap-box rule); a `str` constant allocates a
+    /// [`HeapObject::Str`]; an `f64` / `bool` / `byte` / `void` becomes a
+    /// tagged scalar directly; a function constant becomes a [`Value::function`]
+    /// tagged scalar carrying the fn-id (no heap object). a bad pool index or a
+    /// heap-exhaustion is a [`QalaError::Runtime`].
+    fn op_const(&mut self, idx: u16) -> Result<(), QalaError> {
+        let constant = self
+            .chunk()?
+            .constants
+            .get(idx as usize)
+            .cloned()
+            .ok_or_else(|| self.runtime_err(&format!("bad constant index {idx}")))?;
+        let value = match constant {
+            ConstValue::I64(n) => {
+                let slot = self
+                    .heap
+                    .alloc(HeapObject::Int(n))
+                    .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+                Value::pointer(slot)
+            }
+            ConstValue::F64(x) => Value::from_f64(x),
+            ConstValue::Bool(b) => Value::bool(b),
+            ConstValue::Byte(b) => Value::byte(b),
+            ConstValue::Void => Value::void(),
+            ConstValue::Str(s) => {
+                let slot = self
+                    .heap
+                    .alloc(HeapObject::Str(s))
+                    .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+                Value::pointer(slot)
+            }
+            // a function value is a tagged scalar, not a heap object: the u16
+            // fn-id rides in the NaN payload. the higher-order stdlib functions
+            // recover it via Value::as_function.
+            ConstValue::Function(id) => Value::function(id),
+        };
+        self.push(value)
+    }
+
+    /// run the program from the current state to `Halt` or the first runtime
+    /// error.
+    ///
+    /// loops over [`Vm::dispatch_one`]; a `Ran` outcome continues, a `Halted`
+    /// outcome returns `Ok(())`. shares every byte of execution logic with
+    /// [`Vm::step`] -- both go through `dispatch_one`.
+    pub fn run(&mut self) -> Result<(), QalaError> {
+        loop {
+            match self.dispatch_one()? {
+                StepOutcome::Ran => continue,
+                StepOutcome::Halted => return Ok(()),
+            }
+        }
+    }
+
+    /// advance exactly one instruction.
+    ///
+    /// one `step()` call executes one full instruction including its operands:
+    /// `ip` moves by `1 + operand_bytes()` of the executed opcode. the
+    /// playground's step-through calls this in a loop. a thin wrapper over
+    /// [`Vm::dispatch_one`] -- no duplicated dispatch logic.
+    pub fn step(&mut self) -> Result<StepOutcome, QalaError> {
+        self.dispatch_one()
+    }
+}
+
+/// what one [`Vm::dispatch_one`] call did.
+///
+/// `Ran` -- an ordinary instruction executed and the VM should keep going.
+/// `Halted` -- the VM hit [`Opcode::Halt`] (or fell off the end of `main` once
+/// the call machinery lands) and execution is complete. a runtime fault is the
+/// `Err` arm of the surrounding `Result`, not a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// an ordinary instruction ran; `run` should dispatch the next one.
+    Ran,
+    /// the VM halted; `run` returns `Ok(())`.
+    Halted,
 }
 
 /// the byte-range [`Span`] of a 1-based `line` in `src`.
@@ -711,5 +975,262 @@ mod tests {
         // line 99 does not exist; the span must be zero-width, no panic.
         let span = line_span(&index, src, 99);
         assert_eq!(span.len, 0);
+    }
+
+    // ---- dispatch + malformed bytecode + stack/local opcodes ----
+
+    /// emit a `CONST idx` instruction for the pool entry `v` on `line`, return
+    /// the pool index. a building block for the dispatch tests.
+    fn emit_const(chunk: &mut Chunk, v: ConstValue, line: u32) {
+        let idx = chunk.add_constant(v);
+        chunk.write_op(Opcode::Const, line);
+        chunk.write_u16(idx, line);
+    }
+
+    #[test]
+    fn dispatch_runs_a_const_then_pop_program_clean() {
+        // CONST 7 ; POP ; HALT -- runs to Halted with an empty stack.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(7), 1);
+        chunk.write_op(Opcode::Pop, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("a CONST/POP/HALT program runs clean");
+        assert!(vm.stack.is_empty(), "POP must leave the stack empty");
+    }
+
+    #[test]
+    fn dispatch_const_of_an_i64_pushes_a_pointer_to_a_heap_int() {
+        // CONST 42 ; HALT -- the stack top is a pointer to a HeapObject::Int.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(42), 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let top = *vm.stack.last().expect("the CONST left a value");
+        assert_eq!(top.as_function(), None, "an i64 constant is not a function");
+        let slot = top
+            .as_pointer()
+            .expect("an i64 constant must push a heap pointer");
+        assert!(
+            vm.heap.get(slot) == Some(&HeapObject::Int(42)),
+            "the pointer must reach a heap Int(42)"
+        );
+    }
+
+    #[test]
+    fn dispatch_const_of_a_bool_pushes_a_tagged_scalar_not_a_pointer() {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let top = *vm.stack.last().expect("value");
+        assert_eq!(top.as_bool(), Some(true));
+        assert_eq!(top.as_pointer(), None, "a bool is not a heap pointer");
+    }
+
+    #[test]
+    fn dispatch_const_of_a_function_pushes_a_function_value_carrying_the_id() {
+        // a ConstValue::Function becomes a tagged Value::function, no heap
+        // object -- the locked representation 05-05's map/filter/reduce read.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Function(13), 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let top = *vm.stack.last().expect("value");
+        assert_eq!(top.as_function(), Some(13), "fn-id must round-trip");
+        assert_eq!(top.as_pointer(), None, "a function is not a heap pointer");
+    }
+
+    #[test]
+    fn dispatch_dup_duplicates_the_top_value() {
+        // CONST true ; DUP ; HALT -- two equal values on the stack.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        chunk.write_op(Opcode::Dup, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        assert_eq!(vm.stack.len(), 2, "DUP pushes a copy");
+        assert!(vm.stack[0] == vm.stack[1], "the copy equals the original");
+    }
+
+    #[test]
+    fn dispatch_set_local_then_get_local_round_trips_a_value() {
+        // CONST b'\x05 ; SET_LOCAL 0 ; GET_LOCAL 0 ; HALT.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Byte(5), 1);
+        chunk.write_op(Opcode::SetLocal, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::GetLocal, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let top = *vm.stack.last().expect("GET_LOCAL pushed a value");
+        assert_eq!(top.as_byte(), Some(5), "the local round-trips");
+    }
+
+    #[test]
+    fn dispatch_get_local_of_an_unset_slot_is_a_runtime_error_not_a_panic() {
+        // GET_LOCAL 4 with no locals set -- a clean Runtime error.
+        let mut chunk = Chunk::new();
+        chunk.write_op(Opcode::GetLocal, 1);
+        chunk.write_u16(4, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("bad local slot"), "got: {message}");
+            }
+            other => panic!("expected a Runtime bad-local error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_set_global_then_get_global_round_trips_a_value() {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(false), 1);
+        chunk.write_op(Opcode::SetGlobal, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::GetGlobal, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let top = *vm.stack.last().expect("GET_GLOBAL pushed a value");
+        assert_eq!(top.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn malformed_a_bad_opcode_byte_is_a_runtime_error_not_a_panic() {
+        // byte 46 decodes to no opcode (the dense set ends at 45).
+        let mut chunk = Chunk::new();
+        chunk.code.push(46);
+        chunk.source_lines.push(1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("bad opcode byte"), "got: {message}");
+            }
+            other => panic!("expected a Runtime bad-opcode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_a_truncated_operand_is_a_runtime_error_not_a_panic() {
+        // a CONST opcode with only one of its two operand bytes present.
+        let mut chunk = Chunk::new();
+        chunk.code.push(Opcode::Const as u8);
+        chunk.code.push(0); // only one operand byte; CONST needs two
+        chunk.source_lines.push(1);
+        chunk.source_lines.push(1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("truncated operand"), "got: {message}");
+            }
+            other => panic!("expected a Runtime truncated-operand error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_a_bad_constant_index_is_a_runtime_error_not_a_panic() {
+        // CONST 9 with an empty constant pool.
+        let mut chunk = Chunk::new();
+        chunk.write_op(Opcode::Const, 1);
+        chunk.write_u16(9, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("bad constant index"), "got: {message}");
+            }
+            other => panic!("expected a Runtime bad-constant error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_an_unimplemented_opcode_is_a_clean_runtime_stub_not_a_panic() {
+        // ADD is stubbed by this plan -- it must be a clean Runtime error.
+        let mut chunk = Chunk::new();
+        chunk.write_op(Opcode::Add, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("not yet implemented"), "got: {message}");
+            }
+            other => panic!("expected a Runtime not-implemented stub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_an_ip_past_the_end_of_the_chunk_is_a_runtime_error() {
+        // an empty chunk -- ip 0 is already past the (zero-length) code.
+        let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(
+                    message.contains("instruction pointer past end"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected a Runtime ip-past-end error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_advances_ip_by_one_full_instruction_each_call() {
+        // CONST 1 (3 bytes) ; POP (1 byte) ; HALT (1 byte).
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        chunk.write_op(Opcode::Pop, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        // before the first step, ip is 0.
+        assert_eq!(vm.frame().expect("frame").ip, 0);
+        // step 1 executes CONST -- a 3-byte instruction, ip moves 0 -> 3.
+        assert_eq!(vm.step().expect("step 1"), StepOutcome::Ran);
+        assert_eq!(vm.frame().expect("frame").ip, 3, "CONST advances ip by 3");
+        assert_eq!(vm.stack.len(), 1, "CONST pushed one value");
+        // step 2 executes POP -- a 1-byte instruction, ip moves 3 -> 4.
+        assert_eq!(vm.step().expect("step 2"), StepOutcome::Ran);
+        assert_eq!(vm.frame().expect("frame").ip, 4, "POP advances ip by 1");
+        assert_eq!(vm.stack.len(), 0, "POP cleared the stack");
+        // step 3 executes HALT.
+        assert_eq!(vm.step().expect("step 3"), StepOutcome::Halted);
+    }
+
+    #[test]
+    fn run_and_step_share_dispatch_one_reaching_the_same_end_state() {
+        // a small program run two ways: run() to completion, and step() in a
+        // loop. both must leave the same value-stack state.
+        let build = || {
+            let mut chunk = Chunk::new();
+            emit_const(&mut chunk, ConstValue::Bool(true), 1);
+            emit_const(&mut chunk, ConstValue::Bool(false), 1);
+            chunk.write_op(Opcode::Halt, 1);
+            program_with(chunk)
+        };
+        let mut via_run = Vm::new(build(), "x".to_string());
+        via_run.run().expect("run");
+
+        let mut via_step = Vm::new(build(), "x".to_string());
+        loop {
+            match via_step.step().expect("step") {
+                StepOutcome::Ran => continue,
+                StepOutcome::Halted => break,
+            }
+        }
+        assert_eq!(via_run.stack.len(), via_step.stack.len());
+        assert!(
+            via_run.stack.len() == 2
+                && via_run.stack[0] == via_step.stack[0]
+                && via_run.stack[1] == via_step.stack[1],
+            "run and step must reach the same stack state"
+        );
     }
 }
