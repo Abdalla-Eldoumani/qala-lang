@@ -299,6 +299,68 @@ pub struct CallFrame {
     pub locals: Vec<Value>,
 }
 
+/// one typed value in a [`VmState`] snapshot: its display string and its
+/// runtime type name.
+///
+/// the playground type-tints a stack slot or a variable by `type_name` (so an
+/// `i64` gets one colour, a `str` another) and shows `rendered` as the value.
+/// `rendered` comes from [`Vm::value_to_string`]; `type_name` from
+/// [`Vm::runtime_type_name`].
+///
+/// derives `serde::Serialize` so Phase 6's WASM bridge can hand the snapshot
+/// straight to JavaScript -- the same precedent `diagnostics.rs`'s
+/// `MonacoDiagnostic` set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StateValue {
+    /// the value's display string, e.g. `42`, `true`, `[1, 2, 3]`.
+    pub rendered: String,
+    /// the value's runtime type name, e.g. `i64`, `str`, `[i64]`, `Shape`.
+    pub type_name: String,
+}
+
+/// one in-scope variable in a [`VmState`] snapshot: a name plus its typed
+/// value.
+///
+/// `name` is the variable's real source name -- `x`, `sum`, a `for` loop
+/// variable -- recovered from the chunk's [`Chunk::local_names`] table; a
+/// compiler-synthesized temporary with no recorded name falls back to
+/// `slot{i}`. `value` carries the same rendered-string + type-name pair a
+/// stack slot does. derives `serde::Serialize` for the WASM bridge.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NamedValue {
+    /// the variable's source name (or `slot{i}` for an unnamed temporary).
+    pub name: String,
+    /// the variable's current value, rendered and type-tagged.
+    pub value: StateValue,
+}
+
+/// the playground's step-through snapshot of the VM.
+///
+/// [`Vm::get_state`] builds one of these. it carries everything the
+/// playground's panels render after each instruction: the current chunk index
+/// and instruction pointer (the bytecode panel's highlight), the value stack
+/// (the animated stack panel), the current frame's in-scope variables (the
+/// variables panel), the accumulated console output (the console panel), and
+/// the resource-leak log.
+///
+/// a plain data struct -- no behaviour. derives `serde::Serialize` so Phase
+/// 6's WASM bridge serializes it for JavaScript without a conversion layer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VmState {
+    /// the index into [`Program::chunks`] of the function currently running.
+    pub chunk_index: usize,
+    /// the instruction pointer: a byte offset into that chunk's `code`.
+    pub ip: usize,
+    /// the value stack bottom-to-top, each slot rendered and type-tagged.
+    pub stack: Vec<StateValue>,
+    /// the current frame's in-scope local variables, name + typed value.
+    pub variables: Vec<NamedValue>,
+    /// the accumulated `print` / `println` output, one entry per write.
+    pub console: Vec<String>,
+    /// the resource-leak log: a file handle freed while still open.
+    pub leak_log: Vec<String>,
+}
+
 /// the bytecode virtual machine.
 ///
 /// holds the program being run, the value stack, the call-frame stack, the
@@ -319,18 +381,15 @@ pub struct Vm {
     /// captured `print` / `println` output. the VM runs in WASM where stdout
     /// is invisible; the playground renders this buffer instead.
     ///
-    /// `allow(dead_code)`: written by the stdlib `print` / `println` functions,
-    /// which a later commit adds. the buffer is part of the `Vm`'s locked
-    /// shape, so it is declared now.
-    #[allow(dead_code)]
+    /// read by [`Vm::get_state`] for the snapshot; written by the stdlib
+    /// `print` / `println` functions a later plan (05-05) adds.
     console: Vec<String>,
     /// resource-leak log: a [`HeapObject::FileHandle`] freed while still open
     /// is recorded here, surfaced for the playground.
     ///
-    /// `allow(dead_code)`: written by the heap-decrement leak check, which a
-    /// later commit wires into the `RETURN` and scope-exit paths. declared now
-    /// as part of the `Vm`'s locked shape.
-    #[allow(dead_code)]
+    /// read by [`Vm::get_state`] for the snapshot; written by the
+    /// heap-decrement leak check a later plan (05-05) wires into the `RETURN`
+    /// and scope-exit paths.
     leak_log: Vec<String>,
     /// persistent global slots, indexed by `GET_GLOBAL` / `SET_GLOBAL`. kept
     /// across REPL calls.
@@ -1450,6 +1509,67 @@ impl Vm {
         }
     }
 
+    /// the runtime type name of a [`Value`].
+    ///
+    /// the single source of truth for "what type is this value at runtime",
+    /// reused by [`Vm::get_state`] (to type-tint each stack slot and variable)
+    /// AND by 05-05's `type_of` stdlib function -- both must agree, so the
+    /// logic lives here once. the names match the typechecker's canonical
+    /// lowercase spelling:
+    /// - a primitive: `i64`, `f64`, `bool`, `byte`, `void`, `str`.
+    /// - an array: `[T]` where `T` is the element type of the first element,
+    ///   e.g. `[i64]`. an empty array has no element to inspect, so it renders
+    ///   the bare `[]`.
+    /// - a tuple: `(T, U, ...)` over the element types, e.g. `(i64, str)`. an
+    ///   empty tuple renders `()`.
+    /// - a struct: its declared name, e.g. `Point`.
+    /// - an enum variant: `Enum::Variant`, e.g. `Shape::Circle`.
+    /// - a file handle: `FileHandle`.
+    /// - a function value: `fn`.
+    /// - a dangling pointer (a freed heap slot): `?` -- a type name must
+    ///   always be produced; this never errors.
+    fn runtime_type_name(&self, v: Value) -> String {
+        // tagged scalars decode without touching the heap.
+        if v.as_bool().is_some() {
+            return "bool".to_string();
+        }
+        if v.as_byte().is_some() {
+            return "byte".to_string();
+        }
+        if v.as_void() {
+            return "void".to_string();
+        }
+        if v.as_function().is_some() {
+            return "fn".to_string();
+        }
+        // a pointer: the heap object decides the type.
+        if let Some(slot) = v.as_pointer() {
+            return match self.heap.get(slot) {
+                Some(HeapObject::Int(_)) => "i64".to_string(),
+                Some(HeapObject::Str(_)) => "str".to_string(),
+                Some(HeapObject::Array(items)) => match items.first() {
+                    Some(first) => format!("[{}]", self.runtime_type_name(*first)),
+                    None => "[]".to_string(),
+                },
+                Some(HeapObject::Tuple(items)) => {
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|e| self.runtime_type_name(*e))
+                        .collect();
+                    format!("({})", parts.join(", "))
+                }
+                Some(HeapObject::Struct { type_name, .. }) => type_name.clone(),
+                Some(HeapObject::EnumVariant {
+                    type_name, variant, ..
+                }) => format!("{type_name}::{variant}"),
+                Some(HeapObject::FileHandle { .. }) => "FileHandle".to_string(),
+                None => "?".to_string(),
+            };
+        }
+        // not tagged, not a pointer: a real f64.
+        "f64".to_string()
+    }
+
     /// execute [`Opcode::ToStr`]: pop one value, push its string form as a
     /// heap [`HeapObject::Str`].
     ///
@@ -1574,6 +1694,89 @@ impl Vm {
     /// [`Vm::dispatch_one`] -- no duplicated dispatch logic.
     pub fn step(&mut self) -> Result<StepOutcome, QalaError> {
         self.dispatch_one()
+    }
+
+    /// snapshot the VM's execution state for the playground's step-through.
+    ///
+    /// the [`VmState`] carries the current chunk index and instruction
+    /// pointer, the value stack (each slot rendered and type-tagged), the
+    /// current frame's in-scope variables paired with their REAL source
+    /// names, the accumulated console output, and the leak log.
+    ///
+    /// the output is deterministic -- it iterates `Vec`s in index order, never
+    /// a `HashMap`, so two `get_state` calls on the same VM state produce
+    /// byte-identical snapshots (the contract Phase 6's WASM bridge needs).
+    ///
+    /// never panics. when `frames` is empty (the program has finished and the
+    /// last frame returned) it reports a terminal snapshot: the last chunk
+    /// index and an `ip` one past that chunk's code -- not an out-of-bounds
+    /// index, not a panic. an out-of-range `chunk_idx` is handled the same
+    /// defensive way.
+    pub fn get_state(&self) -> VmState {
+        // the value stack, bottom-to-top, each slot rendered + type-tagged.
+        let stack: Vec<StateValue> = self
+            .stack
+            .iter()
+            .map(|v| StateValue {
+                rendered: self.value_to_string(*v),
+                type_name: self.runtime_type_name(*v),
+            })
+            .collect();
+
+        // the current frame decides the chunk index, ip, and variables. an
+        // empty frame stack is the finished-program case -- a terminal
+        // snapshot, never a panic.
+        let (chunk_index, ip, variables) = match self.frames.last() {
+            Some(frame) => {
+                let names = self
+                    .program
+                    .chunks
+                    .get(frame.chunk_idx)
+                    .map(|c| c.local_names.as_slice())
+                    .unwrap_or(&[]);
+                // pair each local slot with its source name; a slot with no
+                // recorded name (a compiler temporary) falls back to slot{i}.
+                let variables: Vec<NamedValue> = frame
+                    .locals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let name = match names.get(i) {
+                            Some(n) if !n.is_empty() => n.clone(),
+                            _ => format!("slot{i}"),
+                        };
+                        NamedValue {
+                            name,
+                            value: StateValue {
+                                rendered: self.value_to_string(*v),
+                                type_name: self.runtime_type_name(*v),
+                            },
+                        }
+                    })
+                    .collect();
+                (frame.chunk_idx, frame.ip, variables)
+            }
+            None => {
+                // the program finished: the last chunk, an ip past its end.
+                let last_idx = self.program.chunks.len().saturating_sub(1);
+                let ip = self
+                    .program
+                    .chunks
+                    .get(last_idx)
+                    .map(|c| c.code.len())
+                    .unwrap_or(0);
+                (last_idx, ip, Vec::new())
+            }
+        };
+
+        VmState {
+            chunk_index,
+            ip,
+            stack,
+            variables,
+            console: self.console.clone(),
+            leak_log: self.leak_log.clone(),
+        }
     }
 }
 
@@ -3330,5 +3533,243 @@ fn main() -> i64 is pure { return run() }
         let mut vm = Vm::new(program, src.to_string());
         vm.run().expect("the program with two defers runs clean");
         assert_eq!(program_result_i64(&vm), 0, "run returns 0; the defers ran for effect");
+    }
+
+    // ---- get_state + single-step inspection ----
+
+    #[test]
+    fn state_reflects_the_value_stack_and_ip_after_each_step() {
+        // CONST 10 ; CONST 20 ; ADD ; HALT -- step through and watch get_state
+        // track the stack growing then collapsing, and the ip advancing.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(10), 1);
+        emit_const(&mut chunk, ConstValue::I64(20), 1);
+        chunk.write_op(Opcode::Add, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+
+        // before any step: ip 0, an empty stack.
+        let s0 = vm.get_state();
+        assert_eq!(s0.ip, 0);
+        assert_eq!(s0.chunk_index, 0);
+        assert!(s0.stack.is_empty(), "no instruction has run yet");
+
+        // step 1 -- CONST 10: ip 0 -> 3, one value on the stack.
+        assert_eq!(vm.step().expect("step 1"), StepOutcome::Ran);
+        let s1 = vm.get_state();
+        assert_eq!(s1.ip, 3, "CONST advanced ip by its 3 bytes");
+        assert_eq!(s1.stack.len(), 1);
+        assert_eq!(s1.stack[0].rendered, "10");
+
+        // step 2 -- CONST 20: ip 3 -> 6, two values.
+        assert_eq!(vm.step().expect("step 2"), StepOutcome::Ran);
+        let s2 = vm.get_state();
+        assert_eq!(s2.ip, 6);
+        assert_eq!(s2.stack.len(), 2);
+        assert_eq!(s2.stack[1].rendered, "20");
+
+        // step 3 -- ADD: ip 6 -> 7, the two operands collapse to one result.
+        assert_eq!(vm.step().expect("step 3"), StepOutcome::Ran);
+        let s3 = vm.get_state();
+        assert_eq!(s3.ip, 7);
+        assert_eq!(s3.stack.len(), 1, "ADD popped two, pushed one");
+        assert_eq!(s3.stack[0].rendered, "30", "10 + 20 == 30");
+    }
+
+    #[test]
+    fn state_value_type_name_is_correct_for_each_primitive_kind() {
+        // push an i64, an f64, a bool, and a str, then read get_state -- each
+        // StateValue.type_name must name the right runtime type.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        emit_const(&mut chunk, ConstValue::F64(2.5), 1);
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        emit_const(&mut chunk, ConstValue::Str("hi".to_string()), 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let state = vm.get_state();
+        assert_eq!(state.stack.len(), 4, "four values on the stack");
+        assert_eq!(state.stack[0].type_name, "i64");
+        assert_eq!(state.stack[1].type_name, "f64");
+        assert_eq!(state.stack[2].type_name, "bool");
+        assert_eq!(state.stack[3].type_name, "str");
+    }
+
+    #[test]
+    fn state_variables_carry_the_real_source_names_from_the_chunk() {
+        // a chunk whose local_names table names slot 0 `count` and slot 1
+        // `total`; after SET_LOCALs, get_state reports those names, not slotN.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(3), 1);
+        chunk.write_op(Opcode::SetLocal, 1);
+        chunk.write_u16(0, 1);
+        emit_const(&mut chunk, ConstValue::I64(9), 1);
+        chunk.write_op(Opcode::SetLocal, 1);
+        chunk.write_u16(1, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        chunk.local_names = vec!["count".to_string(), "total".to_string()];
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let state = vm.get_state();
+        assert_eq!(state.variables.len(), 2, "two locals are bound");
+        assert_eq!(state.variables[0].name, "count", "slot 0 is the real name");
+        assert_eq!(state.variables[0].value.rendered, "3");
+        assert_eq!(state.variables[1].name, "total");
+        assert_eq!(state.variables[1].value.rendered, "9");
+    }
+
+    #[test]
+    fn state_falls_back_to_slot_index_for_an_unnamed_temporary() {
+        // a slot the chunk's local_names leaves empty (a compiler temporary)
+        // is reported as `slot{i}`, not as a blank name.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(7), 1);
+        chunk.write_op(Opcode::SetLocal, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        // an empty name for slot 0 -- a hidden temporary.
+        chunk.local_names = vec![String::new()];
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.run().expect("run");
+        let state = vm.get_state();
+        assert_eq!(state.variables.len(), 1);
+        assert_eq!(
+            state.variables[0].name, "slot0",
+            "an unnamed slot falls back to slot{{i}}"
+        );
+    }
+
+    #[test]
+    fn state_on_a_finished_program_is_a_terminal_snapshot_not_a_panic() {
+        // a program that runs to completion empties its frame stack (the last
+        // RETURN pops main's frame). get_state must still build -- a terminal
+        // snapshot, no panic, no out-of-bounds index.
+        let src = "fn main() -> i64 is pure { return 42 }";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the program runs clean");
+        // after run() the frame stack is empty; get_state handles it.
+        let state = vm.get_state();
+        assert!(state.variables.is_empty(), "a finished program has no frame");
+        // the result value (42) is still on the stack -- get_state shows it.
+        assert!(
+            state.stack.iter().any(|s| s.rendered == "42"),
+            "the program result is visible in the terminal snapshot"
+        );
+    }
+
+    #[test]
+    fn get_state_output_is_deterministic_across_two_calls() {
+        // the snapshot iterates Vecs only, no HashMap -- two calls on the same
+        // VM state must produce equal snapshots (the Phase 6 bridge contract).
+        let src = "\
+fn main() -> i64 is pure {
+    let a = 1
+    let b = 2
+    return a + b
+}
+";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        // step partway in so there are locals and a non-empty stack.
+        for _ in 0..4 {
+            if vm.step().expect("step") == StepOutcome::Halted {
+                break;
+            }
+        }
+        let first = vm.get_state();
+        let second = vm.get_state();
+        assert_eq!(first.ip, second.ip);
+        assert_eq!(first.chunk_index, second.chunk_index);
+        assert_eq!(first.stack.len(), second.stack.len());
+        assert_eq!(first.variables.len(), second.variables.len());
+        for (a, b) in first.variables.iter().zip(second.variables.iter()) {
+            assert_eq!(a.name, b.name, "variable order is stable across calls");
+            assert_eq!(a.value.rendered, b.value.rendered);
+        }
+    }
+
+    #[test]
+    fn step_advances_ip_by_exactly_one_full_instruction_for_every_width() {
+        // a program mixing a 3-byte instruction (CONST), a 1-byte instruction
+        // (POP), and a 3-byte one (CONST again): each step() must advance ip by
+        // exactly 1 + operand_bytes() of the opcode it executed -- one step is
+        // one whole multi-byte instruction, never a partial advance.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1); // bytes 0..2
+        chunk.write_op(Opcode::Pop, 1); // byte 3
+        emit_const(&mut chunk, ConstValue::I64(2), 1); // bytes 4..6
+        chunk.write_op(Opcode::Halt, 1); // byte 7
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+
+        // each step: capture ip before, step, assert the delta == 1 + operands.
+        let before1 = vm.frame().expect("frame").ip;
+        assert_eq!(vm.step().expect("step 1"), StepOutcome::Ran);
+        let after1 = vm.frame().expect("frame").ip;
+        assert_eq!(
+            after1 - before1,
+            1 + Opcode::Const.operand_bytes() as usize,
+            "CONST advances by 1 + its operand width"
+        );
+
+        let before2 = vm.frame().expect("frame").ip;
+        assert_eq!(vm.step().expect("step 2"), StepOutcome::Ran);
+        let after2 = vm.frame().expect("frame").ip;
+        assert_eq!(
+            after2 - before2,
+            1 + Opcode::Pop.operand_bytes() as usize,
+            "POP is a zero-operand opcode -- ip advances by exactly 1"
+        );
+
+        let before3 = vm.frame().expect("frame").ip;
+        assert_eq!(vm.step().expect("step 3"), StepOutcome::Ran);
+        let after3 = vm.frame().expect("frame").ip;
+        assert_eq!(
+            after3 - before3,
+            1 + Opcode::Const.operand_bytes() as usize,
+            "the second CONST advances by 1 + its operand width"
+        );
+    }
+
+    #[test]
+    fn vm_state_implements_serialize_for_the_wasm_bridge() {
+        // a compile-time witness: if VmState (and the StateValue / NamedValue
+        // it nests) did not derive serde::Serialize, this generic call would
+        // fail to typecheck. Phase 6's WASM bridge serializes get_state's
+        // output, so the derive is part of the locked contract.
+        fn assert_serialize<T: serde::Serialize>(_: &T) {}
+        let src = "fn main() -> i64 is pure { return 5 }";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("run");
+        let state = vm.get_state();
+        assert_serialize(&state);
+    }
+
+    #[test]
+    fn runtime_type_name_renders_compound_types_structurally() {
+        // an array of i64 is `[i64]`; an empty array is `[]`. build them on the
+        // heap directly and ask the shared helper.
+        let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
+        let int_slot = vm.heap.alloc(HeapObject::Int(1)).expect("alloc int");
+        let arr = vm
+            .heap
+            .alloc(HeapObject::Array(vec![Value::pointer(int_slot)]))
+            .expect("alloc array");
+        assert_eq!(vm.runtime_type_name(Value::pointer(arr)), "[i64]");
+        let empty = vm.heap.alloc(HeapObject::Array(Vec::new())).expect("alloc");
+        assert_eq!(
+            vm.runtime_type_name(Value::pointer(empty)),
+            "[]",
+            "an empty array has no element type to show"
+        );
+        // a tuple renders its element types positionally.
+        let s = vm.heap.alloc(HeapObject::Str("k".to_string())).expect("s");
+        let tup = vm
+            .heap
+            .alloc(HeapObject::Tuple(vec![Value::pointer(int_slot), Value::pointer(s)]))
+            .expect("alloc tuple");
+        assert_eq!(vm.runtime_type_name(Value::pointer(tup)), "(i64, str)");
     }
 }
