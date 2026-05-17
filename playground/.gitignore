@@ -1,0 +1,13 @@
+# dependencies
+node_modules
+
+# next build output
+.next
+out
+build
+
+# generated typescript shim
+next-env.d.ts
+
+# wasm artifact copied from the gitignored lib/wasm/ by copy-wasm.mjs
+public/wasm
