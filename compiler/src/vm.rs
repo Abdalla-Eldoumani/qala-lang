@@ -674,10 +674,17 @@ impl Vm {
                 self.op_field(field_index)?;
             }
             Opcode::Len => self.op_len()?,
-            // ---- not implemented by this plan (strings, match) -- a later
-            // plan replaces these stubs ----
-            Opcode::ToStr | Opcode::ConcatN | Opcode::MatchVariant => {
-                return Err(self.runtime_err(&format!("opcode {op:?} not yet implemented")));
+            // ---- strings ----
+            Opcode::ToStr => self.op_to_str()?,
+            Opcode::ConcatN => {
+                let count = self.read_operand_u16(opcode_pos)?;
+                self.op_concat_n(count)?;
+            }
+            // ---- match dispatch ----
+            Opcode::MatchVariant => {
+                let variant_id = self.read_operand_u16(opcode_pos)?;
+                let offset = self.read_match_variant_offset(opcode_pos)?;
+                self.op_match_variant(variant_id, offset, next)?;
             }
             // ---- sentinel ----
             Opcode::Halt => return Ok(StepOutcome::Halted),
@@ -718,6 +725,22 @@ impl Vm {
             .get(off)
             .copied()
             .ok_or_else(|| self.runtime_err("truncated operand"))
+    }
+
+    /// read the trailing `i16` miss-offset of a [`Opcode::MatchVariant`]
+    /// instruction whose opcode byte is at `opcode_pos`.
+    ///
+    /// MATCH_VARIANT's operand layout is `u16 variant_id` then `i16 offset`, so
+    /// the signed offset sits at `opcode_pos + 3`. [`Vm::dispatch_one`] has
+    /// already bounds-checked the four-byte operand sequence; this re-checks
+    /// the two-byte read defensively so the never-panic guarantee stays local.
+    fn read_match_variant_offset(&self, opcode_pos: usize) -> Result<i16, QalaError> {
+        let chunk = self.chunk()?;
+        let off = opcode_pos + 3;
+        if off + 2 > chunk.code.len() {
+            return Err(self.runtime_err("truncated operand"));
+        }
+        Ok(chunk.read_i16(off))
     }
 
     /// the constant-pool entry at `idx` converted to a runtime [`Value`] and
@@ -1339,6 +1362,195 @@ impl Vm {
         self.push_i64(len as i64)
     }
 
+    // ---- the value-to-string routine + string opcodes ---------------------
+
+    /// render a runtime [`Value`] to its display string.
+    ///
+    /// the spelling is locked and matches `ConstValue`'s `Display` for the
+    /// primitive kinds, so a runtime value renders the same way its
+    /// compile-time constant would:
+    /// - an `i64` (a heap `Int`): the decimal form, e.g. `-7`.
+    /// - an `f64`: non-finite values hand-spelled `NaN` / `inf` / `-inf`
+    ///   (so a `println` of a NaN float shows `NaN`); a finite value uses
+    ///   Rust's default `f64` `Display`.
+    /// - a `bool`: `true` / `false`.
+    /// - a `byte`: the plain decimal value (e.g. `65`) -- the readable form for
+    ///   a `println`, NOT `ConstValue`'s `b'\xNN'` disassembly spelling.
+    /// - `void`: `()`.
+    /// - a `str` (a heap `Str`): the raw inner text, UNquoted -- `println` of a
+    ///   string shows the string itself, not a quoted literal.
+    /// - an array `[a, b, c]`, a tuple `(a, b, c)`, a struct
+    ///   `Name { f0, f1 }`, an enum variant `Enum::Variant(p0, p1)` (or just
+    ///   `Enum::Variant` with no payload) -- rendered recursively.
+    /// - a file handle: a `<file "path">` placeholder; the VM does no real I/O.
+    ///
+    /// reused by [`Vm::op_to_str`], [`Vm::op_concat_n`], and 05-05's
+    /// `print` / `println`. a dangling pointer (a freed slot) is rendered as
+    /// `<dangling>` rather than erroring -- a display routine must never fail.
+    fn value_to_string(&self, v: Value) -> String {
+        // a tagged scalar: bool / byte / void / function decode directly.
+        if let Some(b) = v.as_bool() {
+            return if b { "true".to_string() } else { "false".to_string() };
+        }
+        if let Some(b) = v.as_byte() {
+            return b.to_string();
+        }
+        if v.as_void() {
+            return "()".to_string();
+        }
+        if let Some(id) = v.as_function() {
+            return format!("fn#{id}");
+        }
+        // a pointer: dispatch on the heap object.
+        if let Some(slot) = v.as_pointer() {
+            return match self.heap.get(slot) {
+                Some(HeapObject::Int(n)) => n.to_string(),
+                Some(HeapObject::Str(s)) => s.clone(),
+                Some(HeapObject::Array(items)) => {
+                    let parts: Vec<String> =
+                        items.iter().map(|e| self.value_to_string(*e)).collect();
+                    format!("[{}]", parts.join(", "))
+                }
+                Some(HeapObject::Tuple(items)) => {
+                    let parts: Vec<String> =
+                        items.iter().map(|e| self.value_to_string(*e)).collect();
+                    format!("({})", parts.join(", "))
+                }
+                Some(HeapObject::Struct { type_name, fields }) => {
+                    let parts: Vec<String> =
+                        fields.iter().map(|e| self.value_to_string(*e)).collect();
+                    format!("{type_name} {{ {} }}", parts.join(", "))
+                }
+                Some(HeapObject::EnumVariant {
+                    type_name,
+                    variant,
+                    payload,
+                }) => {
+                    if payload.is_empty() {
+                        format!("{type_name}::{variant}")
+                    } else {
+                        let parts: Vec<String> =
+                            payload.iter().map(|e| self.value_to_string(*e)).collect();
+                        format!("{type_name}::{variant}({})", parts.join(", "))
+                    }
+                }
+                Some(HeapObject::FileHandle { path, .. }) => format!("<file \"{path}\">"),
+                None => "<dangling>".to_string(),
+            };
+        }
+        // not tagged and not a pointer: a real f64. hand-spell non-finite
+        // values to match ConstValue's Display.
+        match v.as_f64() {
+            Some(x) if x.is_nan() => "NaN".to_string(),
+            Some(x) if x == f64::INFINITY => "inf".to_string(),
+            Some(x) if x == f64::NEG_INFINITY => "-inf".to_string(),
+            Some(x) => format!("{x}"),
+            // unreachable: a value is a tagged scalar, a pointer, or an f64.
+            None => "<unknown>".to_string(),
+        }
+    }
+
+    /// execute [`Opcode::ToStr`]: pop one value, push its string form as a
+    /// heap [`HeapObject::Str`].
+    ///
+    /// used to materialise an interpolated segment whose static type is not
+    /// already `str`. a heap exhaustion is a `Runtime` error.
+    fn op_to_str(&mut self) -> Result<(), QalaError> {
+        let v = self.pop()?;
+        let s = self.value_to_string(v);
+        let slot = self
+            .heap
+            .alloc(HeapObject::Str(s))
+            .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+        self.push(Value::pointer(slot))
+    }
+
+    /// execute [`Opcode::ConcatN`]: pop `count` values, concatenate their
+    /// string forms in source order, push the result as a heap `Str`.
+    ///
+    /// the values come off the stack in source order via [`Vm::pop_n`] (the
+    /// last-pushed is the last segment). each is rendered with
+    /// [`Vm::value_to_string`], so a string interpolation of a NaN float
+    /// renders `NaN`. used to materialise string interpolation. a heap
+    /// exhaustion is a `Runtime` error.
+    fn op_concat_n(&mut self, count: u16) -> Result<(), QalaError> {
+        let parts = self.pop_n(count as usize)?;
+        let mut joined = String::new();
+        for part in parts {
+            joined.push_str(&self.value_to_string(part));
+        }
+        let slot = self
+            .heap
+            .alloc(HeapObject::Str(joined))
+            .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+        self.push(Value::pointer(slot))
+    }
+
+    /// execute [`Opcode::MatchVariant`]: test the scrutinee on top of the stack
+    /// against `variant_id` and either destructure it or branch.
+    ///
+    /// `fall_through` is the byte after the whole four-byte-operand instruction
+    /// -- the position the signed miss `offset` is relative to.
+    ///
+    /// the scrutinee must be a [`HeapObject::EnumVariant`]; a non-enum
+    /// scrutinee is a `Runtime` error. the comparison key is the
+    /// `(enum_name, variant_name)` pair: the heap `EnumVariant` stores names,
+    /// not the id, so the operand `variant_id` is resolved through
+    /// [`Program::enum_variant_names`] to a name pair and the two pairs are
+    /// compared. on a match the scrutinee is consumed (`pop`) and each payload
+    /// value is pushed -- the first payload field deepest, the last on top --
+    /// so the arm's destructuring `SET_LOCAL`s bind them. on a miss the
+    /// scrutinee is left on the stack and `ip` is set to `fall_through + offset`
+    /// (bounds-checked into the chunk via [`Vm::do_jump`]) so a `MATCH_VARIANT`
+    /// chain can re-test the same scrutinee against the next arm.
+    fn op_match_variant(
+        &mut self,
+        variant_id: u16,
+        offset: i16,
+        fall_through: usize,
+    ) -> Result<(), QalaError> {
+        // peek the scrutinee without consuming it -- a miss must leave it.
+        let scrutinee = *self
+            .stack
+            .last()
+            .ok_or_else(|| self.runtime_err("stack underflow at a match"))?;
+        let slot = scrutinee
+            .as_pointer()
+            .ok_or_else(|| self.runtime_err("match scrutinee is not an enum value"))?;
+        // resolve the operand variant id to its (enum, variant) name pair.
+        let (want_enum, want_variant) = self
+            .program
+            .enum_variant_names
+            .get(variant_id as usize)
+            .ok_or_else(|| self.runtime_err(&format!("bad variant id {variant_id}")))?
+            .clone();
+        // read the scrutinee's own enum/variant names and payload.
+        let (matches, payload) = match self.heap.get(slot) {
+            Some(HeapObject::EnumVariant {
+                type_name,
+                variant,
+                payload,
+            }) => {
+                let hit = *type_name == want_enum && *variant == want_variant;
+                (hit, if hit { payload.clone() } else { Vec::new() })
+            }
+            _ => {
+                return Err(self.runtime_err("match scrutinee is not an enum value"));
+            }
+        };
+        if matches {
+            // consume the scrutinee, push the payload (first field deepest).
+            self.pop()?;
+            for value in payload {
+                self.push(value)?;
+            }
+            Ok(())
+        } else {
+            // a miss: leave the scrutinee, branch to the next arm.
+            self.do_jump(fall_through, offset)
+        }
+    }
+
     /// run the program from the current state to `Halt` or the first runtime
     /// error.
     ///
@@ -1891,14 +2103,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_an_unimplemented_opcode_is_a_clean_runtime_stub_not_a_panic() {
-        // TO_STR is still stubbed at this point in the build (Task 3 of this
-        // plan fills it in); until then it must be a clean Runtime "not yet
-        // implemented" error, not a panic. the not-implemented dispatch arm
-        // returns before any stack access, so an empty stack is fine here.
+    fn the_remaining_unimplemented_seam_is_a_clean_runtime_stub_not_a_panic() {
+        // every opcode now has a real handler -- the dispatch match has no
+        // "not yet implemented" arm left. the one remaining deferred-feature
+        // seam is `call_stdlib`: a CALL to a stdlib fn-id (>= STDLIB_FN_BASE)
+        // routes there, and until 05-05 fills it in it must be a clean Runtime
+        // "not yet implemented" error, never a panic. this guards the
+        // stub-then-fill discipline against the last unimplemented path.
         let mut chunk = Chunk::new();
-        chunk.write_op(Opcode::ToStr, 1);
-        chunk.write_op(Opcode::Halt, 1);
+        chunk.write_op(Opcode::Call, 1);
+        chunk.write_u16(STDLIB_FN_BASE, 1);
+        chunk.code.push(0); // argc 0
+        chunk.source_lines.push(1);
+        chunk.write_op(Opcode::Return, 1);
         let mut vm = Vm::new(program_with(chunk), "x".to_string());
         match vm.run() {
             Err(QalaError::Runtime { message, .. }) => {
@@ -2844,5 +3061,274 @@ fn main() -> i64 is pure {
             Err(other) => panic!("expected a Runtime not-a-struct error, got {other:?}"),
             Ok(_) => panic!("expected a Runtime not-a-struct error, the program ran clean"),
         }
+    }
+
+    // ---- TO_STR / CONCAT_N / MATCH_VARIANT + value_to_string + defer ----
+
+    /// the `String` the stack top decodes to: a pointer to a heap `Str`.
+    fn top_str(vm: &Vm) -> String {
+        let top = *vm.stack.last().expect("a value on the stack");
+        let slot = top.as_pointer().expect("a heap pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Str(s)) => s.clone(),
+            _ => panic!("the result pointer does not reach a heap Str"),
+        }
+    }
+
+    #[test]
+    fn to_str_of_an_i64_renders_the_decimal_form() {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(-42), 1);
+        chunk.write_op(Opcode::ToStr, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("to_str i64");
+        assert_eq!(top_str(&vm), "-42");
+    }
+
+    #[test]
+    fn to_str_of_a_bool_renders_the_lowercase_keyword() {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        chunk.write_op(Opcode::ToStr, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("to_str bool");
+        assert_eq!(top_str(&vm), "true");
+    }
+
+    #[test]
+    fn to_str_of_a_float_hand_spells_nan_and_infinities() {
+        // value_to_string of each non-finite f64 matches ConstValue's Display.
+        let to_str = |x: f64| -> String {
+            let mut chunk = Chunk::new();
+            emit_const(&mut chunk, ConstValue::F64(x), 1);
+            chunk.write_op(Opcode::ToStr, 1);
+            chunk.write_op(Opcode::Halt, 1);
+            top_str(&run_chunk(chunk, "x").expect("to_str f64"))
+        };
+        assert_eq!(to_str(f64::NAN), "NaN", "a NaN renders as NaN");
+        assert_eq!(to_str(f64::INFINITY), "inf");
+        assert_eq!(to_str(f64::NEG_INFINITY), "-inf");
+        assert_eq!(to_str(3.5), "3.5", "a finite float uses the default form");
+    }
+
+    #[test]
+    fn value_to_string_renders_each_runtime_value_kind_with_its_locked_spelling() {
+        // exercise value_to_string directly across every kind.
+        let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
+        // tagged scalars.
+        assert_eq!(vm.value_to_string(Value::bool(false)), "false");
+        assert_eq!(vm.value_to_string(Value::byte(65)), "65", "a byte is decimal");
+        assert_eq!(vm.value_to_string(Value::void()), "()");
+        assert_eq!(vm.value_to_string(Value::function(7)), "fn#7");
+        assert_eq!(vm.value_to_string(Value::from_f64(2.0)), "2");
+        // heap objects.
+        let int_slot = vm.heap.alloc(HeapObject::Int(-3)).expect("alloc");
+        assert_eq!(vm.value_to_string(Value::pointer(int_slot)), "-3");
+        let str_slot = vm
+            .heap
+            .alloc(HeapObject::Str("raw text".to_string()))
+            .expect("alloc");
+        assert_eq!(
+            vm.value_to_string(Value::pointer(str_slot)),
+            "raw text",
+            "a string renders unquoted"
+        );
+        let arr_slot = vm
+            .heap
+            .alloc(HeapObject::Array(vec![
+                Value::pointer(int_slot),
+                Value::bool(true),
+            ]))
+            .expect("alloc");
+        assert_eq!(vm.value_to_string(Value::pointer(arr_slot)), "[-3, true]");
+        let variant_slot = vm
+            .heap
+            .alloc(HeapObject::EnumVariant {
+                type_name: "Shape".to_string(),
+                variant: "Circle".to_string(),
+                payload: vec![Value::pointer(int_slot)],
+            })
+            .expect("alloc");
+        assert_eq!(
+            vm.value_to_string(Value::pointer(variant_slot)),
+            "Shape::Circle(-3)"
+        );
+        let bare_variant = vm
+            .heap
+            .alloc(HeapObject::EnumVariant {
+                type_name: "Color".to_string(),
+                variant: "Red".to_string(),
+                payload: Vec::new(),
+            })
+            .expect("alloc");
+        assert_eq!(
+            vm.value_to_string(Value::pointer(bare_variant)),
+            "Color::Red",
+            "a payload-less variant renders without parentheses"
+        );
+    }
+
+    #[test]
+    fn concat_n_joins_several_values_into_one_string() {
+        // CONST "a=" ; CONST 1 ; TO_STR ; CONST "!" ; CONCAT_N 3 -> "a=1!".
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Str("a=".to_string()), 1);
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        chunk.write_op(Opcode::ToStr, 1);
+        emit_const(&mut chunk, ConstValue::Str("!".to_string()), 1);
+        chunk.write_op(Opcode::ConcatN, 1);
+        chunk.write_u16(3, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("concat_n");
+        assert_eq!(top_str(&vm), "a=1!", "CONCAT_N joins in source order");
+    }
+
+    #[test]
+    fn concat_n_of_an_interpolated_nan_float_renders_the_word_nan() {
+        // the VM-04 guarantee at the CONCAT_N layer: a string interpolation of
+        // a NaN float renders "NaN", not a numeric token. CONST "v=" ;
+        // CONST NaN ; CONCAT_N 2 -> "v=NaN" (CONCAT_N stringifies each part).
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Str("v=".to_string()), 1);
+        emit_const(&mut chunk, ConstValue::F64(f64::NAN), 1);
+        chunk.write_op(Opcode::ConcatN, 1);
+        chunk.write_u16(2, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("concat_n nan");
+        assert_eq!(top_str(&vm), "v=NaN", "an interpolated NaN renders as NaN");
+    }
+
+    #[test]
+    fn match_variant_on_a_match_destructures_the_payload_onto_the_stack() {
+        // a Program whose variant id 0 is (Shape, Circle). build Circle(99),
+        // then MATCH_VARIANT 0: a hit consumes the scrutinee and leaves the
+        // payload 99 on the stack.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(99), 1);
+        chunk.write_op(Opcode::MakeEnumVariant, 1);
+        chunk.write_u16(0, 1);
+        chunk.code.push(1); // payload count 1
+        chunk.source_lines.push(1);
+        // MATCH_VARIANT 0, miss-offset +0 (irrelevant on a hit).
+        chunk.write_op(Opcode::MatchVariant, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_i16(0, 1);
+        chunk.write_op(Opcode::Halt, 1);
+
+        let mut p = program_with(chunk);
+        p.enum_variant_names
+            .push(("Shape".to_string(), "Circle".to_string()));
+        let mut vm = Vm::new(p, "x".to_string());
+        vm.run().expect("match_variant hit");
+        // a hit consumed the scrutinee and left exactly the payload.
+        assert_eq!(vm.stack.len(), 1, "only the payload remains");
+        assert_eq!(top_i64(&vm), 99, "the destructured payload is 99");
+    }
+
+    #[test]
+    fn match_variant_on_a_miss_leaves_the_scrutinee_and_branches_by_the_offset() {
+        // build Circle(1), then MATCH_VARIANT against the (Shape, Square)
+        // variant id -- a miss. the scrutinee stays on the stack, ip branches
+        // past a skipped CONST by the i16 offset.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1); // bytes 0..2
+        chunk.write_op(Opcode::MakeEnumVariant, 1); // byte 3
+        chunk.write_u16(0, 1); // bytes 4..5: variant id 0 (Circle)
+        chunk.code.push(1); // byte 6: payload count
+        chunk.source_lines.push(1);
+        // MATCH_VARIANT at byte 7, operand bytes 8..11, fall-through 12.
+        chunk.write_op(Opcode::MatchVariant, 1); // byte 7
+        chunk.write_u16(1, 1); // bytes 8..9: variant id 1 (Square) -- a miss
+        chunk.write_i16(3, 1); // bytes 10..11: miss offset +3 -> target 15
+        emit_const(&mut chunk, ConstValue::I64(777), 1); // bytes 12..14 (skipped)
+        chunk.write_op(Opcode::Halt, 1); // byte 15
+        let mut p = program_with(chunk);
+        p.enum_variant_names
+            .push(("Shape".to_string(), "Circle".to_string()));
+        p.enum_variant_names
+            .push(("Shape".to_string(), "Square".to_string()));
+        let mut vm = Vm::new(p, "x".to_string());
+        vm.run().expect("match_variant miss");
+        // a miss left the scrutinee and branched past the CONST 777, so the
+        // stack holds exactly the one scrutinee pointer.
+        assert_eq!(vm.stack.len(), 1, "the scrutinee stays, the CONST was skipped");
+        let top = *vm.stack.last().expect("the scrutinee");
+        let slot = top.as_pointer().expect("the scrutinee is an enum pointer");
+        assert!(
+            matches!(vm.heap.get(slot), Some(HeapObject::EnumVariant { .. })),
+            "the value left on the stack is the original scrutinee"
+        );
+    }
+
+    #[test]
+    fn match_variant_of_a_non_enum_scrutinee_is_a_runtime_error_not_a_panic() {
+        // MATCH_VARIANT on an i64 -- not an enum value.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(5), 1);
+        chunk.write_op(Opcode::MatchVariant, 1);
+        chunk.write_u16(0, 1);
+        chunk.write_i16(0, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let mut p = program_with(chunk);
+        p.enum_variant_names
+            .push(("E".to_string(), "V".to_string()));
+        let mut vm = Vm::new(p, "x".to_string());
+        match vm.run() {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("not an enum"), "got: {message}");
+            }
+            other => panic!("expected a Runtime non-enum-scrutinee error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defer_bytecode_runs_in_lifo_order_at_scope_exit() {
+        // VM-03: Phase 4 codegen splices defer bytecode inline at scope exit,
+        // emitted in REVERSE (LIFO) order. this test compiles a Qala program
+        // with two defers, runs it through the VM, and confirms both that the
+        // VM executes the spliced defer bytecode correctly (the program runs
+        // clean to completion -- no stack imbalance from the extra calls) AND
+        // that the two defer call sites appear LIFO in the emitted bytecode.
+        let src = "\
+fn first() -> i64 is pure { return 1 }
+fn second() -> i64 is pure { return 2 }
+fn run() -> i64 is pure {
+    defer first()
+    defer second()
+    return 0
+}
+fn main() -> i64 is pure { return run() }
+";
+        let program = compile_qala(src);
+        // `first` and `second` are the first two functions compiled -- dense
+        // ids 0 and 1. the `run` chunk's defers must CALL id 1 (second) BEFORE
+        // id 0 (first): the source order is first-then-second, LIFO reverses it.
+        let run_idx = program
+            .fn_names
+            .iter()
+            .position(|n| n == "run")
+            .expect("the run function exists");
+        let code = &program.chunks[run_idx].code;
+        // collect the fn-ids of every CALL in the run chunk, in byte order.
+        let mut call_ids: Vec<u16> = Vec::new();
+        let mut ip = 0;
+        while ip < code.len() {
+            let Some(op) = Opcode::from_u8(code[ip]) else { break };
+            if op == Opcode::Call {
+                call_ids.push(u16::from_le_bytes([code[ip + 1], code[ip + 2]]));
+            }
+            ip += 1 + op.operand_bytes() as usize;
+        }
+        let first_id = program.fn_names.iter().position(|n| n == "first").unwrap() as u16;
+        let second_id = program.fn_names.iter().position(|n| n == "second").unwrap() as u16;
+        assert_eq!(
+            call_ids,
+            vec![second_id, first_id],
+            "the run chunk must CALL second's defer before first's defer -- LIFO"
+        );
+        // and the VM runs the whole program (defer bytecode included) clean.
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the program with two defers runs clean");
+        assert_eq!(program_result_i64(&vm), 0, "run returns 0; the defers ran for effect");
     }
 }
