@@ -214,12 +214,16 @@ fn print(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
 
 /// `println(x)` -- render `x` and append it to the VM console as a line.
 ///
-/// each `println` pushes one console entry. the playground renders one entry
-/// per line, so a program's `println` calls read back as exactly the lines it
-/// printed. returns `void`.
+/// each `println` pushes one console entry with a trailing `'\n'`. the
+/// playground renders one entry per line, so the newline is typically invisible
+/// when the console displays entries individually, but consumers that
+/// concatenate entries into a single text block get the correct newline
+/// separation between lines (and no trailing newline after `print` entries).
+/// returns `void`.
 fn println(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let arg = one_arg(vm, args, "println")?;
-    let text = vm.value_to_string(arg);
+    let mut text = vm.value_to_string(arg);
+    text.push('\n');
     vm.console.push(text);
     Ok(Value::void())
 }
@@ -752,11 +756,11 @@ mod tests {
     #[test]
     fn print_and_println_append_to_the_console() {
         let mut vm = bare_vm();
-        // println pushes one console line.
+        // println pushes one console line with a trailing newline.
         let line = string(&mut vm, "first line");
         println(&mut vm, &[line]).expect("println");
-        assert_eq!(vm.console, vec!["first line".to_string()]);
-        // print pushes its own console entry (the v1 line-list convention).
+        assert_eq!(vm.console, vec!["first line\n".to_string()]);
+        // print pushes its own console entry without a trailing newline.
         let a = string(&mut vm, "a");
         let b = string(&mut vm, "b");
         print(&mut vm, &[a]).expect("print a");
@@ -764,12 +768,27 @@ mod tests {
         assert_eq!(
             vm.console,
             vec![
-                "first line".to_string(),
+                "first line\n".to_string(),
                 "a".to_string(),
                 "b".to_string(),
             ],
-            "each print and println appends one console entry"
+            "println entries end with newline; print entries do not"
         );
+    }
+
+    #[test]
+    fn println_adds_newline_print_does_not() {
+        // joining all console entries produces correct newline separation:
+        // two println calls each add a '\n'; a print call does not.
+        let mut vm = bare_vm();
+        let a = string(&mut vm, "a");
+        let b = string(&mut vm, "b");
+        let c = string(&mut vm, "c");
+        println(&mut vm, &[a]).expect("println a");
+        println(&mut vm, &[b]).expect("println b");
+        print(&mut vm, &[c]).expect("print c");
+        let joined: String = vm.console.concat();
+        assert_eq!(joined, "a\nb\nc", "two println then print joined is a\\nb\\nc");
     }
 
     #[test]
@@ -990,7 +1009,7 @@ mod tests {
         // hello: string interpolation -> "hello, world!".
         let hello = run_example("hello");
         assert!(
-            hello.console.iter().any(|l| l == "hello, world!"),
+            hello.console.iter().any(|l| l.trim_end_matches('\n') == "hello, world!"),
             "hello.qala console: {:?}",
             hello.console,
         );
@@ -999,17 +1018,17 @@ mod tests {
         // lines fib(0)=0 .. fib(14)=377.
         let fibonacci = run_example("fibonacci");
         assert!(
-            fibonacci.console.iter().any(|l| l == "fib(0) = 0"),
+            fibonacci.console.iter().any(|l| l.trim_end_matches('\n') == "fib(0) = 0"),
             "fibonacci.qala console: {:?}",
             fibonacci.console,
         );
         assert!(
-            fibonacci.console.iter().any(|l| l == "fib(10) = 55"),
+            fibonacci.console.iter().any(|l| l.trim_end_matches('\n') == "fib(10) = 55"),
             "fibonacci.qala must print fib(10) = 55, console: {:?}",
             fibonacci.console,
         );
         assert!(
-            fibonacci.console.iter().any(|l| l == "fib(14) = 377"),
+            fibonacci.console.iter().any(|l| l.trim_end_matches('\n') == "fib(14) = 377"),
             "fibonacci.qala must print fib(14) = 377, console: {:?}",
             fibonacci.console,
         );
@@ -1017,7 +1036,7 @@ mod tests {
         // effects: a pure function called from an io function -> "7 squared: 49".
         let effects = run_example("effects");
         assert!(
-            effects.console.iter().any(|l| l == "7 squared: 49"),
+            effects.console.iter().any(|l| l.trim_end_matches('\n') == "7 squared: 49"),
             "effects.qala console: {:?}",
             effects.console,
         );
@@ -1030,17 +1049,17 @@ mod tests {
             "pattern-matching.qala must print something",
         );
         assert!(
-            pattern_matching.console.iter().any(|l| l == "positive"),
+            pattern_matching.console.iter().any(|l| l.trim_end_matches('\n') == "positive"),
             "pattern-matching.qala classify(42) must print positive, console: {:?}",
             pattern_matching.console,
         );
         assert!(
-            pattern_matching.console.iter().any(|l| l == "negative"),
+            pattern_matching.console.iter().any(|l| l.trim_end_matches('\n') == "negative"),
             "pattern-matching.qala classify(-7) must print negative, console: {:?}",
             pattern_matching.console,
         );
         assert!(
-            pattern_matching.console.iter().any(|l| l == "zero"),
+            pattern_matching.console.iter().any(|l| l.trim_end_matches('\n') == "zero"),
             "pattern-matching.qala classify(0) must print zero, console: {:?}",
             pattern_matching.console,
         );
@@ -1058,7 +1077,7 @@ mod tests {
             pipeline.console,
         );
         assert!(
-            pipeline.console.iter().any(|l| l == "20"),
+            pipeline.console.iter().any(|l| l.trim_end_matches('\n') == "20"),
             "pipeline.qala filter+map must print the doubled even 20, console: {:?}",
             pipeline.console,
         );
