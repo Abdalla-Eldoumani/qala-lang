@@ -72,6 +72,10 @@ export interface UseQala {
   // compile. setSource sets it; a successful compile clears it. a dirty
   // edit also stops the run loop synchronously.
   dirty: boolean;
+  // finished is true when the last step or run reached Halt -- the
+  // program is done. it gates Step and Run off in the Controls so a
+  // manual Step past the end does not fault the VM. a Reset clears it.
+  finished: boolean;
   // evaluate one repl line through the bridge. returns the ReplResult, or
   // null when the session is not ready. the hook keeps no transcript --
   // that is the ConsolePanel's own state.
@@ -354,6 +358,18 @@ export function useQala(): UseQala {
     return s.replEval(line);
   }, []);
 
+  // the program has finished when the last step or run reached Halt. a
+  // StepResult carries a "status" field and halts at status "halted"; a
+  // RunResult has no "status" and ran to Halt when ok is true. the run
+  // loop stops itself on the halting tick, so a finished program is not
+  // running -- but Step would still be enabled and a manual Step on the
+  // empty frame stack faults the VM, so the controls gate Step (and Run)
+  // off this flag. a Reset rebuilds the VM at the entry point and clears
+  // lastRun, which clears finished.
+  const finished =
+    lastRun !== null &&
+    ("status" in lastRun ? lastRun.status === "halted" : lastRun.ok);
+
   return {
     status,
     source,
@@ -368,6 +384,7 @@ export function useQala(): UseQala {
     speed,
     setSpeed,
     dirty,
+    finished,
     replEval,
     loadedExample,
     loadExample,
