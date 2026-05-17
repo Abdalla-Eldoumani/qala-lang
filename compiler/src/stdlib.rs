@@ -612,6 +612,22 @@ mod tests {
         }
     }
 
+    /// the rendered form of a finished program's result.
+    ///
+    /// after `run()`, a program's `RETURN` from `main` leaves the result on the
+    /// value stack; `get_state` renders the stack, so the last entry's
+    /// `rendered` string is the result -- `"55"` for an `i64` 55, and so on.
+    /// reading it through the public `get_state` avoids reaching into the VM's
+    /// private value stack from this module.
+    fn program_result(vm: &Vm) -> String {
+        vm.get_state()
+            .stack
+            .last()
+            .expect("a finished program left a result value")
+            .rendered
+            .clone()
+    }
+
     #[test]
     fn len_of_an_array_and_of_a_string() {
         let mut vm = bare_vm();
@@ -909,5 +925,165 @@ mod tests {
             Err(other) => panic!("expected a wrong-type Runtime error, got {other:?}"),
             Ok(_) => panic!("len of a bool must error"),
         }
+    }
+
+    // ---- re-entrancy + the cross-cutting smoke tests ----
+
+    #[test]
+    fn map_reentrant_a_nested_map_inside_the_callback_works() {
+        // RESEARCH Pitfall 7: a `map` whose callback itself calls `map` must
+        // produce the correct nested result. `double_row` is the outer
+        // callback; it calls `map(row, double)` -- a nested re-entry. the loop
+        // state of each `map` stays in Rust locals, so the inner map does not
+        // corrupt the outer. the grid [[1,2],[3,4]] doubled is [[2,4],[6,8]];
+        // the program returns doubled[1][1], which must be 8.
+        let src = "fn double(x: i64) -> i64 is pure { return x * 2 }\n\
+                   fn double_row(row: [i64]) -> [i64] is pure {\n    \
+                   return map(row, double)\n}\n\
+                   fn main() -> i64 is pure {\n    \
+                   let grid = [[1, 2], [3, 4]]\n    \
+                   let doubled = map(grid, double_row)\n    \
+                   return doubled[1][1]\n}\n";
+        let program = compile(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("a nested-map program runs clean");
+        assert_eq!(
+            program_result(&vm),
+            "8",
+            "the nested map doubled [3,4] to [6,8]; [1][1] is 8"
+        );
+    }
+
+    #[test]
+    fn fibonacci_smoke_computes_the_correct_numeric_result() {
+        // the success-criterion smoke test: a recursive fib compiled and run
+        // end to end. fib(10) is 55.
+        let src = "fn fib(n: i64) -> i64 is pure {\n    \
+                   if n <= 1 { return n }\n    \
+                   return fib(n - 1) + fib(n - 2)\n}\n\
+                   fn main() -> i64 is pure {\n    return fib(10)\n}\n";
+        let program = compile(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the fibonacci program runs clean");
+        assert_eq!(program_result(&vm), "55", "fib(10) must be 55");
+    }
+
+    /// read a bundled example from `playground/public/examples/`.
+    fn example_source(name: &str) -> String {
+        let path = format!(
+            "{}/../playground/public/examples/{name}.qala",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    }
+
+    /// compile and run a bundled example, returning the finished VM so the
+    /// caller can inspect its console.
+    fn run_example(name: &str) -> Vm {
+        let src = example_source(name);
+        let program = compile(&src);
+        let mut vm = Vm::new(program, src);
+        vm.run()
+            .unwrap_or_else(|e| panic!("{name}.qala did not run to completion: {e:?}"));
+        vm
+    }
+
+    #[test]
+    fn six_examples_run_to_completion() {
+        // every bundled example compiles, runs to completion without a runtime
+        // error, and -- for the examples that print -- produces the expected
+        // console output. the examples are the acceptance corpus for Phase 5.
+
+        // hello: string interpolation -> "hello, world!".
+        let hello = run_example("hello");
+        assert!(
+            hello.console.iter().any(|l| l == "hello, world!"),
+            "hello.qala console: {:?}",
+            hello.console,
+        );
+
+        // fibonacci: a for loop printing fib(0..14). the console is the 15
+        // lines fib(0)=0 .. fib(14)=377.
+        let fibonacci = run_example("fibonacci");
+        assert!(
+            fibonacci.console.iter().any(|l| l == "fib(0) = 0"),
+            "fibonacci.qala console: {:?}",
+            fibonacci.console,
+        );
+        assert!(
+            fibonacci.console.iter().any(|l| l == "fib(10) = 55"),
+            "fibonacci.qala must print fib(10) = 55, console: {:?}",
+            fibonacci.console,
+        );
+        assert!(
+            fibonacci.console.iter().any(|l| l == "fib(14) = 377"),
+            "fibonacci.qala must print fib(14) = 377, console: {:?}",
+            fibonacci.console,
+        );
+
+        // effects: a pure function called from an io function -> "7 squared: 49".
+        let effects = run_example("effects");
+        assert!(
+            effects.console.iter().any(|l| l == "7 squared: 49"),
+            "effects.qala console: {:?}",
+            effects.console,
+        );
+
+        // pattern-matching: enums with data + guards. it prints the three
+        // shape areas then the three classify results.
+        let pattern_matching = run_example("pattern-matching");
+        assert!(
+            !pattern_matching.console.is_empty(),
+            "pattern-matching.qala must print something",
+        );
+        assert!(
+            pattern_matching.console.iter().any(|l| l == "positive"),
+            "pattern-matching.qala classify(42) must print positive, console: {:?}",
+            pattern_matching.console,
+        );
+        assert!(
+            pattern_matching.console.iter().any(|l| l == "negative"),
+            "pattern-matching.qala classify(-7) must print negative, console: {:?}",
+            pattern_matching.console,
+        );
+        assert!(
+            pattern_matching.console.iter().any(|l| l == "zero"),
+            "pattern-matching.qala classify(0) must print zero, console: {:?}",
+            pattern_matching.console,
+        );
+
+        // pipeline: |> with map / filter. 5 |> double |> add_one |> double is
+        // ((5*2)+1)*2 = 22; the even numbers 1..10 filtered then doubled are
+        // 4, 8, 12, 16, 20.
+        let pipeline = run_example("pipeline");
+        assert!(
+            pipeline
+                .console
+                .iter()
+                .any(|l| l.contains("= 22")),
+            "pipeline.qala must print the pipeline result 22, console: {:?}",
+            pipeline.console,
+        );
+        assert!(
+            pipeline.console.iter().any(|l| l == "20"),
+            "pipeline.qala filter+map must print the doubled even 20, console: {:?}",
+            pipeline.console,
+        );
+
+        // defer-demo: a resource with defer close. process_file's mock read
+        // returns empty content, so len(content) == 0 takes the Err path; the
+        // `or "no data"` fallback supplies the value and main prints it.
+        let defer_demo = run_example("defer-demo");
+        assert!(
+            defer_demo.console.iter().any(|l| l.starts_with("got: ")),
+            "defer-demo.qala must print a got: line, console: {:?}",
+            defer_demo.console,
+        );
+        // the defer closed the handle on every exit path -- no leak.
+        assert!(
+            defer_demo.leak_log.is_empty(),
+            "defer-demo.qala closes its handle via defer -- no leak, got: {:?}",
+            defer_demo.leak_log,
+        );
     }
 }
