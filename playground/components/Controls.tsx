@@ -56,11 +56,13 @@ export default function Controls({
   const ready = status === "ready";
 
   // the disabled matrix (UI-SPEC surface 6). Run/Pause: disabled only
-  // when WASM is not ready or there is no program and the loop is not
-  // running. Step: enabled only with a compiled, non-dirty program and
-  // the loop stopped. Reset: enabled once compiled, including while the
-  // loop runs. the slider: enabled whenever a program is compiled.
-  const runDisabled = !ready || (!programCompiled && !running);
+  // when WASM is not ready or there is no program, the loop is not
+  // running, AND the source is not dirty. a dirty source keeps Run
+  // enabled -- pressing it compiles then runs, the needs-compile column
+  // of the matrix. Step: enabled only with a compiled, non-dirty program
+  // and the loop stopped. Reset: enabled once compiled, including while
+  // the loop runs. the slider: enabled whenever a program is compiled.
+  const runDisabled = !ready || (!programCompiled && !running && !dirty);
   const stepDisabled = !ready || !programCompiled || running || dirty;
   const resetDisabled = !ready || (!programCompiled && !running);
   const speedDisabled = !ready || !programCompiled;
