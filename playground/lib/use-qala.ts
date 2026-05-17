@@ -50,7 +50,10 @@ export interface UseQala {
   status: QalaStatus;
   source: string;
   setSource: (next: string) => void;
-  compile: () => void;
+  // compile the current source through the bridge. returns true on a
+  // successful compile, false on a compile error or a not-ready session,
+  // so a compile-then-run caller can gate the run on the result.
+  compile: () => boolean;
   // the bridge's instant run(). kept for completeness; the Controls' Run
   // button drives the animated loop via play(), not this.
   run: () => void;
@@ -284,9 +287,12 @@ export function useQala(): UseQala {
     window.localStorage.setItem(STORAGE_KEY, source);
   }, [source]);
 
-  const compile = useCallback(() => {
+  // compile returns whether the compile succeeded so a caller in the same
+  // tick can gate on it -- the `lastCompile` state set here is not visible
+  // until the next render, so a return value is the only in-tick signal.
+  const compile = useCallback((): boolean => {
     const s = sessionRef.current;
-    if (!s) return;
+    if (!s) return false;
     const result = s.compile(source);
     setLastCompile(result);
     setLastState(s.getState());
@@ -294,6 +300,7 @@ export function useQala(): UseQala {
     // a successful compile clears dirty -- the program now matches the
     // source. a failed compile leaves it dirty.
     if (result.ok) setDirty(false);
+    return result.ok;
   }, [source]);
 
   const run = useCallback(() => {
