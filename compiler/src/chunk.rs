@@ -57,13 +57,31 @@ pub struct Chunk {
     pub source_lines: Vec<u32>,
 }
 
+/// one declared struct's runtime identity: its name and its field count.
+///
+/// the [`Program::structs`] table holds one of these per declared struct;
+/// a MAKE_STRUCT opcode's `u16` operand indexes it. the VM reads `name` to
+/// label the heap struct it builds (so `type_of` of a struct returns the
+/// declared name) and `field_count` to know how many values to pop. codegen
+/// fills the table as it emits struct literals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructInfo {
+    /// the struct's declared name, e.g. `"Point"`. the VM stores this as the
+    /// heap struct's `type_name`.
+    pub name: String,
+    /// the number of fields the struct declares. MAKE_STRUCT pops exactly
+    /// this many values off the stack to build the struct.
+    pub field_count: u16,
+}
+
 /// a whole compiled program: one chunk per function, with the entry-point
 /// index and a globals table.
 ///
 /// function indexes in CALL opcodes are indexes into [`Program::chunks`];
 /// matching name lookups for the disassembler are in [`Program::fn_names`].
 /// enum variant ids in MAKE_ENUM_VARIANT and MATCH_VARIANT are indexes into
-/// [`Program::enum_variant_names`].
+/// [`Program::enum_variant_names`]. struct ids in MAKE_STRUCT are indexes
+/// into [`Program::structs`].
 #[derive(Debug, Clone, Default)]
 pub struct Program {
     /// one chunk per function, indexed by function id (u16 in CALL operands).
@@ -82,6 +100,11 @@ pub struct Program {
     /// MATCH_VARIANT u16 operands. the disassembler renders
     /// #variant_id(Enum::Variant).
     pub enum_variant_names: Vec<(String, String)>,
+    /// one [`StructInfo`] per declared struct, indexed by MAKE_STRUCT u16
+    /// operands. records each struct's name and field count so the VM can
+    /// build a heap struct with the right `type_name` and pop the right
+    /// number of fields. `Program::default()` gives an empty vec.
+    pub structs: Vec<StructInfo>,
 }
 
 impl Chunk {
@@ -355,10 +378,22 @@ impl Chunk {
                     .unwrap_or("?");
                 format!("#{fn_id}({name})/{argc}")
             }
-            // MAKE_ARRAY / MAKE_TUPLE / MAKE_STRUCT (u16 count) -> `count`.
-            Opcode::MakeArray | Opcode::MakeTuple | Opcode::MakeStruct => {
+            // MAKE_ARRAY / MAKE_TUPLE (u16 count) -> `count`.
+            Opcode::MakeArray | Opcode::MakeTuple => {
                 let count = self.read_u16(off + 1);
                 format!("{count}")
+            }
+            // MAKE_STRUCT (u16 struct_id) -> `#id(StructName)`. the operand
+            // indexes Program.structs; a bad index renders `?`, matching the
+            // other name-table lookups.
+            Opcode::MakeStruct => {
+                let id = self.read_u16(off + 1);
+                let name = program
+                    .structs
+                    .get(id as usize)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("?");
+                format!("#{id}({name})")
             }
             // MAKE_ENUM_VARIANT (u16 variant_id + u8 payload_count) ->
             // `#variant_id(Enum::Variant)/payload_count`.
@@ -815,6 +850,38 @@ mod tests {
         assert!(
             out.contains("MATCH_VARIANT #0(Shape::Circle) miss-> "),
             "missing MATCH_VARIANT line in:\n{out}"
+        );
+    }
+
+    // Test 15b: MAKE_STRUCT renders its u16 operand as `#id(StructName)` by
+    // looking the id up in program.structs; a bad id falls back to `?`.
+    #[test]
+    fn disassemble_renders_make_struct_with_its_struct_name() {
+        let mut p = Program::new();
+        p.fn_names.push("main".to_string());
+        // struct id 0 -> "Point" with two fields.
+        p.structs.push(StructInfo {
+            name: "Point".to_string(),
+            field_count: 2,
+        });
+
+        let mut c = Chunk::new();
+        // MAKE_STRUCT #0 -- the registered struct.
+        c.write_op(Opcode::MakeStruct, 1);
+        c.write_u16(0, 1);
+        // MAKE_STRUCT #9 -- an unregistered id, renders the `?` fallback.
+        c.write_op(Opcode::MakeStruct, 2);
+        c.write_u16(9, 2);
+
+        p.chunks.push(c.clone());
+        let out = c.disassemble(&p);
+        assert!(
+            out.contains("MAKE_STRUCT #0(Point)"),
+            "missing MAKE_STRUCT struct-name rendering in:\n{out}"
+        );
+        assert!(
+            out.contains("MAKE_STRUCT #9(?)"),
+            "missing MAKE_STRUCT bad-id fallback in:\n{out}"
         );
     }
 
