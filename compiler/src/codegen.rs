@@ -150,6 +150,12 @@ struct Codegen<'a> {
     /// the accumulated codegen errors -- the public entry returns these
     /// sorted rather than failing fast on the first one.
     errors: Vec<QalaError>,
+    /// `(slot, name)` for every local bound while compiling the CURRENT
+    /// function. cleared at the start of each function in [`Codegen::compile_item`]
+    /// and drained into the finished chunk's [`Chunk::local_names`]. a scope's
+    /// `(name, slot)` list is gone once the scope is popped, so this outlives
+    /// the scopes and gives the VM the real source name of every slot.
+    local_names_acc: Vec<(u16, String)>,
 }
 
 /// one lexical scope: the locals it binds and the defers it has registered.
@@ -277,6 +283,7 @@ impl<'a> Codegen<'a> {
             struct_id_table: BTreeMap::new(),
             fn_effects,
             errors: Vec::new(),
+            local_names_acc: Vec::new(),
         }
     }
 
@@ -355,12 +362,12 @@ impl<'a> Codegen<'a> {
                         message: format!("codegen: function `{}` was not pre-registered", decl.name),
                     })?;
                 self.current_fn_id = fn_id;
+                // a fresh function: the slot-to-name accumulator starts empty.
+                self.local_names_acc.clear();
                 // the outermost scope holds the parameters in slots 0..N.
                 self.push_scope();
                 for (i, param) in decl.params.iter().enumerate() {
-                    if let Some(scope) = self.scopes.last_mut() {
-                        scope.locals.push((param.name.clone(), i as u16));
-                    }
+                    self.register_local(param.name.clone(), i as u16);
                 }
                 let terminated = self.compile_block(&decl.body)?;
                 if !terminated {
@@ -373,6 +380,8 @@ impl<'a> Codegen<'a> {
                 // remove the outermost scope. its defers fired above (or at
                 // the terminator's exit); no second emission.
                 self.pop_scope_no_defers();
+                // record the slot-to-name table on the finished chunk.
+                self.finalize_local_names();
                 Ok(())
             }
             // type-level items: build_tables recorded what codegen needs.
@@ -554,9 +563,7 @@ impl<'a> Codegen<'a> {
                 let line = self.line_at(*span);
                 self.compile_expr(init)?;
                 let slot = self.next_slot();
-                if let Some(scope) = self.scopes.last_mut() {
-                    scope.locals.push((name.clone(), slot));
-                }
+                self.register_local(name.clone(), slot);
                 self.chunk_mut().write_op(Opcode::SetLocal, line);
                 self.chunk_mut().write_u16(slot, line);
                 Ok(false)
@@ -620,6 +627,48 @@ impl<'a> Codegen<'a> {
                 Ok(false)
             }
         }
+    }
+
+    /// bind a local in the topmost scope: register `(name, slot)` for
+    /// identifier resolution AND record it in [`Codegen::local_names_acc`] so
+    /// the finished chunk can map slot indices back to source names.
+    ///
+    /// every place that introduces a slot a `GET_LOCAL` reads -- a parameter,
+    /// a `let`, a `for` variable, a `match` payload binding, a hidden
+    /// compiler temporary -- goes through here, so the accumulator is the
+    /// complete slot-to-name picture for the current function. a hidden slot
+    /// passes an empty `name` (it is never resolved by an identifier); the VM
+    /// shows `slot{i}` for an empty-named slot.
+    fn register_local(&mut self, name: String, slot: u16) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.locals.push((name.clone(), slot));
+        }
+        self.local_names_acc.push((slot, name));
+    }
+
+    /// drain [`Codegen::local_names_acc`] into a dense slot-indexed name table
+    /// and store it on the chunk just finished. called once per function at
+    /// the end of [`Codegen::compile_item`].
+    ///
+    /// slots are dense (each [`Codegen::next_slot`] hands out the next free
+    /// index) so the table is sized to the highest slot seen. a slot the
+    /// accumulator never recorded -- and the last-write-wins for a slot a
+    /// `for` loop rebinds across nested scopes -- both resolve to the empty
+    /// string, which the VM renders as `slot{i}`.
+    fn finalize_local_names(&mut self) {
+        let max_slot = self
+            .local_names_acc
+            .iter()
+            .map(|(slot, _)| *slot as usize)
+            .max();
+        let mut names: Vec<String> = match max_slot {
+            Some(m) => vec![String::new(); m + 1],
+            None => Vec::new(),
+        };
+        for (slot, name) in self.local_names_acc.drain(..) {
+            names[slot as usize] = name;
+        }
+        self.chunk_mut().local_names = names;
     }
 
     /// the next free local slot in the current chunk: one past the highest
@@ -1721,9 +1770,7 @@ impl<'a> Codegen<'a> {
         // the loop variable's slot, bound in the loop scope so it survives
         // the per-iteration body scope `compile_block` pushes.
         let var_slot = self.next_slot();
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.locals.push((var.to_string(), var_slot));
-        }
+        self.register_local(var.to_string(), var_slot);
         // `var = arr[idx]`.
         self.chunk_mut().write_op(Opcode::GetLocal, line);
         self.chunk_mut().write_u16(arr_slot, line);
@@ -1751,11 +1798,10 @@ impl<'a> Codegen<'a> {
 
     /// bind a hidden (compiler-generated) local slot in the topmost scope so
     /// [`Codegen::next_slot`] does not hand the same slot out twice. the name
-    /// is empty -- a hidden slot is never resolved by an identifier.
+    /// is empty -- a hidden slot is never resolved by an identifier, and the
+    /// VM renders an empty-named slot as `slot{i}`.
     fn bind_hidden_slot(&mut self, slot: u16) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.locals.push((String::new(), slot));
-        }
+        self.register_local(String::new(), slot);
     }
 
     /// patch every `break` jump recorded on the innermost loop scope to land
@@ -1922,10 +1968,8 @@ impl<'a> Codegen<'a> {
             // the arm body runs in its own scope so an arm-local `defer`
             // fires at arm exit. the pattern's bindings live in it.
             self.push_scope();
-            if let Some(scope) = self.scopes.last_mut() {
-                for (bind_name, bind_slot) in bindings {
-                    scope.locals.push((bind_name, bind_slot));
-                }
+            for (bind_name, bind_slot) in bindings {
+                self.register_local(bind_name, bind_slot);
             }
             // an optional guard: when false, fall through to the next arm.
             if let Some(guard) = &arm.guard {
@@ -4183,6 +4227,50 @@ mod tests {
             line_count, op_count,
             "disassembly line count ({line_count}) != opcode count ({op_count}): \
              continue-jump may have landed mid-instruction"
+        );
+    }
+
+    // a function's chunk records the source name of every parameter and `let`
+    // binding in local_names, indexed by slot -- the table the VM's get_state
+    // reads to show `x`, not `slot0`.
+    #[test]
+    fn compiled_chunk_records_parameter_and_let_names_by_slot() {
+        let src = "fn add(a: i64, b: i64) -> i64 is pure {\n\
+                   \x20\x20let sum = a + b\n\
+                   \x20\x20return sum\n\
+                   }";
+        let p = compile_ok(src);
+        let id = p.fn_names.iter().position(|n| n == "add").unwrap();
+        let names = &p.chunks[id].local_names;
+        // slot 0 / 1 are the two params; slot 2 is the `let sum`.
+        assert_eq!(names[0], "a", "param slot 0 is `a`");
+        assert_eq!(names[1], "b", "param slot 1 is `b`");
+        assert_eq!(names[2], "sum", "the `let` slot is `sum`");
+    }
+
+    // a `for` loop's variable is a real name in local_names; the loop's hidden
+    // array / index temporaries have empty names (the VM renders those as
+    // `slot{i}`). a hand-built or comptime chunk leaves local_names empty.
+    #[test]
+    fn compiled_chunk_names_the_for_variable_and_leaves_hidden_slots_empty() {
+        let src = "fn main() -> void is pure {\n\
+                   \x20\x20for n in [1, 2, 3] {\n\
+                   \x20\x20\x20\x20let doubled = n + n\n\
+                   \x20\x20}\n\
+                   }";
+        let p = compile_ok(src);
+        let id = p.fn_names.iter().position(|n| n == "main").unwrap();
+        let names = &p.chunks[id].local_names;
+        // the loop variable `n` and the body `let doubled` are real names.
+        assert!(names.iter().any(|n| n == "n"), "the for variable `n` is named");
+        assert!(
+            names.iter().any(|n| n == "doubled"),
+            "the body `let doubled` is named"
+        );
+        // the hidden for-loop array + index slots carry empty names.
+        assert!(
+            names.iter().any(|n| n.is_empty()),
+            "a for loop has hidden unnamed temporary slots"
         );
     }
 }
