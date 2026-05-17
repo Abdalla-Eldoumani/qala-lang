@@ -1681,6 +1681,14 @@ impl Vm {
     /// - a dangling pointer (a freed heap slot): `?` -- a type name must
     ///   always be produced; this never errors.
     pub(crate) fn runtime_type_name(&self, v: Value) -> String {
+        self.runtime_type_name_depth(v, 0)
+    }
+
+    /// depth-bounded inner worker for [`Vm::runtime_type_name`].
+    fn runtime_type_name_depth(&self, v: Value, depth: u32) -> String {
+        if depth > MAX_DISPLAY_DEPTH {
+            return "...".to_string();
+        }
         // tagged scalars decode without touching the heap.
         if v.as_bool().is_some() {
             return "bool".to_string();
@@ -1700,13 +1708,15 @@ impl Vm {
                 Some(HeapObject::Int(_)) => "i64".to_string(),
                 Some(HeapObject::Str(_)) => "str".to_string(),
                 Some(HeapObject::Array(items)) => match items.first() {
-                    Some(first) => format!("[{}]", self.runtime_type_name(*first)),
+                    Some(first) => {
+                        format!("[{}]", self.runtime_type_name_depth(*first, depth + 1))
+                    }
                     None => "[]".to_string(),
                 },
                 Some(HeapObject::Tuple(items)) => {
                     let parts: Vec<String> = items
                         .iter()
-                        .map(|e| self.runtime_type_name(*e))
+                        .map(|e| self.runtime_type_name_depth(*e, depth + 1))
                         .collect();
                     format!("({})", parts.join(", "))
                 }
@@ -4179,6 +4189,28 @@ fn main() -> i64 is pure {
             .alloc(HeapObject::Tuple(vec![Value::pointer(int_slot), Value::pointer(s)]))
             .expect("alloc tuple");
         assert_eq!(vm.runtime_type_name(Value::pointer(tup)), "(i64, str)");
+    }
+
+    #[test]
+    fn runtime_type_name_depth_limit_prevents_stack_overflow() {
+        // build a chain of arrays nested deeper than MAX_DISPLAY_DEPTH and
+        // verify that runtime_type_name returns without panicking and that
+        // the depth sentinel "..." appears in the output.
+        let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
+        let leaf = vm.heap.alloc(HeapObject::Int(1)).expect("alloc");
+        let mut inner = Value::pointer(leaf);
+        for _ in 0..(MAX_DISPLAY_DEPTH + 2) {
+            let slot = vm
+                .heap
+                .alloc(HeapObject::Array(vec![inner]))
+                .expect("alloc");
+            inner = Value::pointer(slot);
+        }
+        let result = vm.runtime_type_name(inner);
+        assert!(
+            result.contains("..."),
+            "expected depth sentinel in type name, got: {result}"
+        );
     }
 
     // ---- the REPL entry point ----
