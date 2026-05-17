@@ -13,7 +13,7 @@
 // useQala's lastCompile (compiled and ok). the user never switches modes
 // by hand -- compiling a program is the switch.
 
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { MonacoDiagnostic, ReplResult, VmState } from "@/lib/types";
 
 // one entry in the repl transcript: the line the user typed and the
@@ -59,11 +59,13 @@ export default function ConsolePanel({
   // the scrolling body. auto-scroll reads and writes its scrollTop.
   const bodyRef = useRef<HTMLDivElement | null>(null);
 
-  // whether the body was at (or near) the bottom before the latest
-  // content change. sticky-bottom: hold the bottom only while the user
-  // has not scrolled up. a ref, not state -- it is read in a layout
-  // effect and must not trigger a render.
-  const atBottomRef = useRef(true);
+  // the body's scrollHeight as of the last content change. sticky-bottom
+  // needs to know if the user was at the bottom BEFORE the new content,
+  // but a post-commit effect can only measure the DOM after the content
+  // is in -- so it compares the current scroll position against this
+  // remembered previous scrollHeight instead. a ref: it is read and
+  // written in a layout effect and must not trigger a render.
+  const prevScrollHeightRef = useRef(0);
 
   // the repl transcript -- one entry per evaluated line. component state,
   // unbounded by design (UI-SPEC R3). a monotonic counter gives each
@@ -80,26 +82,28 @@ export default function ConsolePanel({
   const consoleLines = state?.console ?? [];
   const runtimeError = lastRun?.error ? lastRun.error.message : null;
 
-  // record whether the body is scrolled to the bottom BEFORE react commits
-  // the new content, so the post-commit effect knows whether to stick. a
-  // 2px slack absorbs sub-pixel rounding. this layout effect runs before
-  // paint on every render; it only reads the dom, it sets no state.
-  useEffect(() => {
-    const body = bodyRef.current;
-    if (body === null) return;
-    atBottomRef.current =
-      body.scrollHeight - body.scrollTop - body.clientHeight < 2;
-  });
-
-  // after the content changes, stick to the bottom only if the user was
-  // already there. keyed on the program-mode line count and the runtime
-  // error so a new output line scrolls, and on the transcript length so a
-  // new repl entry scrolls. the user scrolling up pauses the stick until
+  // sticky-bottom auto-scroll. one layout effect, keyed on the content
+  // that changes the body height: the program-mode line count and the
+  // runtime error (a new output line), and the transcript length (a new
+  // repl entry). it runs after the commit, before paint -- so the new
+  // content is in the DOM but not yet shown.
+  //
+  // whether to stick is decided WITHOUT a second effect: a browser does
+  // not move scrollTop when content is appended, so if the user was
+  // pinned to the bottom before the change, scrollTop + clientHeight
+  // still reaches the PREVIOUS scrollHeight. comparing against the
+  // remembered previous scrollHeight (a 2px slack absorbs sub-pixel
+  // rounding) is the at-bottom test; a separate record effect measuring
+  // the already-grown DOM would read false and break the stick. the user
+  // having scrolled up makes the test false, so the stick pauses until
   // they return to the bottom.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const body = bodyRef.current;
     if (body === null) return;
-    if (atBottomRef.current) body.scrollTop = body.scrollHeight;
+    const wasAtBottom =
+      body.scrollTop + body.clientHeight >= prevScrollHeightRef.current - 2;
+    if (wasAtBottom) body.scrollTop = body.scrollHeight;
+    prevScrollHeightRef.current = body.scrollHeight;
   }, [consoleLines.length, runtimeError, transcript.length]);
 
   // evaluate the current repl line. called on Enter. a blank line is
