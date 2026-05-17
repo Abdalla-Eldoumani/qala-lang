@@ -27,3 +27,5 @@ pub mod codegen;
 pub mod optimizer;
 // stack-based bytecode interpreter -- call frames, heap, single-step.
 pub mod vm;
+// native standard library -- the 15 built-in functions the VM dispatches.
+pub mod stdlib;
