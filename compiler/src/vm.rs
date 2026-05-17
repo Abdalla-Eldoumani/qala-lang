@@ -563,36 +563,66 @@ impl Vm {
                 }
                 self.globals[idx] = v;
             }
-            // ---- arithmetic / comparison / logic / jump ----
-            // a later commit fills these in; until then they are clean stubs.
-            Opcode::Add
-            | Opcode::Sub
-            | Opcode::Mul
-            | Opcode::Div
-            | Opcode::Mod
-            | Opcode::Neg
-            | Opcode::FAdd
-            | Opcode::FSub
-            | Opcode::FMul
-            | Opcode::FDiv
-            | Opcode::FNeg
-            | Opcode::Eq
-            | Opcode::Ne
-            | Opcode::Lt
-            | Opcode::Le
-            | Opcode::Gt
-            | Opcode::Ge
-            | Opcode::FEq
-            | Opcode::FNe
-            | Opcode::FLt
-            | Opcode::FLe
-            | Opcode::FGt
-            | Opcode::FGe
-            | Opcode::Not
-            | Opcode::Jump
-            | Opcode::JumpIfFalse
-            | Opcode::JumpIfTrue => {
-                return Err(self.runtime_err(&format!("opcode {op:?} not yet implemented")));
+            // ---- i64 arithmetic ----
+            // every result is checked: an overflow (or i64::MIN / -1, or a
+            // zero divisor) is a Runtime error, never a Rust panic. the result
+            // is a fresh heap Int -- i64 is uniformly heap-boxed.
+            Opcode::Add => self.op_arith_i64(IntOp::Add)?,
+            Opcode::Sub => self.op_arith_i64(IntOp::Sub)?,
+            Opcode::Mul => self.op_arith_i64(IntOp::Mul)?,
+            Opcode::Div => self.op_arith_i64(IntOp::Div)?,
+            Opcode::Mod => self.op_arith_i64(IntOp::Mod)?,
+            Opcode::Neg => {
+                let n = self.pop_i64()?;
+                let r = n
+                    .checked_neg()
+                    .ok_or_else(|| self.runtime_err("integer overflow"))?;
+                self.push_i64(r)?;
+            }
+            // ---- f64 arithmetic (IEEE 754, no error -- inf / NaN are valid) ----
+            Opcode::FAdd => self.op_arith_f64(FloatOp::Add)?,
+            Opcode::FSub => self.op_arith_f64(FloatOp::Sub)?,
+            Opcode::FMul => self.op_arith_f64(FloatOp::Mul)?,
+            Opcode::FDiv => self.op_arith_f64(FloatOp::Div)?,
+            Opcode::FNeg => {
+                let x = self.pop_f64()?;
+                self.push(Value::from_f64(-x))?;
+            }
+            // ---- comparisons (the VM dispatches by operand type) ----
+            Opcode::Eq => self.op_compare(CmpOp::Eq)?,
+            Opcode::Ne => self.op_compare(CmpOp::Ne)?,
+            Opcode::Lt => self.op_compare(CmpOp::Lt)?,
+            Opcode::Le => self.op_compare(CmpOp::Le)?,
+            Opcode::Gt => self.op_compare(CmpOp::Gt)?,
+            Opcode::Ge => self.op_compare(CmpOp::Ge)?,
+            // ---- f64 comparisons (IEEE 754: NaN compares unequal) ----
+            Opcode::FEq => self.op_compare_f64(CmpOp::Eq)?,
+            Opcode::FNe => self.op_compare_f64(CmpOp::Ne)?,
+            Opcode::FLt => self.op_compare_f64(CmpOp::Lt)?,
+            Opcode::FLe => self.op_compare_f64(CmpOp::Le)?,
+            Opcode::FGt => self.op_compare_f64(CmpOp::Gt)?,
+            Opcode::FGe => self.op_compare_f64(CmpOp::Ge)?,
+            // ---- logic ----
+            Opcode::Not => {
+                let b = self.pop_bool()?;
+                self.push(Value::bool(!b))?;
+            }
+            // ---- control flow ----
+            Opcode::Jump => {
+                let offset = self.read_operand_i16(opcode_pos)?;
+                self.do_jump(next, offset)?;
+            }
+            Opcode::JumpIfFalse => {
+                let offset = self.read_operand_i16(opcode_pos)?;
+                if !self.pop_bool()? {
+                    self.do_jump(next, offset)?;
+                }
+            }
+            Opcode::JumpIfTrue => {
+                let offset = self.read_operand_i16(opcode_pos)?;
+                if self.pop_bool()? {
+                    self.do_jump(next, offset)?;
+                }
             }
             // ---- not implemented by this plan (calls, heap construction,
             // access, strings, match) -- a later plan replaces these stubs ----
@@ -676,6 +706,223 @@ impl Vm {
         self.push(value)
     }
 
+    // ---- typed pops + the i64 push ----------------------------------------
+
+    /// pop a value and decode it as an `i64`.
+    ///
+    /// an `i64` runtime value is a `TAG_PTR` pointer to a [`HeapObject::Int`]
+    /// (the uniform-heap-box rule). a value that is not a pointer, or a pointer
+    /// to a non-`Int` heap object, is a [`QalaError::Runtime`] "expected an
+    /// integer" -- never a panic.
+    fn pop_i64(&mut self) -> Result<i64, QalaError> {
+        let v = self.pop()?;
+        let slot = v
+            .as_pointer()
+            .ok_or_else(|| self.runtime_err("expected an integer"))?;
+        match self.heap.get(slot) {
+            Some(HeapObject::Int(n)) => Ok(*n),
+            _ => Err(self.runtime_err("expected an integer")),
+        }
+    }
+
+    /// pop a value and decode it as an `f64`.
+    ///
+    /// an `f64` is stored verbatim in the value (not heap-boxed). a non-`f64`
+    /// value is a [`QalaError::Runtime`] "expected a float".
+    fn pop_f64(&mut self) -> Result<f64, QalaError> {
+        let v = self.pop()?;
+        v.as_f64()
+            .ok_or_else(|| self.runtime_err("expected a float"))
+    }
+
+    /// pop a value and decode it as a `bool`.
+    ///
+    /// a non-`bool` value is a [`QalaError::Runtime`] "expected a boolean".
+    fn pop_bool(&mut self) -> Result<bool, QalaError> {
+        let v = self.pop()?;
+        v.as_bool()
+            .ok_or_else(|| self.runtime_err("expected a boolean"))
+    }
+
+    /// pop a value and decode it as an owned `String`.
+    ///
+    /// a `str` runtime value is a `TAG_PTR` pointer to a [`HeapObject::Str`].
+    /// the string is cloned out so the caller owns it independently of the
+    /// heap slot. a non-string value is a [`QalaError::Runtime`] "expected a
+    /// string".
+    ///
+    /// `allow(dead_code)`: the string-comparison path in `op_compare` uses the
+    /// heap slot directly; this typed pop is part of the pop-helper family the
+    /// later string opcodes (`CONCAT_N`, `TO_STR`) consume.
+    #[allow(dead_code)]
+    fn pop_str(&mut self) -> Result<String, QalaError> {
+        let v = self.pop()?;
+        let slot = v
+            .as_pointer()
+            .ok_or_else(|| self.runtime_err("expected a string"))?;
+        match self.heap.get(slot) {
+            Some(HeapObject::Str(s)) => Ok(s.clone()),
+            _ => Err(self.runtime_err("expected a string")),
+        }
+    }
+
+    /// allocate a [`HeapObject::Int`] for `n` and push a pointer to it.
+    ///
+    /// the shared tail of every i64-producing opcode: `i64` is uniformly
+    /// heap-boxed, so an integer result is always a fresh heap object reached
+    /// through a pointer. a heap-exhaustion is a [`QalaError::Runtime`].
+    fn push_i64(&mut self, n: i64) -> Result<(), QalaError> {
+        let slot = self
+            .heap
+            .alloc(HeapObject::Int(n))
+            .ok_or_else(|| self.runtime_err("heap exhausted"))?;
+        self.push(Value::pointer(slot))
+    }
+
+    /// read the `i16` operand (a signed jump offset) of the instruction whose
+    /// opcode byte is at `opcode_pos`.
+    ///
+    /// like [`Vm::read_operand_u16`] this re-checks the two-byte read is in
+    /// range rather than trust the caller, keeping the never-panic guarantee
+    /// local.
+    fn read_operand_i16(&self, opcode_pos: usize) -> Result<i16, QalaError> {
+        let chunk = self.chunk()?;
+        let off = opcode_pos + 1;
+        if off + 2 > chunk.code.len() {
+            return Err(self.runtime_err("truncated operand"));
+        }
+        Ok(chunk.read_i16(off))
+    }
+
+    // ---- arithmetic / comparison / jump handlers --------------------------
+
+    /// pop two `i64` operands and push the checked result of `op`.
+    ///
+    /// the deeper stack value is the left operand. every operation goes through
+    /// `i64::checked_*`: an overflow is "integer overflow", a zero divisor (or
+    /// the `i64::MIN / -1` overflow that `checked_div` / `checked_rem` also
+    /// reject) is "division by zero" / "modulo by zero". one `None` check on
+    /// the checked op covers both faults.
+    fn op_arith_i64(&mut self, op: IntOp) -> Result<(), QalaError> {
+        // pop order: rhs is on top, lhs is below it.
+        let rhs = self.pop_i64()?;
+        let lhs = self.pop_i64()?;
+        let result = match op {
+            IntOp::Add => lhs
+                .checked_add(rhs)
+                .ok_or_else(|| self.runtime_err("integer overflow"))?,
+            IntOp::Sub => lhs
+                .checked_sub(rhs)
+                .ok_or_else(|| self.runtime_err("integer overflow"))?,
+            IntOp::Mul => lhs
+                .checked_mul(rhs)
+                .ok_or_else(|| self.runtime_err("integer overflow"))?,
+            IntOp::Div => lhs
+                .checked_div(rhs)
+                .ok_or_else(|| self.runtime_err("division by zero"))?,
+            IntOp::Mod => lhs
+                .checked_rem(rhs)
+                .ok_or_else(|| self.runtime_err("modulo by zero"))?,
+        };
+        self.push_i64(result)
+    }
+
+    /// pop two `f64` operands and push the IEEE 754 result of `op`.
+    ///
+    /// the deeper stack value is the left operand. float arithmetic never
+    /// errors -- `FDiv` of a zero divisor yields `inf` / `-inf` / `NaN` per
+    /// IEEE 754, exactly as plain Rust `f64` `/` does.
+    fn op_arith_f64(&mut self, op: FloatOp) -> Result<(), QalaError> {
+        let rhs = self.pop_f64()?;
+        let lhs = self.pop_f64()?;
+        let result = match op {
+            FloatOp::Add => lhs + rhs,
+            FloatOp::Sub => lhs - rhs,
+            FloatOp::Mul => lhs * rhs,
+            FloatOp::Div => lhs / rhs,
+        };
+        self.push(Value::from_f64(result))
+    }
+
+    /// pop two values, compare them by their runtime kind, and push the `bool`
+    /// result of `op`.
+    ///
+    /// the two operands must be the same kind. supported kinds: two heap
+    /// `Int`s (compared as `i64`), two heap `Str`s (compared lexicographically
+    /// as Rust strings), or two `bool`s. a `bool` ordering follows Rust's
+    /// `false < true`; the typechecker only emits an ordering comparison on a
+    /// type it has already accepted, so the runtime ordering is well-defined
+    /// for every case the typechecker lets through. a kind mismatch between the
+    /// two operands is a [`QalaError::Runtime`].
+    fn op_compare(&mut self, op: CmpOp) -> Result<(), QalaError> {
+        let rhs = self.pop()?;
+        let lhs = self.pop()?;
+        let ordering = self.compare_values(lhs, rhs)?;
+        self.push(Value::bool(op.holds(ordering)))
+    }
+
+    /// the [`Ordering`](std::cmp::Ordering) of two same-kind values.
+    ///
+    /// pulled out of [`Vm::op_compare`] so the kind dispatch is one place. a
+    /// pointer is resolved to its heap object before comparison; a kind
+    /// mismatch is a [`QalaError::Runtime`].
+    fn compare_values(
+        &self,
+        lhs: Value,
+        rhs: Value,
+    ) -> Result<std::cmp::Ordering, QalaError> {
+        // both bools: order false < true.
+        if let (Some(a), Some(b)) = (lhs.as_bool(), rhs.as_bool()) {
+            return Ok(a.cmp(&b));
+        }
+        // otherwise both must be pointers to comparable heap objects.
+        match (lhs.as_pointer(), rhs.as_pointer()) {
+            (Some(a), Some(b)) => match (self.heap.get(a), self.heap.get(b)) {
+                (Some(HeapObject::Int(x)), Some(HeapObject::Int(y))) => Ok(x.cmp(y)),
+                (Some(HeapObject::Str(x)), Some(HeapObject::Str(y))) => Ok(x.cmp(y)),
+                _ => Err(self.runtime_err("cannot compare values of different types")),
+            },
+            _ => Err(self.runtime_err("cannot compare values of different types")),
+        }
+    }
+
+    /// pop two `f64` operands, compare them per IEEE 754, push the `bool`.
+    ///
+    /// IEEE 754 ordering: a `NaN` compares unequal to everything including
+    /// itself, and is unordered, so `FEq` of two `NaN`s is `false`, `FNe` is
+    /// `true`, and `FLt` / `FLe` / `FGt` / `FGe` involving a `NaN` are all
+    /// `false`. this falls out of Rust's `f64` `PartialOrd` / `==` directly.
+    fn op_compare_f64(&mut self, op: CmpOp) -> Result<(), QalaError> {
+        let rhs = self.pop_f64()?;
+        let lhs = self.pop_f64()?;
+        let result = match op {
+            CmpOp::Eq => lhs == rhs,
+            CmpOp::Ne => lhs != rhs,
+            CmpOp::Lt => lhs < rhs,
+            CmpOp::Le => lhs <= rhs,
+            CmpOp::Gt => lhs > rhs,
+            CmpOp::Ge => lhs >= rhs,
+        };
+        self.push(Value::bool(result))
+    }
+
+    /// take a jump: set the current frame's `ip` to `fall_through + offset`.
+    ///
+    /// `fall_through` is the byte AFTER the whole jump instruction -- which is
+    /// exactly the position the codegen's signed `i16` offset is relative to.
+    /// the computed target must land in `0..=code.len()`; a target outside the
+    /// chunk is a [`QalaError::Runtime`] "jump target out of range", never a
+    /// silent out-of-bounds `ip`.
+    fn do_jump(&mut self, fall_through: usize, offset: i16) -> Result<(), QalaError> {
+        let code_len = self.chunk()?.code.len();
+        let target = fall_through as isize + offset as isize;
+        if target < 0 || target as usize > code_len {
+            return Err(self.runtime_err("jump target out of range"));
+        }
+        self.frame_mut()?.ip = target as usize;
+        Ok(())
+    }
+
     /// run the program from the current state to `Halt` or the first runtime
     /// error.
     ///
@@ -714,6 +961,81 @@ pub enum StepOutcome {
     Ran,
     /// the VM halted; `run` returns `Ok(())`.
     Halted,
+}
+
+/// which checked `i64` arithmetic the `op_arith_i64` handler performs.
+///
+/// a small private selector so the five integer-arithmetic opcodes share one
+/// handler instead of five near-identical bodies.
+#[derive(Clone, Copy)]
+enum IntOp {
+    /// checked addition.
+    Add,
+    /// checked subtraction.
+    Sub,
+    /// checked multiplication.
+    Mul,
+    /// checked division -- a zero divisor (or `i64::MIN / -1`) is an error.
+    Div,
+    /// checked remainder -- a zero divisor (or `i64::MIN % -1`) is an error.
+    Mod,
+}
+
+/// which IEEE 754 `f64` arithmetic the `op_arith_f64` handler performs.
+///
+/// the float counterpart of [`IntOp`]; there is no `FloatOp::Neg` because
+/// `FNeg` is a single sign flip handled inline.
+#[derive(Clone, Copy)]
+enum FloatOp {
+    /// addition.
+    Add,
+    /// subtraction.
+    Sub,
+    /// multiplication.
+    Mul,
+    /// division -- never an error; a zero divisor yields `inf` / `NaN`.
+    Div,
+}
+
+/// which comparison the `op_compare` / `op_compare_f64` handlers test.
+///
+/// shared by the integer/string/bool comparisons and the `f64` comparisons so
+/// the twelve comparison opcodes route through two handlers.
+#[derive(Clone, Copy)]
+enum CmpOp {
+    /// `==`
+    Eq,
+    /// `!=`
+    Ne,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+}
+
+impl CmpOp {
+    /// whether this comparison holds for an [`Ordering`](std::cmp::Ordering).
+    ///
+    /// used by the integer / string / bool comparison path, which reduces two
+    /// operands to one `Ordering` and then asks each `CmpOp` whether it is
+    /// satisfied. the `f64` path does not use this -- IEEE 754 has an
+    /// unordered case (`NaN`) that an `Ordering` cannot express, so the float
+    /// handler compares with `f64`'s own operators directly.
+    fn holds(self, ordering: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match self {
+            CmpOp::Eq => ordering == Equal,
+            CmpOp::Ne => ordering != Equal,
+            CmpOp::Lt => ordering == Less,
+            CmpOp::Le => ordering != Greater,
+            CmpOp::Gt => ordering == Greater,
+            CmpOp::Ge => ordering != Less,
+        }
+    }
 }
 
 /// the byte-range [`Span`] of a 1-based `line` in `src`.
@@ -1154,9 +1476,11 @@ mod tests {
 
     #[test]
     fn malformed_an_unimplemented_opcode_is_a_clean_runtime_stub_not_a_panic() {
-        // ADD is stubbed by this plan -- it must be a clean Runtime error.
+        // MAKE_ARRAY is one of the opcodes a later plan implements; until then
+        // it must be a clean Runtime "not yet implemented" error, not a panic.
         let mut chunk = Chunk::new();
-        chunk.write_op(Opcode::Add, 1);
+        chunk.write_op(Opcode::MakeArray, 1);
+        chunk.write_u16(0, 1);
         chunk.write_op(Opcode::Halt, 1);
         let mut vm = Vm::new(program_with(chunk), "x".to_string());
         match vm.run() {
@@ -1219,12 +1543,8 @@ mod tests {
         via_run.run().expect("run");
 
         let mut via_step = Vm::new(build(), "x".to_string());
-        loop {
-            match via_step.step().expect("step") {
-                StepOutcome::Ran => continue,
-                StepOutcome::Halted => break,
-            }
-        }
+        // step until Halted: the loop body is empty, the work is the step call.
+        while via_step.step().expect("step") == StepOutcome::Ran {}
         assert_eq!(via_run.stack.len(), via_step.stack.len());
         assert!(
             via_run.stack.len() == 2
@@ -1232,5 +1552,396 @@ mod tests {
                 && via_run.stack[1] == via_step.stack[1],
             "run and step must reach the same stack state"
         );
+    }
+
+    // ---- arithmetic / comparison / logic / jump opcodes ----
+
+    /// run a chunk and return the VM so the caller can inspect the end state.
+    fn run_chunk(chunk: Chunk, src: &str) -> Result<Vm, QalaError> {
+        let mut vm = Vm::new(program_with(chunk), src.to_string());
+        vm.run()?;
+        Ok(vm)
+    }
+
+    /// the `i64` the stack top decodes to: a pointer to a heap `Int`.
+    fn top_i64(vm: &Vm) -> i64 {
+        let top = *vm.stack.last().expect("a value on the stack");
+        let slot = top.as_pointer().expect("the result is a heap pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Int(n)) => *n,
+            _ => panic!("the result pointer does not reach a heap Int"),
+        }
+    }
+
+    /// build `CONST a ; CONST b ; <op> ; HALT` for two i64 literals.
+    fn binary_i64_chunk(a: i64, b: i64, op: Opcode) -> Chunk {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(a), 1);
+        emit_const(&mut chunk, ConstValue::I64(b), 1);
+        chunk.write_op(op, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        chunk
+    }
+
+    #[test]
+    fn arith_add_sub_mul_compute_correct_i64_results() {
+        let add = run_chunk(binary_i64_chunk(20, 22, Opcode::Add), "x").expect("add");
+        assert_eq!(top_i64(&add), 42);
+        let sub = run_chunk(binary_i64_chunk(50, 8, Opcode::Sub), "x").expect("sub");
+        assert_eq!(top_i64(&sub), 42);
+        let mul = run_chunk(binary_i64_chunk(6, 7, Opcode::Mul), "x").expect("mul");
+        assert_eq!(top_i64(&mul), 42);
+    }
+
+    #[test]
+    fn arith_div_and_mod_compute_correct_i64_results() {
+        // 85 / 2 == 42 (truncated toward zero); 85 % 2 == 1.
+        let div = run_chunk(binary_i64_chunk(85, 2, Opcode::Div), "x").expect("div");
+        assert_eq!(top_i64(&div), 42);
+        let modr = run_chunk(binary_i64_chunk(85, 2, Opcode::Mod), "x").expect("mod");
+        assert_eq!(top_i64(&modr), 1);
+    }
+
+    #[test]
+    fn arith_neg_negates_an_i64() {
+        // CONST 42 ; NEG ; HALT.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(42), 1);
+        chunk.write_op(Opcode::Neg, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("neg");
+        assert_eq!(top_i64(&vm), -42);
+    }
+
+    #[test]
+    fn arith_add_overflow_is_a_runtime_error_not_a_wraparound() {
+        // i64::MAX + 1 must error, not wrap to i64::MIN.
+        let chunk = binary_i64_chunk(i64::MAX, 1, Opcode::Add);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("integer overflow"), "got: {message}");
+            }
+            Err(other) => panic!("expected an overflow Runtime error, got {other:?}"),
+            Ok(_) => panic!("expected an overflow Runtime error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn arith_neg_of_i64_min_is_a_runtime_overflow() {
+        // -i64::MIN does not fit in i64.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(i64::MIN), 1);
+        chunk.write_op(Opcode::Neg, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("integer overflow"), "got: {message}");
+            }
+            Err(other) => panic!("expected an overflow Runtime error, got {other:?}"),
+            Ok(_) => panic!("expected an overflow Runtime error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn div_by_zero_is_a_runtime_error_carrying_the_div_opcode_source_line() {
+        // the DIV opcode sits on source line 4; the error span must cover it.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        emit_const(&mut chunk, ConstValue::I64(0), 1);
+        chunk.write_op(Opcode::Div, 4);
+        chunk.write_op(Opcode::Halt, 4);
+        let src = "one\ntwo\nthree\nfour line here\nfive";
+        match run_chunk(chunk, src) {
+            Err(QalaError::Runtime { message, span }) => {
+                assert!(message.contains("division by zero"), "got: {message}");
+                assert_eq!(
+                    span.slice(src),
+                    "four line here",
+                    "the error must point at the DIV's source line"
+                );
+            }
+            Err(other) => panic!("expected a division-by-zero Runtime error, got {other:?}"),
+            Ok(_) => panic!("expected a division-by-zero error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn div_by_zero_mod_form_is_a_runtime_modulo_by_zero_error() {
+        // MOD by a zero divisor reports "modulo by zero", on the MOD's line.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(7), 1);
+        emit_const(&mut chunk, ConstValue::I64(0), 1);
+        chunk.write_op(Opcode::Mod, 2);
+        chunk.write_op(Opcode::Halt, 2);
+        let src = "first line\nsecond line is the mod";
+        match run_chunk(chunk, src) {
+            Err(QalaError::Runtime { message, span }) => {
+                assert!(message.contains("modulo by zero"), "got: {message}");
+                assert_eq!(span.slice(src), "second line is the mod");
+            }
+            Err(other) => panic!("expected a modulo-by-zero Runtime error, got {other:?}"),
+            Ok(_) => panic!("expected a modulo-by-zero error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn div_of_i64_min_by_negative_one_is_caught_as_a_runtime_error() {
+        // i64::MIN / -1 overflows; checked_div returns None and the VM reports
+        // it on the division-by-zero path (one None check covers both faults).
+        let chunk = binary_i64_chunk(i64::MIN, -1, Opcode::Div);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("division by zero"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime error for i64::MIN / -1, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime error for i64::MIN / -1, ran clean"),
+        }
+    }
+
+    /// build `CONST a ; CONST b ; <op> ; HALT` for two f64 literals.
+    fn binary_f64_chunk(a: f64, b: f64, op: Opcode) -> Chunk {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::F64(a), 1);
+        emit_const(&mut chunk, ConstValue::F64(b), 1);
+        chunk.write_op(op, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        chunk
+    }
+
+    #[test]
+    fn float_arith_add_sub_mul_neg_compute_correct_f64_results() {
+        let add = run_chunk(binary_f64_chunk(1.5, 2.0, Opcode::FAdd), "x").expect("fadd");
+        assert_eq!(add.stack.last().unwrap().as_f64(), Some(3.5));
+        let sub = run_chunk(binary_f64_chunk(5.0, 1.5, Opcode::FSub), "x").expect("fsub");
+        assert_eq!(sub.stack.last().unwrap().as_f64(), Some(3.5));
+        let mul = run_chunk(binary_f64_chunk(2.0, 1.75, Opcode::FMul), "x").expect("fmul");
+        assert_eq!(mul.stack.last().unwrap().as_f64(), Some(3.5));
+        // FNEG flips the sign.
+        let mut neg = Chunk::new();
+        emit_const(&mut neg, ConstValue::F64(3.5), 1);
+        neg.write_op(Opcode::FNeg, 1);
+        neg.write_op(Opcode::Halt, 1);
+        let negv = run_chunk(neg, "x").expect("fneg");
+        assert_eq!(negv.stack.last().unwrap().as_f64(), Some(-3.5));
+    }
+
+    #[test]
+    fn float_arith_div_by_zero_is_ieee754_inf_not_an_error() {
+        // 1.0 / 0.0 == inf, with NO runtime error -- IEEE 754.
+        let vm = run_chunk(binary_f64_chunk(1.0, 0.0, Opcode::FDiv), "x")
+            .expect("float division by zero must not error");
+        let top = vm.stack.last().unwrap().as_f64().expect("an f64 result");
+        assert_eq!(top, f64::INFINITY, "1.0 / 0.0 is positive infinity");
+    }
+
+    #[test]
+    fn float_arith_zero_over_zero_is_ieee754_nan_not_an_error() {
+        // 0.0 / 0.0 == NaN, with NO runtime error -- IEEE 754.
+        let vm = run_chunk(binary_f64_chunk(0.0, 0.0, Opcode::FDiv), "x")
+            .expect("0.0 / 0.0 must not error");
+        let top = vm.stack.last().unwrap().as_f64().expect("an f64 result");
+        assert!(top.is_nan(), "0.0 / 0.0 is NaN");
+    }
+
+    #[test]
+    fn compare_i64_eq_ne_lt_le_gt_ge_produce_correct_bools() {
+        // helper: run CONST a ; CONST b ; <cmp> and read the bool result.
+        let cmp = |a: i64, b: i64, op: Opcode| -> bool {
+            let vm = run_chunk(binary_i64_chunk(a, b, op), "x").expect("compare");
+            vm.stack.last().unwrap().as_bool().expect("a bool result")
+        };
+        assert!(cmp(3, 3, Opcode::Eq));
+        assert!(!cmp(3, 4, Opcode::Eq));
+        assert!(cmp(3, 4, Opcode::Ne));
+        assert!(cmp(3, 4, Opcode::Lt));
+        assert!(!cmp(4, 3, Opcode::Lt));
+        assert!(cmp(3, 3, Opcode::Le));
+        assert!(cmp(5, 4, Opcode::Gt));
+        assert!(cmp(4, 4, Opcode::Ge));
+        assert!(!cmp(3, 4, Opcode::Ge));
+    }
+
+    #[test]
+    fn compare_str_eq_and_lt_compare_lexicographically() {
+        // CONST "apple" ; CONST "banana" ; <cmp>.
+        let cmp = |a: &str, b: &str, op: Opcode| -> bool {
+            let mut chunk = Chunk::new();
+            emit_const(&mut chunk, ConstValue::Str(a.to_string()), 1);
+            emit_const(&mut chunk, ConstValue::Str(b.to_string()), 1);
+            chunk.write_op(op, 1);
+            chunk.write_op(Opcode::Halt, 1);
+            let vm = run_chunk(chunk, "x").expect("str compare");
+            vm.stack.last().unwrap().as_bool().expect("a bool result")
+        };
+        assert!(cmp("apple", "apple", Opcode::Eq));
+        assert!(!cmp("apple", "banana", Opcode::Eq));
+        assert!(cmp("apple", "banana", Opcode::Lt), "apple < banana");
+        assert!(!cmp("banana", "apple", Opcode::Lt));
+        assert!(cmp("apple", "banana", Opcode::Ne));
+    }
+
+    #[test]
+    fn compare_bool_eq_and_ordering_follow_false_lt_true() {
+        let cmp = |a: bool, b: bool, op: Opcode| -> bool {
+            let mut chunk = Chunk::new();
+            emit_const(&mut chunk, ConstValue::Bool(a), 1);
+            emit_const(&mut chunk, ConstValue::Bool(b), 1);
+            chunk.write_op(op, 1);
+            chunk.write_op(Opcode::Halt, 1);
+            let vm = run_chunk(chunk, "x").expect("bool compare");
+            vm.stack.last().unwrap().as_bool().expect("a bool result")
+        };
+        assert!(cmp(true, true, Opcode::Eq));
+        assert!(cmp(false, true, Opcode::Ne));
+        // the documented bool ordering: false < true.
+        assert!(cmp(false, true, Opcode::Lt));
+        assert!(!cmp(true, false, Opcode::Lt));
+    }
+
+    #[test]
+    fn compare_mismatched_operand_types_is_a_runtime_error_not_a_panic() {
+        // CONST 1 (heap Int) ; CONST "x" (heap Str) ; EQ -- a kind mismatch.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 1);
+        emit_const(&mut chunk, ConstValue::Str("x".to_string()), 1);
+        chunk.write_op(Opcode::Eq, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("cannot compare"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime compare-mismatch error, got {other:?}"),
+            Ok(_) => panic!("expected a compare-mismatch error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn compare_f64_eq_lt_ge_follow_ieee754_including_nan() {
+        let cmp = |a: f64, b: f64, op: Opcode| -> bool {
+            let vm = run_chunk(binary_f64_chunk(a, b, op), "x").expect("f64 compare");
+            vm.stack.last().unwrap().as_bool().expect("a bool result")
+        };
+        assert!(cmp(1.5, 1.5, Opcode::FEq));
+        assert!(cmp(1.0, 2.0, Opcode::FLt));
+        assert!(cmp(2.0, 2.0, Opcode::FGe));
+        // IEEE 754: NaN compares unequal to itself and is unordered.
+        assert!(!cmp(f64::NAN, f64::NAN, Opcode::FEq), "NaN == NaN is false");
+        assert!(cmp(f64::NAN, f64::NAN, Opcode::FNe), "NaN != NaN is true");
+        assert!(!cmp(f64::NAN, 1.0, Opcode::FLt), "NaN < x is false");
+        assert!(!cmp(f64::NAN, 1.0, Opcode::FGt), "NaN > x is false");
+    }
+
+    #[test]
+    fn logic_not_negates_a_bool() {
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        chunk.write_op(Opcode::Not, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        let vm = run_chunk(chunk, "x").expect("not");
+        assert_eq!(vm.stack.last().unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn jumps_jump_moves_ip_over_a_skipped_instruction() {
+        // CONST true ; JUMP +4 (skip the next CONST) ; CONST false ; HALT.
+        // a JUMP operand is relative to the byte after the operand. the JUMP
+        // opcode is at byte 3, its operand at 4..5, fall-through at 6; the
+        // CONST-false instruction is bytes 6..8; HALT is byte 9. to land on
+        // HALT (byte 9) from fall-through 6 the offset is +3.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1); // bytes 0..2
+        chunk.write_op(Opcode::Jump, 1); // byte 3
+        chunk.write_i16(3, 1); // bytes 4..5, fall-through is 6
+        emit_const(&mut chunk, ConstValue::Bool(false), 1); // bytes 6..8 (skipped)
+        chunk.write_op(Opcode::Halt, 1); // byte 9
+        let vm = run_chunk(chunk, "x").expect("jump");
+        // only the `true` CONST ran; the `false` CONST was jumped over.
+        assert_eq!(vm.stack.len(), 1, "the skipped CONST left nothing");
+        assert_eq!(vm.stack[0].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn jumps_jump_if_false_branches_on_false_and_falls_through_on_true() {
+        // build CONST <cond> ; JUMP_IF_FALSE +3 ; CONST 111 ; HALT.
+        // on a false cond the CONST 111 is skipped; on true it runs.
+        let outcome = |cond: bool| -> usize {
+            let mut chunk = Chunk::new();
+            emit_const(&mut chunk, ConstValue::Bool(cond), 1); // bytes 0..2
+            chunk.write_op(Opcode::JumpIfFalse, 1); // byte 3
+            chunk.write_i16(3, 1); // bytes 4..5, fall-through 6
+            emit_const(&mut chunk, ConstValue::I64(111), 1); // bytes 6..8
+            chunk.write_op(Opcode::Halt, 1); // byte 9
+            let vm = run_chunk(chunk, "x").expect("jump_if_false");
+            vm.stack.len()
+        };
+        // false: the cond is consumed, the CONST 111 is jumped over -> empty.
+        assert_eq!(outcome(false), 0, "false branches past the CONST");
+        // true: the cond is consumed, the CONST 111 runs -> one value.
+        assert_eq!(outcome(true), 1, "true falls through to the CONST");
+    }
+
+    #[test]
+    fn jumps_jump_if_true_branches_on_true_and_falls_through_on_false() {
+        let outcome = |cond: bool| -> usize {
+            let mut chunk = Chunk::new();
+            emit_const(&mut chunk, ConstValue::Bool(cond), 1);
+            chunk.write_op(Opcode::JumpIfTrue, 1);
+            chunk.write_i16(3, 1);
+            emit_const(&mut chunk, ConstValue::I64(222), 1);
+            chunk.write_op(Opcode::Halt, 1);
+            let vm = run_chunk(chunk, "x").expect("jump_if_true");
+            vm.stack.len()
+        };
+        // true branches past the CONST; false falls through to it.
+        assert_eq!(outcome(true), 0, "true branches past the CONST");
+        assert_eq!(outcome(false), 1, "false falls through to the CONST");
+    }
+
+    #[test]
+    fn jumps_a_backward_jump_lands_at_an_earlier_instruction() {
+        // POP-free loop body would spin forever; instead verify a backward
+        // offset lands correctly by stepping once. CONST true ; JUMP back to 0.
+        // the JUMP at byte 3, fall-through 6; offset -6 targets byte 0.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1); // bytes 0..2
+        chunk.write_op(Opcode::Jump, 1); // byte 3
+        chunk.write_i16(-6, 1); // bytes 4..5; fall-through 6, target 0
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+        vm.step().expect("step the CONST");
+        assert_eq!(vm.frame().expect("frame").ip, 3, "ip after CONST is 3");
+        vm.step().expect("step the JUMP");
+        assert_eq!(vm.frame().expect("frame").ip, 0, "the backward JUMP lands at 0");
+    }
+
+    #[test]
+    fn jumps_a_jump_target_outside_the_chunk_is_a_runtime_error_not_a_panic() {
+        // JUMP with an offset that lands far past the end of the code.
+        let mut chunk = Chunk::new();
+        chunk.write_op(Opcode::Jump, 1); // byte 0
+        chunk.write_i16(1000, 1); // fall-through 3, target 1003 -- out of range
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("jump target out of range"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime jump-out-of-range error, got {other:?}"),
+            Ok(_) => panic!("expected a jump-out-of-range error, the program ran clean"),
+        }
+    }
+
+    #[test]
+    fn arith_add_of_non_integer_operands_is_a_runtime_type_error() {
+        // CONST true ; CONST false ; ADD -- ADD expects two heap Ints.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Bool(true), 1);
+        emit_const(&mut chunk, ConstValue::Bool(false), 1);
+        chunk.write_op(Opcode::Add, 1);
+        chunk.write_op(Opcode::Halt, 1);
+        match run_chunk(chunk, "x") {
+            Err(QalaError::Runtime { message, .. }) => {
+                assert!(message.contains("expected an integer"), "got: {message}");
+            }
+            Err(other) => panic!("expected a Runtime type error, got {other:?}"),
+            Ok(_) => panic!("expected a Runtime type error, the program ran clean"),
+        }
     }
 }
