@@ -68,9 +68,10 @@ export interface UseQala {
   // effect on the next tick -- the loop is not restarted.
   speed: RunSpeed;
   setSpeed: (next: RunSpeed) => void;
-  // dirty is true when the source has changed since the last successful
-  // compile. setSource sets it; a successful compile clears it. a dirty
-  // edit also stops the run loop synchronously.
+  // dirty is true when the source does not match the last successful
+  // compile -- including before the first compile, so it starts true.
+  // setSource sets it; a successful compile clears it. a dirty edit also
+  // stops the run loop synchronously.
   dirty: boolean;
   // finished is true when the last step or run reached Halt -- the
   // program is done. it gates Step and Run off in the Controls so a
@@ -101,7 +102,14 @@ export function useQala(): UseQala {
   const [lastRun, setLastRun] = useState<RunResult | StepResult | null>(null);
   const [lastState, setLastState] = useState<VmState | null>(null);
   const [version, setVersion] = useState(0);
-  const [dirty, setDirty] = useState(false);
+  // dirty starts true: at mount no compile has happened, so the source --
+  // the "" initial, the restored text, or the first-visit preload, all
+  // applied without a compile -- does not match any bytecode. that is the
+  // exact meaning of dirty (source differs from the last successful
+  // compile), and it is what keeps Run enabled on a fresh load so the
+  // first compile-then-run is reachable. the first successful compile
+  // clears it.
+  const [dirty, setDirty] = useState(true);
   const [loadedExample, setLoadedExample] = useState<string | null>(null);
 
   // the run loop. the timer id lives in a ref so it survives re-renders.
