@@ -2144,27 +2144,33 @@ enum ReplLineKind {
 /// classify a REPL source line as an item, an expression, or a statement.
 ///
 /// the line is probed by trial parse, never by guessing on its first token:
-/// - if it parses as a complete program with at least one item, it is an
-///   [`ReplLineKind::Item`] (a bare `fn` / `struct` / `enum` / `interface`).
-/// - else, if wrapping it as `let __t = <line>` parses, it is an
-///   [`ReplLineKind::Expression`].
+/// - first: if wrapping it as `let __t = <line>` parses, it is an
+///   [`ReplLineKind::Expression`]. this probe runs BEFORE the item probe so
+///   that a function-call expression (e.g. `double(5)`) that the parser also
+///   accepts as a complete one-item program is correctly classified as an
+///   expression and its return value captured.
+/// - then: if it parses as a complete program with at least one item, it is an
+///   [`ReplLineKind::Item`] (a `fn` / `struct` / `enum` / `interface`
+///   definition). a genuine definition cannot parse as `let __t = <line>`, so
+///   it reaches this probe.
 /// - else it is a [`ReplLineKind::Statement`] (a `let` binding, or anything
 ///   else -- the real pipeline run surfaces a genuine error for true garbage,
 ///   so misclassifying garbage as a statement is harmless).
 fn classify_repl_line(line: &str) -> ReplLineKind {
-    // an item parses as a whole program with >= 1 item.
-    if let Ok(tokens) = crate::lexer::Lexer::tokenize(line)
-        && let Ok(ast) = crate::parser::Parser::parse(&tokens)
-        && !ast.is_empty()
-    {
-        return ReplLineKind::Item;
-    }
-    // an expression parses inside a `let __t = <line>` probe.
+    // expression probe first: a line that fits `let __t = <line>` is an
+    // expression -- covers function-call-shaped lines like `fn_name(x)`.
     let probe = format!("fn __probe() is io {{ let __t = {line}\n}}\n");
     if let Ok(tokens) = crate::lexer::Lexer::tokenize(&probe)
         && crate::parser::Parser::parse(&tokens).is_ok()
     {
         return ReplLineKind::Expression;
+    }
+    // item probe: a line that parses as a whole program with >= 1 item.
+    if let Ok(tokens) = crate::lexer::Lexer::tokenize(line)
+        && let Ok(ast) = crate::parser::Parser::parse(&tokens)
+        && !ast.is_empty()
+    {
+        return ReplLineKind::Item;
     }
     // everything else: a statement.
     ReplLineKind::Statement
@@ -4325,6 +4331,29 @@ fn main() -> i64 is pure {
             .repl_eval("triple(14)")
             .expect("the declared function is callable later");
         assert_eq!(repl_result_i64(&vm, r), 42, "triple(14) is 42");
+    }
+
+    #[test]
+    fn repl_call_expression_is_classified_as_expression_not_item() {
+        // a function-call expression like `triple(14)` also parses as a valid
+        // one-item top-level program under a lenient parser. the expression
+        // probe must run first so such lines are classified as Expression
+        // (value captured and returned) not as Item (placed outside
+        // __repl_main, value discarded as void).
+        let mut vm = Vm::new_repl();
+        // declare a function first so the call typechecks.
+        vm.repl_eval("fn triple(n: i64) -> i64 is pure { return n * 3 }")
+            .expect("fn declaration compiles");
+        // calling it must return 42, not void -- if misclassified as an Item
+        // the call is placed outside __repl_main and the REPL returns void.
+        let r = vm
+            .repl_eval("triple(14)")
+            .expect("the call expression evaluates");
+        assert_eq!(
+            repl_result_i64(&vm, r),
+            42,
+            "a call expression is an Expression -- its value must be returned, not void"
+        );
     }
 
     #[test]
