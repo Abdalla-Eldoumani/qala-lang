@@ -50,16 +50,9 @@
 //! [`dispatch`] rejects an unknown fn-id the same way.
 
 use crate::errors::QalaError;
+use crate::opcode::STDLIB_FN_BASE;
 use crate::value::Value;
 use crate::vm::{HeapObject, Vm};
-
-/// the first fn-id reserved for the standard library.
-///
-/// codegen (`codegen.rs`'s `STDLIB_FN_BASE`) and the VM (`vm.rs`'s
-/// `STDLIB_FN_BASE`) define the same value; this third copy is the one
-/// [`dispatch`] checks. all three MUST agree -- the number is the contract
-/// that separates a stdlib call from a user-function call.
-const STDLIB_FN_BASE: u16 = 40_000;
 
 /// the `MAKE_ENUM_VARIANT` id of `Result::Ok`.
 ///
