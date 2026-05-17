@@ -397,6 +397,13 @@ pub struct Vm {
     /// the original source text. used to map a `source_lines` line back to a
     /// byte-range [`Span`] for runtime errors, and by the REPL pipeline.
     src: String,
+    /// the accumulated REPL source lines, in acceptance order. each
+    /// [`Vm::repl_eval`] call concatenates every prior accepted line plus the
+    /// new one into one wrapped source string and runs the whole pipeline on
+    /// it -- the accumulating-source REPL. a line that fails to compile is NOT
+    /// appended, so a typo never poisons later evaluations. empty for a VM
+    /// that is not used as a REPL.
+    repl_history: Vec<String>,
 }
 
 impl Vm {
@@ -422,6 +429,32 @@ impl Vm {
             leak_log: Vec::new(),
             globals: Vec::new(),
             src,
+            repl_history: Vec::new(),
+        }
+    }
+
+    /// construct an empty VM ready to receive REPL calls.
+    ///
+    /// unlike [`Vm::new`], there is no `Program` and no `main` frame yet -- a
+    /// REPL VM starts blank: an empty program, an empty heap, an empty
+    /// console, an empty `repl_history`. the first [`Vm::repl_eval`] call
+    /// builds the first real `Program` from the first line and runs it; every
+    /// later call rebuilds the program from the whole accumulated source.
+    ///
+    /// the empty `Program` has no chunks, so this VM must not be `run()`
+    /// directly -- `repl_eval` is the only entry point for a REPL VM. the
+    /// persistent `console` / `leak_log` accumulate across `repl_eval` calls.
+    pub fn new_repl() -> Vm {
+        Vm {
+            program: Program::new(),
+            stack: Vec::new(),
+            frames: Vec::new(),
+            heap: Heap::new(),
+            console: Vec::new(),
+            leak_log: Vec::new(),
+            globals: Vec::new(),
+            src: String::new(),
+            repl_history: Vec::new(),
         }
     }
 
@@ -1138,22 +1171,37 @@ impl Vm {
     /// execute a [`Opcode::Return`]: pop the current frame and pass the result
     /// back.
     ///
-    /// the value on top of the stack is the call's result. the current
-    /// [`CallFrame`] is popped and the value stack truncated back to that
-    /// frame's `base`, discarding the callee's transient stack. when no frame
-    /// remains the program is finished: returns `Ok(true)` so the caller halts
-    /// the VM. otherwise the result value is pushed onto the (now caller's)
-    /// stack and `Ok(false)` is returned.
+    /// the call's result is whatever sits ABOVE the frame's `base` on the
+    /// value stack. a value-returning function leaves its result there before
+    /// the `RETURN`; a `void` function leaves nothing -- codegen emits a bare
+    /// `RETURN` with no value pushed for a fall-through exit or a `return`
+    /// with no operand -- so a `RETURN` whose stack is at or below `base`
+    /// yields a `void` result. this is why the frame is popped FIRST: the
+    /// result is decided relative to `base`, never by an unconditional
+    /// `pop` that would underflow on a void function or steal the caller's
+    /// top-of-stack.
+    ///
+    /// the current [`CallFrame`] is popped and the value stack truncated back
+    /// to that frame's `base`, discarding the callee's transient stack. when
+    /// no frame remains the program is finished: returns `Ok(true)` so the
+    /// caller halts the VM. otherwise the result value is pushed onto the
+    /// (now caller's) stack and `Ok(false)` is returned.
     ///
     /// codegen emits an explicit `RETURN` at every function exit, including
     /// `main`'s -- a `RETURN` from the last frame is therefore the normal end
     /// of a program.
     fn op_return(&mut self) -> Result<bool, QalaError> {
-        let result = self.pop()?;
         let frame = self
             .frames
             .pop()
             .ok_or_else(|| self.runtime_err("return with no active call frame"))?;
+        // the result is whatever the function left above its base. a void
+        // function left nothing -- its result is void.
+        let result = if self.stack.len() > frame.base {
+            self.stack.pop().unwrap_or_else(Value::void)
+        } else {
+            Value::void()
+        };
         // drop the callee's transient value stack back to its base.
         if frame.base <= self.stack.len() {
             self.stack.truncate(frame.base);
@@ -1778,6 +1826,234 @@ impl Vm {
             leak_log: self.leak_log.clone(),
         }
     }
+
+    /// evaluate one line of REPL source against the persistent VM state.
+    ///
+    /// the accumulating-source REPL: every prior accepted line plus `source`
+    /// is concatenated into one wrapped program, the whole pipeline (lex,
+    /// parse, typecheck, codegen) runs on it, and the result executes against
+    /// this VM. because the whole accumulated program is rebuilt and re-run
+    /// each call, a `let` binding from an earlier call is simply an earlier
+    /// statement in the same body and is in scope for the new line -- that is
+    /// how state persists.
+    ///
+    /// the wrapping shape: the accepted statements plus the new line live
+    /// inside a synthetic `fn __repl_main() is io { ... }`. when the new line
+    /// is an expression its value is captured via a `let __repl_result =
+    /// <expr>` binding (the result this method returns); a statement line
+    /// yields `void`. a line that parses as a top-level item (`fn` / `struct`
+    /// / `enum` / `interface`) is placed OUTSIDE `__repl_main` as a sibling
+    /// item and the result is `void`.
+    ///
+    /// on a lexer / parser / typechecker / codegen error the error is returned
+    /// and `source` is NOT appended to the history -- a line that does not
+    /// compile cannot poison later evaluations. the persistent `console` and
+    /// `leak_log` survive across calls so output accumulates; the heap is
+    /// naturally rebuilt each call because the whole program re-runs from
+    /// scratch (correct and simplest -- there is no stale heap state).
+    pub fn repl_eval(&mut self, source: &str) -> Result<Value, QalaError> {
+        let kind = classify_repl_line(source);
+        let combined = self.build_repl_source(source, kind);
+
+        // run the full pipeline on the wrapped accumulated source. any failure
+        // returns the error WITHOUT touching `repl_history`.
+        let tokens = crate::lexer::Lexer::tokenize(&combined)?;
+        let ast = crate::parser::Parser::parse(&tokens)?;
+        let (typed, type_errors, _warnings) =
+            crate::typechecker::check_program(&ast, &combined);
+        if let Some(first) = type_errors.into_iter().next() {
+            return Err(first);
+        }
+        let program = crate::codegen::compile_program(&typed, &combined)
+            .map_err(|errors| {
+                errors
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| QalaError::Runtime {
+                        span: Span::new(0, 0),
+                        message: "codegen failed".to_string(),
+                    })
+            })?;
+
+        // run the freshly built program against a reset executable state --
+        // a fresh value stack, a fresh heap, a frame at the entry point --
+        // but KEEP the persistent console / leak_log so output accumulates.
+        let result = self.run_repl_program(program, &combined, kind)?;
+
+        // the line compiled and ran: it is now part of the accumulated source.
+        self.repl_history.push(source.to_string());
+        Ok(result)
+    }
+
+    /// assemble the combined wrapped source for one REPL call.
+    ///
+    /// every history line is re-classified (an item goes outside the synthetic
+    /// function, a statement / expression inside its body) and joined with the
+    /// new line. a history expression line becomes a bare expression statement;
+    /// only the NEW line, when it is an expression, gets the `let
+    /// __repl_result = ...` capture binding. lines are joined with newlines so
+    /// source spans stay sane for any diagnostic.
+    fn build_repl_source(&self, new_line: &str, new_kind: ReplLineKind) -> String {
+        let mut items = String::new();
+        let mut body = String::new();
+        // prior accepted lines: classify each, route items out, the rest in.
+        for line in &self.repl_history {
+            match classify_repl_line(line) {
+                ReplLineKind::Item => {
+                    items.push_str(line);
+                    items.push('\n');
+                }
+                ReplLineKind::Expression | ReplLineKind::Statement => {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+            }
+        }
+        // the new line: an item goes outside; an expression gets the capture
+        // binding; a statement goes in as-is.
+        match new_kind {
+            ReplLineKind::Item => {
+                items.push_str(new_line);
+                items.push('\n');
+            }
+            ReplLineKind::Expression => {
+                body.push_str("let ");
+                body.push_str(REPL_RESULT_NAME);
+                body.push_str(" = ");
+                body.push_str(new_line);
+                body.push('\n');
+            }
+            ReplLineKind::Statement => {
+                body.push_str(new_line);
+                body.push('\n');
+            }
+        }
+        format!("{items}fn {REPL_ENTRY_NAME}() is io {{\n{body}}}\n")
+    }
+
+    /// run a freshly compiled REPL `program` and recover the result value.
+    ///
+    /// resets the executable state (a fresh value stack, a fresh heap, the
+    /// entry frame) while keeping the persistent `console` / `leak_log`, then
+    /// runs to completion. the result is the `__repl_result` local of the
+    /// `__repl_main` frame, captured the instant before that frame's `RETURN`
+    /// executes; when the line was a statement or an item there is no such
+    /// local and the result is `void`.
+    fn run_repl_program(
+        &mut self,
+        program: Program,
+        combined: &str,
+        kind: ReplLineKind,
+    ) -> Result<Value, QalaError> {
+        // the entry chunk: the fn named __repl_main. compile_program sets
+        // main_index only for a fn named `main`, so locate __repl_main and
+        // point the VM at it explicitly.
+        let entry = program
+            .fn_names
+            .iter()
+            .position(|n| n == REPL_ENTRY_NAME)
+            .ok_or_else(|| QalaError::Runtime {
+                span: Span::new(0, 0),
+                message: "repl: the synthetic entry function is missing".to_string(),
+            })?;
+        // the slot of __repl_result in the entry chunk, if the new line was an
+        // expression -- read from the local-names table this VM's codegen built.
+        let result_slot: Option<usize> = if kind == ReplLineKind::Expression {
+            program
+                .chunks
+                .get(entry)
+                .and_then(|c| c.local_names.iter().position(|n| n == REPL_RESULT_NAME))
+        } else {
+            None
+        };
+
+        // reset the executable state; KEEP console + leak_log.
+        self.program = program;
+        self.src = combined.to_string();
+        self.stack.clear();
+        self.heap = Heap::new();
+        self.globals.clear();
+        self.frames = vec![CallFrame {
+            chunk_idx: entry,
+            ip: 0,
+            base: 0,
+            locals: Vec::new(),
+        }];
+
+        // run, capturing __repl_result the instant before __repl_main RETURNs.
+        let mut captured = Value::void();
+        loop {
+            // before dispatch: is the top frame __repl_main, about to RETURN?
+            if let Some(slot) = result_slot
+                && let Some(frame) = self.frames.last()
+                && frame.chunk_idx == entry
+                && let Some(chunk) = self.program.chunks.get(entry)
+                && chunk.code.get(frame.ip).copied() == Some(Opcode::Return as u8)
+                && let Some(v) = frame.locals.get(slot)
+            {
+                // the value bound to __repl_result is in the frame's locals.
+                captured = *v;
+            }
+            match self.dispatch_one()? {
+                StepOutcome::Ran => continue,
+                StepOutcome::Halted => break,
+            }
+        }
+        Ok(captured)
+    }
+}
+
+/// the synthetic name of the REPL's entry function. each REPL call wraps the
+/// accumulated statements in `fn __repl_main() is io { ... }`.
+const REPL_ENTRY_NAME: &str = "__repl_main";
+
+/// the synthetic name of the REPL's result local. when a REPL line is an
+/// expression its value is bound to `let __repl_result = <expr>` so it lands
+/// in a named slot the VM can read back.
+const REPL_RESULT_NAME: &str = "__repl_result";
+
+/// how a REPL source line is shaped, deciding where it is placed in the
+/// wrapped program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplLineKind {
+    /// a top-level item (`fn` / `struct` / `enum` / `interface`) -- placed
+    /// outside the synthetic entry function as a sibling item.
+    Item,
+    /// an expression -- bound to `let __repl_result = <expr>` so its value can
+    /// be recovered as the result.
+    Expression,
+    /// a statement (`let`, ...) -- placed in the body as-is; the result is
+    /// `void`.
+    Statement,
+}
+
+/// classify a REPL source line as an item, an expression, or a statement.
+///
+/// the line is probed by trial parse, never by guessing on its first token:
+/// - if it parses as a complete program with at least one item, it is an
+///   [`ReplLineKind::Item`] (a bare `fn` / `struct` / `enum` / `interface`).
+/// - else, if wrapping it as `let __t = <line>` parses, it is an
+///   [`ReplLineKind::Expression`].
+/// - else it is a [`ReplLineKind::Statement`] (a `let` binding, or anything
+///   else -- the real pipeline run surfaces a genuine error for true garbage,
+///   so misclassifying garbage as a statement is harmless).
+fn classify_repl_line(line: &str) -> ReplLineKind {
+    // an item parses as a whole program with >= 1 item.
+    if let Ok(tokens) = crate::lexer::Lexer::tokenize(line)
+        && let Ok(ast) = crate::parser::Parser::parse(&tokens)
+        && !ast.is_empty()
+    {
+        return ReplLineKind::Item;
+    }
+    // an expression parses inside a `let __t = <line>` probe.
+    let probe = format!("fn __probe() is io {{ let __t = {line}\n}}\n");
+    if let Ok(tokens) = crate::lexer::Lexer::tokenize(&probe)
+        && crate::parser::Parser::parse(&tokens).is_ok()
+    {
+        return ReplLineKind::Expression;
+    }
+    // everything else: a statement.
+    ReplLineKind::Statement
 }
 
 /// what one [`Vm::dispatch_one`] call did.
@@ -3771,5 +4047,140 @@ fn main() -> i64 is pure {
             .alloc(HeapObject::Tuple(vec![Value::pointer(int_slot), Value::pointer(s)]))
             .expect("alloc tuple");
         assert_eq!(vm.runtime_type_name(Value::pointer(tup)), "(i64, str)");
+    }
+
+    // ---- the REPL entry point ----
+
+    /// the i64 a REPL result Value decodes to -- the result is a heap pointer
+    /// to a HeapObject::Int.
+    fn repl_result_i64(vm: &Vm, v: Value) -> i64 {
+        let slot = v.as_pointer().expect("a REPL i64 result is a heap pointer");
+        match vm.heap.get(slot) {
+            Some(HeapObject::Int(n)) => *n,
+            _ => panic!("the REPL result pointer does not reach a heap Int"),
+        }
+    }
+
+    #[test]
+    fn repl_persists_a_binding_from_one_call_to_the_next() {
+        // the VM-07 success criterion: a `let` on one REPL call, then an
+        // expression using it on the next, returns the expected value.
+        let mut vm = Vm::new_repl();
+        // call 1: a let binding -- a statement, the result is void.
+        let first = vm
+            .repl_eval("let x = 5")
+            .expect("the let binding compiles and runs");
+        assert!(first.as_void(), "a let-statement REPL line yields void");
+        // call 2: an expression using the prior binding -- x + 1 == 6.
+        let second = vm
+            .repl_eval("x + 1")
+            .expect("the expression sees the prior binding");
+        assert_eq!(
+            repl_result_i64(&vm, second),
+            6,
+            "x (5) defined on the first call plus 1 is 6 on the second"
+        );
+    }
+
+    #[test]
+    fn repl_evaluates_a_standalone_expression() {
+        // a single expression call with no prior history returns its value.
+        let mut vm = Vm::new_repl();
+        let r = vm.repl_eval("2 * 21").expect("a bare expression evaluates");
+        assert_eq!(repl_result_i64(&vm, r), 42);
+    }
+
+    #[test]
+    fn repl_keeps_the_console_buffer_across_calls() {
+        // the persistence contract: a REPL call resets the value stack, heap,
+        // and frames but KEEPS the console buffer so output accumulates across
+        // calls. the stdlib `println` that writes the console is 05-05's work
+        // (call_stdlib is still a clean Runtime stub here), so this test
+        // verifies the mechanism directly: a console entry present before a
+        // repl call must still be present after it.
+        let mut vm = Vm::new_repl();
+        // a first call establishes a binding and a real program.
+        vm.repl_eval("let x = 1").expect("first call");
+        // simulate stdlib output landing in the console (what println will do).
+        vm.console.push("output one".to_string());
+        // a second REPL call rebuilds and re-runs the whole program.
+        vm.repl_eval("let y = 2").expect("second call");
+        // the console entry from before the second call survived it.
+        assert!(
+            vm.console.iter().any(|line| line == "output one"),
+            "a repl call must not clear the console -- output accumulates"
+        );
+        // and more output after the second call also accumulates.
+        vm.console.push("output two".to_string());
+        vm.repl_eval("x + y").expect("third call");
+        assert_eq!(
+            vm.console,
+            vec!["output one".to_string(), "output two".to_string()],
+            "every console entry survives every later repl call"
+        );
+    }
+
+    #[test]
+    fn repl_a_non_compiling_line_does_not_poison_later_calls() {
+        // a line that does not compile returns an Err and is NOT appended to
+        // the history -- a SUBSEQUENT valid line that uses an earlier binding
+        // still succeeds.
+        let mut vm = Vm::new_repl();
+        vm.repl_eval("let x = 10").expect("the first binding is fine");
+        // a line referencing an undefined name: a typecheck error.
+        match vm.repl_eval("let bad = no_such_name") {
+            Err(_) => {} // expected -- the bad line is rejected.
+            Ok(_) => panic!("a line with an undefined name must not compile"),
+        }
+        // the bad line was not appended; a later valid line using `x` works.
+        let r = vm
+            .repl_eval("x + 2")
+            .expect("the earlier binding is intact after the bad line");
+        assert_eq!(
+            repl_result_i64(&vm, r),
+            12,
+            "x (10) is still in scope -- the bad line did not poison the history"
+        );
+    }
+
+    #[test]
+    fn repl_a_parse_error_line_is_also_not_appended_to_history() {
+        // a syntactically malformed line (not just a type error) is likewise
+        // rejected and not appended.
+        let mut vm = Vm::new_repl();
+        vm.repl_eval("let a = 7").expect("a valid binding");
+        match vm.repl_eval("let = = =") {
+            Err(_) => {}
+            Ok(_) => panic!("a malformed line must not compile"),
+        }
+        // a later valid line still sees `a`.
+        let r = vm.repl_eval("a").expect("the binding survives the parse error");
+        assert_eq!(repl_result_i64(&vm, r), 7);
+    }
+
+    #[test]
+    fn repl_a_function_declaration_line_is_callable_on_a_later_call() {
+        // a top-level item (a `fn`) is placed outside the synthetic entry
+        // function as a sibling; a later REPL line can call it.
+        let mut vm = Vm::new_repl();
+        let decl = vm
+            .repl_eval("fn triple(n: i64) -> i64 is pure { return n * 3 }")
+            .expect("a fn declaration compiles");
+        assert!(decl.as_void(), "an item-declaration REPL line yields void");
+        let r = vm
+            .repl_eval("triple(14)")
+            .expect("the declared function is callable later");
+        assert_eq!(repl_result_i64(&vm, r), 42, "triple(14) is 42");
+    }
+
+    #[test]
+    fn repl_new_repl_starts_blank() {
+        // a fresh REPL VM has no program, no frames, an empty history and
+        // console -- it is ready to receive its first line.
+        let vm = Vm::new_repl();
+        assert!(vm.program.chunks.is_empty(), "no program yet");
+        assert!(vm.frames.is_empty(), "no frame until the first repl call");
+        assert!(vm.repl_history.is_empty(), "an empty accumulated history");
+        assert!(vm.console.is_empty(), "an empty console");
     }
 }
