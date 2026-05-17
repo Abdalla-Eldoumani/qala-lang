@@ -207,10 +207,19 @@ pub enum QalaError {
     /// relaxing this is a future enhancement.
     ComptimeResultNotConstable { span: Span, type_name: String },
 
-    // ---- runtime: added in later phases, same shape ----
-    // keeping these as comments, not code, means later phases extend the enum
-    // and teach `span()` the new arms without changing any existing variant.
-    // Runtime { span: Span, message: String },
+    // ---- runtime ----
+    /// a fault the bytecode VM hit while executing a program: division or
+    /// modulo by zero, an array index out of bounds, a call-frame stack
+    /// overflow from deep recursion, a value-stack overflow, or a malformed
+    /// bytecode stream (an undecodable opcode byte, a truncated operand, a
+    /// jump offset out of range). the VM never panics on any of these -- it
+    /// constructs this variant and unwinds. `span` covers the offending
+    /// source line: the VM derives it from `chunk.source_lines[ip]` via
+    /// [`crate::span::LineIndex`] and stores a span covering that line, so the
+    /// diagnostics renderer formats a runtime fault exactly like a type error.
+    /// `message` is the human description. mirrors the `Type` and `Parse`
+    /// fallback variants -- one structured `{ span, message }` shape.
+    Runtime { span: Span, message: String },
 }
 
 impl QalaError {
@@ -245,7 +254,8 @@ impl QalaError {
             | QalaError::IntegerOverflow { span, .. }
             | QalaError::ComptimeBudgetExceeded { span }
             | QalaError::ComptimeEffectViolation { span, .. }
-            | QalaError::ComptimeResultNotConstable { span, .. } => *span,
+            | QalaError::ComptimeResultNotConstable { span, .. }
+            | QalaError::Runtime { span, .. } => *span,
         }
     }
 
@@ -334,6 +344,7 @@ impl QalaError {
                     "comptime result of type `{type_name}` is not representable as a constant (only primitives and strings)"
                 )
             }
+            QalaError::Runtime { message, .. } => message.clone(),
         }
     }
 }
@@ -616,6 +627,28 @@ mod tests {
     }
 
     #[test]
+    fn span_returns_the_carried_span_for_the_runtime_variant() {
+        // the VM constructs Runtime with a span covering the offending source
+        // line; span() must hand that span straight back.
+        let e = QalaError::Runtime {
+            span: sample(7),
+            message: "division by zero".to_string(),
+        };
+        assert_eq!(e.span(), sample(7), "span() mismatch for {e:?}");
+    }
+
+    #[test]
+    fn runtime_message_returns_the_carried_message_verbatim() {
+        // like the Type and Parse fallback arms, message() is the stored
+        // string with no template wrapping.
+        let e = QalaError::Runtime {
+            span: sample(0),
+            message: "index 5 out of bounds for length 3".to_string(),
+        };
+        assert_eq!(e.message(), "index 5 out of bounds for length 3");
+    }
+
+    #[test]
     fn errors_are_comparable_and_clonable() {
         let a = QalaError::IntOverflow { span: sample(0) };
         let b = a.clone();
@@ -704,6 +737,10 @@ mod tests {
             QalaError::ComptimeResultNotConstable {
                 span: sample(0),
                 type_name: "[i64; 3]".to_string(),
+            },
+            QalaError::Runtime {
+                span: sample(0),
+                message: "division by zero".to_string(),
             },
         ];
         for e in &errs {
