@@ -1,8 +1,8 @@
 //! the Qala compiler and bytecode VM, as a single crate.
 //!
 //! the pipeline is lexer -> parser -> type and effect checker -> codegen -> VM.
-//! this file declares the modules in dependency order. there are no
-//! `wasm-bindgen` exports yet; the browser bridge is added in a later phase.
+//! this file declares the modules in dependency order. the `wasm-bindgen`
+//! bridge that exposes the pipeline to JavaScript lives in `wasm.rs`.
 
 pub mod span;
 pub mod errors;
@@ -29,3 +29,5 @@ pub mod optimizer;
 pub mod vm;
 // native standard library -- the 15 built-in functions the VM dispatches.
 pub mod stdlib;
+// wasm-bindgen bridge -- the browser-facing Qala session API.
+pub mod wasm;
