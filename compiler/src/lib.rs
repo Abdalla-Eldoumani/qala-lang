@@ -25,3 +25,5 @@ pub mod chunk;
 pub mod codegen;
 // peephole optimizer -- single-pass bytecode rewrites.
 pub mod optimizer;
+// stack-based bytecode interpreter -- call frames, heap, single-step.
+pub mod vm;
