@@ -22,6 +22,16 @@
 //! match-based reverse lookup compiles to a branch table and is safe on
 //! every byte. zero-cost safety; idiomatic Rust pattern.
 
+/// the first fn-id reserved for the native standard library.
+///
+/// codegen assigns user functions dense ids `0..N` (into `Program::chunks`)
+/// and stdlib functions ids `STDLIB_FN_BASE + i`. the VM's `CALL` handler
+/// branches on this threshold: a fn-id at or above it routes to the native
+/// stdlib dispatcher; below it looks up a user chunk. all three modules that
+/// use this value (`codegen.rs`, `vm.rs`, `stdlib.rs`) import it from here so
+/// there is exactly one definition to change.
+pub const STDLIB_FN_BASE: u16 = 40_000;
+
 /// the bytecode opcode set.
 ///
 /// one byte per opcode, dense discriminants 0..=45 for the active set plus
