@@ -35,7 +35,7 @@
 //! `chunk.code.len() == chunk.source_lines.len()` survives codegen.
 
 use crate::ast::{BinOp, Pattern, UnaryOp};
-use crate::chunk::{Chunk, Program};
+use crate::chunk::{Chunk, Program, StructInfo};
 use crate::effects::EffectSet;
 use crate::errors::QalaError;
 use crate::opcode::Opcode;
@@ -139,6 +139,11 @@ struct Codegen<'a> {
     /// `(struct_name, field_name)` -> the field's stable index within the
     /// struct, used as the `FIELD` opcode operand.
     struct_field_index: HashMap<(String, String), u16>,
+    /// `struct_name` -> struct id, parallel to [`Program::structs`]. a struct
+    /// is registered on first sight at a struct literal; the id is the
+    /// `MAKE_STRUCT` operand. `BTreeMap` for deterministic id assignment,
+    /// matching the `enum_variant_table` precedent.
+    struct_id_table: BTreeMap<String, u16>,
     /// fn-id -> declared/inferred effect; the [`ComptimeInterpreter`] consults
     /// this at every CALL for the defense-in-depth purity gate.
     fn_effects: HashMap<u16, EffectSet>,
@@ -269,6 +274,7 @@ impl<'a> Codegen<'a> {
             enum_variant_table,
             enum_variant_payload_count,
             struct_field_index: HashMap::new(),
+            struct_id_table: BTreeMap::new(),
             fn_effects,
             errors: Vec::new(),
         }
@@ -384,6 +390,27 @@ impl<'a> Codegen<'a> {
     /// the 1-based source line of a span's start byte.
     fn line_at(&self, span: Span) -> u32 {
         self.line_index.location(self.src, span.start as usize).0 as u32
+    }
+
+    /// resolve a struct name to its id, registering it on first sight.
+    ///
+    /// the id is an index into [`Program::structs`]; the first struct seen
+    /// gets id 0, the next id 1, and so on. a second literal of an
+    /// already-seen struct reuses the same id. the `BTreeMap` keeps id
+    /// assignment deterministic regardless of the order struct literals
+    /// appear, matching the `enum_variant_table` precedent. `field_count`
+    /// is recorded so the VM knows how many values `MAKE_STRUCT` pops.
+    fn register_struct(&mut self, name: &str, field_count: u16) -> u16 {
+        if let Some(&id) = self.struct_id_table.get(name) {
+            return id;
+        }
+        let id = self.program.structs.len() as u16;
+        self.program.structs.push(StructInfo {
+            name: name.to_string(),
+            field_count,
+        });
+        self.struct_id_table.insert(name.to_string(), id);
+        id
     }
 
     // ---- scope management --------------------------------------------------
@@ -1018,13 +1045,12 @@ impl<'a> Codegen<'a> {
                 for field in fields {
                     self.compile_expr(&field.value)?;
                 }
-                // v1 limitation: MAKE_STRUCT carries only the field count,
-                // not the struct name -- Phase 5 will need a struct-id table
-                // extension to recover the runtime layout. documented in the
-                // SUMMARY.
-                let _ = name;
+                // register the struct (name + field count) in Program.structs
+                // and emit its id as the MAKE_STRUCT operand, so the VM can
+                // label the heap struct with its declared name.
+                let struct_id = self.register_struct(name, fields.len() as u16);
                 self.chunk_mut().write_op(Opcode::MakeStruct, line);
-                self.chunk_mut().write_u16(fields.len() as u16, line);
+                self.chunk_mut().write_u16(struct_id, line);
                 Ok(())
             }
             TypedExpr::Range { start, end, inclusive, span, .. } => {
@@ -3380,7 +3406,9 @@ mod tests {
         assert_eq!(ops.last(), Some(&Opcode::MakeArray));
     }
 
-    // Test 15: a struct literal emits its field values then MAKE_STRUCT.
+    // Test 15: a struct literal emits its field values then MAKE_STRUCT. the
+    // MAKE_STRUCT operand is now a struct id (Point is the first struct
+    // registered, so id 0), NOT the bare field count.
     #[test]
     fn compile_expr_struct_lit_emits_make_struct() {
         let src = "struct Point { x: f64, y: f64 }\n\
@@ -3389,7 +3417,43 @@ mod tests {
         let ops = opcodes(&code);
         assert_eq!(ops.last(), Some(&Opcode::MakeStruct));
         let ms = code.len() - 3;
-        assert_eq!(u16::from_le_bytes([code[ms + 1], code[ms + 2]]), 2);
+        assert_eq!(
+            u16::from_le_bytes([code[ms + 1], code[ms + 2]]),
+            0,
+            "MAKE_STRUCT operand is the struct id of the first registered struct"
+        );
+    }
+
+    // Test 15b: a struct literal registers its struct in Program.structs --
+    // the id MAKE_STRUCT carries indexes a StructInfo with the declared name
+    // and field count.
+    #[test]
+    fn struct_literal_registers_the_struct_in_the_program_table() {
+        let src = "struct Point { x: f64, y: f64 }\n\
+                   fn main() -> Point is pure { Point { x: 1.0, y: 2.0 } }";
+        let typed = typecheck(src);
+        let program = compile_program(&typed, src).expect("compile");
+        assert_eq!(program.structs.len(), 1, "exactly one struct registered");
+        assert_eq!(program.structs[0].name, "Point");
+        assert_eq!(program.structs[0].field_count, 2);
+    }
+
+    // Test 15c: two literals of the same struct reuse one id; two distinct
+    // structs get distinct ids assigned deterministically.
+    #[test]
+    fn repeated_struct_literals_reuse_one_id_distinct_structs_get_distinct_ids() {
+        let src = "struct A { v: i64 }\n\
+                   struct B { v: i64 }\n\
+                   fn two() -> A is pure { let _x = B { v: 1 }\nA { v: 2 } }\n\
+                   fn again() -> A is pure { A { v: 3 } }\n\
+                   fn main() is pure { }";
+        let typed = typecheck(src);
+        let program = compile_program(&typed, src).expect("compile");
+        // A is referenced twice but registered once; B once. two entries.
+        assert_eq!(program.structs.len(), 2, "A reused, B distinct");
+        // B is seen first (inside `two`'s body), so it takes id 0, A id 1.
+        let names: Vec<&str> = program.structs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["B", "A"]);
     }
 
     // Test 16: an enum-variant constructor emits MAKE_ENUM_VARIANT.
