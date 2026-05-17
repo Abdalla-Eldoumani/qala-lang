@@ -165,6 +165,7 @@ export default function Page() {
     speed,
     setSpeed,
     dirty,
+    finished,
     replEval,
     loadedExample,
     loadExample,
@@ -226,6 +227,7 @@ export default function Page() {
       running={running}
       dirty={dirty}
       programCompiled={programCompiled}
+      finished={finished}
       speed={speed}
       setSpeed={setSpeed}
       onRun={handleRun}
