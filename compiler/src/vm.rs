@@ -36,7 +36,7 @@
 use crate::chunk::Chunk;
 use crate::chunk::Program;
 use crate::errors::QalaError;
-use crate::opcode::Opcode;
+use crate::opcode::{Opcode, STDLIB_FN_BASE};
 use crate::span::LineIndex;
 use crate::span::Span;
 use crate::value::ConstValue;
@@ -51,17 +51,6 @@ use crate::value::Value;
 /// enforced in [`Vm::op_call`] and [`Vm::call_function_value`] -- both check
 /// `frames.len() >= MAX_FRAMES` before pushing a frame.
 const MAX_FRAMES: usize = 1024;
-
-/// the first function id reserved for the stdlib. codegen assigns user
-/// functions dense ids `0..N` (indexes into [`Program::chunks`]) and stdlib
-/// functions ids `STDLIB_FN_BASE + i` -- the two id spaces never collide.
-///
-/// the [`Vm::op_call`] handler branches on this threshold: a `fn_id` at or
-/// above it is a native stdlib call routed to [`Vm::call_stdlib`]; below it is
-/// a user function with a chunk in `Program.chunks`. the value must match
-/// codegen's `STDLIB_FN_BASE` (see `codegen.rs`); changing one without the
-/// other corrupts every stdlib call site.
-const STDLIB_FN_BASE: u16 = 40_000;
 
 /// the value-stack depth cap. [`Vm::push`] errors past it with "value stack
 /// overflow" so a runaway program cannot exhaust WASM memory through the value
