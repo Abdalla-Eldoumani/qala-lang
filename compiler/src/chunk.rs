@@ -55,6 +55,17 @@ pub struct Chunk {
     /// multi-byte instructions duplicate the line across operand bytes so
     /// `source_lines[i]` is valid for any `i in 0..code.len()`.
     pub source_lines: Vec<u32>,
+    /// the source name of each local slot, indexed by slot number (the
+    /// GET_LOCAL / SET_LOCAL operand). `local_names[i]` is the name the
+    /// programmer wrote for slot `i` -- `"x"`, `"sum"`, a `for` loop variable,
+    /// a `match` payload binding. a compiler-synthesized temporary (a hidden
+    /// `for`-loop array/index slot) has an empty string; the VM falls back to
+    /// `slot{i}` for those. codegen fills this when it finalizes a function's
+    /// chunk; the VM's `get_state` reads it to surface the in-scope variables
+    /// with their real names rather than slot indices. a chunk built by hand
+    /// (a test, a `comptime` body) leaves it empty -- `Default` gives an empty
+    /// vec, so older callers are unaffected.
+    pub local_names: Vec<String>,
 }
 
 /// one declared struct's runtime identity: its name and its field count.
