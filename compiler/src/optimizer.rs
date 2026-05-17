@@ -25,7 +25,7 @@
 
 use crate::chunk::Chunk;
 use crate::opcode::Opcode;
-use crate::value::Value;
+use crate::value::ConstValue;
 
 /// run the single-pass peephole optimizer over `chunk`.
 ///
@@ -85,7 +85,7 @@ struct Rewrite {
     /// Pattern 8 only: the folded constant to append to `chunk.constants`.
     /// `apply_rewrite` pushes it, gets the new u16 index, and patches
     /// `replacement_bytes[1..=2]` with the little-endian index.
-    new_constant: Option<Value>,
+    new_constant: Option<ConstValue>,
 }
 
 /// try to match a locked pattern starting at byte `i` in `chunk.code`.
@@ -142,7 +142,7 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
 
         // Pattern 4: CONST true JUMP_IF_FALSE -> remove both. the branch is
         // never taken; control falls through.
-        if jump_op == jif_byte && cond == Some(&Value::Bool(true)) {
+        if jump_op == jif_byte && cond == Some(&ConstValue::Bool(true)) {
             return Some(Rewrite {
                 window_bytes_in: 6,
                 replacement_bytes: Vec::new(),
@@ -152,7 +152,7 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
         }
         // Pattern 5: CONST false JUMP_IF_FALSE -> JUMP. the branch is always
         // taken; the JUMP_IF_FALSE offset bytes carry over unchanged.
-        if jump_op == jif_byte && cond == Some(&Value::Bool(false)) {
+        if jump_op == jif_byte && cond == Some(&ConstValue::Bool(false)) {
             return Some(Rewrite {
                 window_bytes_in: 6,
                 replacement_bytes: vec![jump_byte, code[i + 4], code[i + 5]],
@@ -162,7 +162,7 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
         }
         // Pattern 6: CONST true JUMP_IF_TRUE -> JUMP. the branch is always
         // taken.
-        if jump_op == jit_byte && cond == Some(&Value::Bool(true)) {
+        if jump_op == jit_byte && cond == Some(&ConstValue::Bool(true)) {
             return Some(Rewrite {
                 window_bytes_in: 6,
                 replacement_bytes: vec![jump_byte, code[i + 4], code[i + 5]],
@@ -172,7 +172,7 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
         }
         // Pattern 7: CONST false JUMP_IF_TRUE -> remove both. the branch is
         // never taken.
-        if jump_op == jit_byte && cond == Some(&Value::Bool(false)) {
+        if jump_op == jit_byte && cond == Some(&ConstValue::Bool(false)) {
             return Some(Rewrite {
                 window_bytes_in: 6,
                 replacement_bytes: Vec::new(),
@@ -201,12 +201,12 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
             // user-facing IntegerOverflow path; if a fold reaches peephole
             // and overflows, v1 leaves the bytes rather than erroring (an
             // error here would break the build silently).
-            (Some(Value::I64(x)), Some(Value::I64(y)), op_byte) if op_byte == add_byte => {
-                x.checked_add(*y).map(Value::I64)
+            (Some(ConstValue::I64(x)), Some(ConstValue::I64(y)), op_byte) if op_byte == add_byte => {
+                x.checked_add(*y).map(ConstValue::I64)
             }
             // f64 + f64: IEEE 754 add. inf / NaN are valid fold results.
-            (Some(Value::F64(x)), Some(Value::F64(y)), op_byte) if op_byte == fadd_byte => {
-                Some(Value::F64(x + y))
+            (Some(ConstValue::F64(x)), Some(ConstValue::F64(y)), op_byte) if op_byte == fadd_byte => {
+                Some(ConstValue::F64(x + y))
             }
             // any other type pair (or opcode/type mismatch): no fold.
             _ => None,
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn pattern_1_const_pop_pair_is_removed() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(7));
+        let idx = c.add_constant(ConstValue::I64(7));
         write_const(&mut c, idx, 1);
         c.write_op(Opcode::Pop, 1);
         c.write_op(Opcode::Halt, 2);
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn pattern_2_dup_pop_pair_is_removed() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(0));
+        let idx = c.add_constant(ConstValue::I64(0));
         write_const(&mut c, idx, 1);
         c.write_op(Opcode::Dup, 1);
         c.write_op(Opcode::Pop, 1);
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn pattern_4_const_true_jump_if_false_is_removed() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::Bool(true));
+        let idx = c.add_constant(ConstValue::Bool(true));
         write_const(&mut c, idx, 1);
         write_jump(&mut c, Opcode::JumpIfFalse, 5, 1);
         c.write_op(Opcode::Halt, 2);
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn pattern_5_const_false_jump_if_false_becomes_jump() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::Bool(false));
+        let idx = c.add_constant(ConstValue::Bool(false));
         write_const(&mut c, idx, 1);
         write_jump(&mut c, Opcode::JumpIfFalse, 5, 1);
         c.write_op(Opcode::Halt, 2);
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn pattern_6_const_true_jump_if_true_becomes_jump() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::Bool(true));
+        let idx = c.add_constant(ConstValue::Bool(true));
         write_const(&mut c, idx, 1);
         write_jump(&mut c, Opcode::JumpIfTrue, 9, 1);
         c.write_op(Opcode::Halt, 2);
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn pattern_7_const_false_jump_if_true_is_removed() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::Bool(false));
+        let idx = c.add_constant(ConstValue::Bool(false));
         write_const(&mut c, idx, 1);
         write_jump(&mut c, Opcode::JumpIfTrue, 5, 1);
         c.write_op(Opcode::Halt, 2);
@@ -547,8 +547,8 @@ mod tests {
     #[test]
     fn pattern_8_folds_two_i64_const_add() {
         let mut c = Chunk::new();
-        let a = c.add_constant(Value::I64(2));
-        let b = c.add_constant(Value::I64(3));
+        let a = c.add_constant(ConstValue::I64(2));
+        let b = c.add_constant(ConstValue::I64(3));
         write_const(&mut c, a, 1);
         write_const(&mut c, b, 1);
         c.write_op(Opcode::Add, 1);
@@ -560,10 +560,10 @@ mod tests {
         assert_eq!(c.code.len(), 4);
         // the folded constant is the latest pool entry, value 5.
         let new_idx = c.read_u16(1);
-        assert_eq!(c.constants[new_idx as usize], Value::I64(5));
+        assert_eq!(c.constants[new_idx as usize], ConstValue::I64(5));
         // the two original constants are still present at indices 0 and 1.
-        assert_eq!(c.constants[0], Value::I64(2));
-        assert_eq!(c.constants[1], Value::I64(3));
+        assert_eq!(c.constants[0], ConstValue::I64(2));
+        assert_eq!(c.constants[1], ConstValue::I64(3));
         assert_eq!(c.constants.len(), 3);
     }
 
@@ -572,8 +572,8 @@ mod tests {
     #[test]
     fn pattern_8_folds_two_f64_const_fadd() {
         let mut c = Chunk::new();
-        let a = c.add_constant(Value::F64(1.5));
-        let b = c.add_constant(Value::F64(2.5));
+        let a = c.add_constant(ConstValue::F64(1.5));
+        let b = c.add_constant(ConstValue::F64(2.5));
         write_const(&mut c, a, 1);
         write_const(&mut c, b, 1);
         c.write_op(Opcode::FAdd, 1);
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(c.code[0], Opcode::Const as u8);
         assert_eq!(c.code[3], Opcode::Halt as u8);
         let new_idx = c.read_u16(1);
-        assert_eq!(c.constants[new_idx as usize], Value::F64(4.0));
+        assert_eq!(c.constants[new_idx as usize], ConstValue::F64(4.0));
     }
 
     // Test 10 (Pattern 8 -- i64 overflow): the fold WOULD overflow; per the
@@ -590,8 +590,8 @@ mod tests {
     #[test]
     fn pattern_8_skips_fold_on_i64_overflow() {
         let mut c = Chunk::new();
-        let a = c.add_constant(Value::I64(i64::MAX));
-        let b = c.add_constant(Value::I64(1));
+        let a = c.add_constant(ConstValue::I64(i64::MAX));
+        let b = c.add_constant(ConstValue::I64(1));
         write_const(&mut c, a, 1);
         write_const(&mut c, b, 1);
         c.write_op(Opcode::Add, 1);
@@ -625,7 +625,7 @@ mod tests {
         // CONST+POP pair is removed the HALT moves to byte 4; the JUMP's
         // offset must drop by 4 to +1: (1+2)+1 = 4.
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(0));
+        let idx = c.add_constant(ConstValue::I64(0));
         write_jump(&mut c, Opcode::Jump, 5, 1);
         write_const(&mut c, idx, 1);
         c.write_op(Opcode::Pop, 1);
@@ -650,7 +650,7 @@ mod tests {
         // (bytes 1..=4) is removed the JUMP slides to byte 1, operand 2..=3,
         // byte-after = 4; to still reach byte 0 the offset must be -4.
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(0));
+        let idx = c.add_constant(ConstValue::I64(0));
         c.write_op(Opcode::Halt, 1);
         write_const(&mut c, idx, 2);
         c.write_op(Opcode::Pop, 2);
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn multiple_patterns_collapse_in_a_single_pass() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(0));
+        let idx = c.add_constant(ConstValue::I64(0));
         write_const(&mut c, idx, 1);
         c.write_op(Opcode::Pop, 1);
         c.write_op(Opcode::Dup, 2);
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn peephole_is_idempotent_within_a_single_pass() {
         let mut c = Chunk::new();
-        let t = c.add_constant(Value::Bool(false));
+        let t = c.add_constant(ConstValue::Bool(false));
         write_const(&mut c, t, 1);
         write_jump(&mut c, Opcode::JumpIfFalse, 7, 1);
         c.write_op(Opcode::Not, 2);
@@ -709,7 +709,7 @@ mod tests {
         // offset is 9 - 5 = +4. after the CONST+POP pair is removed the HALT
         // moves to byte 5; the offset must drop by 4 to 0.
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(0));
+        let idx = c.add_constant(ConstValue::I64(0));
         c.write_op(Opcode::MatchVariant, 1);
         c.write_u16(0, 1); // variant id
         c.write_i16(4, 1); // miss offset
@@ -730,8 +730,8 @@ mod tests {
     #[test]
     fn lockstep_invariant_holds_after_rewrites() {
         let mut c = Chunk::new();
-        let n = c.add_constant(Value::I64(1));
-        let t = c.add_constant(Value::Bool(true));
+        let n = c.add_constant(ConstValue::I64(1));
+        let t = c.add_constant(ConstValue::Bool(true));
         write_const(&mut c, n, 1);
         c.write_op(Opcode::Pop, 1);
         write_const(&mut c, t, 2);
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn peephole_leaves_an_already_tight_chunk_unchanged() {
         let mut c = Chunk::new();
-        let idx = c.add_constant(Value::I64(1));
+        let idx = c.add_constant(ConstValue::I64(1));
         write_const(&mut c, idx, 1);
         c.write_op(Opcode::Return, 1);
         let before = c.code.clone();
