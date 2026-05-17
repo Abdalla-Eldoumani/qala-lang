@@ -191,9 +191,10 @@ export default function Page() {
   // wiring, not business logic: it only sequences two hook calls so the
   // page stays a thin orchestrator. compile is synchronous (it calls the
   // bridge and updates the snapshot in the same tick), so play() runs the
-  // freshly compiled program.
+  // freshly compiled program. a failed compile returns false -- the
+  // editor squiggles surface the errors and the loop does not start.
   const handleRun = useCallback(() => {
-    if (dirty) compile();
+    if (dirty && !compile()) return;
     play();
   }, [dirty, compile, play]);
 
