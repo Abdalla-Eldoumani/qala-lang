@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+:root {
+  /* codex palette -- the in-code source of truth for the design system */
+  --bg: #0C0E14;
+  --surface: #13151E;
+  --border: #1E2130;
+  --text-primary: #E8E4DC;
+  --text-secondary: #8A8690;
+  --accent: #D4943A;
+  --accent-soft: rgba(212, 148, 58, 0.15);
+  --error: #C74B50;
+  --success: #4B8C6F;
+  --warning: #C7A14B;
+  --type-number: rgba(212, 148, 58, 0.20);
+  --type-string: rgba(75, 140, 111, 0.20);
+  --type-bool: rgba(85, 110, 200, 0.20);
+
+  /* codex spacing scale -- sparse by design, no --space-5 / --space-7 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* codex radii */
+  --radius-panel: 6px;
+  --radius-button: 4px;
+  --radius-tag: 2px;
+}
+
+/*
+  re-expose the :root variables as tailwind tokens. `inline` matters:
+  the values reference other css variables (the :root block and the
+  next/font variables), so tailwind must inline the reference into the
+  generated utility rather than emit a fresh variable. with `inline`,
+  bg-bg resolves to var(--bg) and font-mono to var(--font-mono).
+  the --space-* and --radius-* tokens stay out of @theme on purpose:
+  components reach them through arbitrary-value utilities, which keeps
+  the off-scale-value check easy to eyeball.
+*/
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-error: var(--error);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-type-number: var(--type-number);
+  --color-type-string: var(--type-string);
+  --color-type-bool: var(--type-bool);
+
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-body), sans-serif;
+}
