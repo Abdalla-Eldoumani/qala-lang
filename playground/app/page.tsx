@@ -185,6 +185,14 @@ export default function Page() {
   // vs repl) and the Controls disabled matrix. it stays true after an
   // edit -- the separate dirty flag is the stale signal -- so the panels
   // and the controls reflect "a program exists, but it is stale".
+  //
+  // the disassembly check relies on the bridge invariant that a
+  // CompileResult carries a disassembly string exactly when ok is true,
+  // and leaves it undefined (never a placeholder string) on a failed
+  // compile. disassemble_core does return a truthy "no program" string
+  // elsewhere, but that string never reaches a CompileResult -- so the
+  // check is sound. if compile_core ever changes its disassembly field,
+  // revisit this gate.
   const programCompiled = Boolean(lastCompile?.ok && lastCompile.disassembly);
 
   // the Run handler. when the source is dirty, Run compiles first, then
