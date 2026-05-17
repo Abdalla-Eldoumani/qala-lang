@@ -15,6 +15,8 @@
   --type-number: rgba(212, 148, 58, 0.20);
   --type-string: rgba(75, 140, 111, 0.20);
   --type-bool: rgba(85, 110, 200, 0.20);
+  /* the neutral stack tint -- arrays, tuples, structs, enums, void */
+  --type-other: rgba(138, 134, 144, 0.12);
 
   /* codex spacing scale -- sparse by design, no --space-5 / --space-7 */
   --space-1: 4px;
@@ -54,6 +56,7 @@
   --color-type-number: var(--type-number);
   --color-type-string: var(--type-string);
   --color-type-bool: var(--type-bool);
+  --color-type-other: var(--type-other);
 
   --font-display: var(--font-display);
   --font-body: var(--font-body);
@@ -64,4 +67,145 @@ body {
   background: var(--bg);
   color: var(--text-primary);
   font-family: var(--font-body), sans-serif;
+}
+
+/*
+  the playground animation layer. pure css -- the pinned package.json
+  carries no motion library. every duration and easing is verbatim from
+  the codex animation contract: motion is a translate-plus-fade, never a
+  glow or a gradient. the panel components attach these classes; the
+  keyframes themselves live here so the timings are in one place.
+*/
+
+/* stackpanel push: a value slides down into its slot from above and
+   fades in. the decelerate curve reads as "it landed". */
+@keyframes stack-push {
+  from {
+    transform: translateY(-100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.stack-entry--entering {
+  animation: stack-push 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* stackpanel pop: a value slides down out of its slot and fades. the
+   accelerate curve reads as "dropped off". the entry is held in the dom
+   for the 150ms and removed on animationend so the keyframe can play. */
+@keyframes stack-pop {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+}
+
+.stack-entry--leaving {
+  animation: stack-pop 150ms ease-in;
+}
+
+/* variablespanel flash: a changed variable row washes amber and fades
+   back. 3000ms total -- 300ms in, a 1700ms hold, 1000ms out -- the codex
+   changed-variable timing. re-applied on a re-change. */
+@keyframes var-flash {
+  0% {
+    background-color: transparent;
+  }
+  10% {
+    background-color: var(--accent-soft);
+  }
+  67% {
+    background-color: var(--accent-soft);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.var-row--flashing {
+  animation: var-flash 3000ms ease-in-out;
+}
+
+/* the run-loop running indicator: the pause button's accent outline
+   pulses while the loop is live -- the "alive" signal. */
+@keyframes running-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.running-indicator {
+  animation: running-pulse 1s ease-in-out infinite;
+}
+
+/* the editor current-source-line highlight: the monaco whole-line
+   decoration class. the soft amber background eases as the highlight
+   moves from line to line. */
+.qala-current-line {
+  background-color: var(--accent-soft);
+  transition: background-color 100ms ease-out;
+}
+
+/* the stackpanel entry backgrounds, tinted by the value's runtime type.
+   the stackpanel classifier picks one of these per entry. */
+.tint-number {
+  background-color: var(--type-number);
+}
+
+.tint-string {
+  background-color: var(--type-string);
+}
+
+.tint-bool {
+  background-color: var(--type-bool);
+}
+
+.tint-other {
+  background-color: var(--type-other);
+}
+
+/*
+  the accessibility floor: under prefers-reduced-motion the slides, the
+  pulse, and the long flash hold are removed. the data still updates --
+  only the motion goes. pushes and pops settle instantly, the running
+  indicator holds steady, and the variable flash collapses to a brief
+  static tint.
+*/
+@media (prefers-reduced-motion: reduce) {
+  .stack-entry--entering,
+  .stack-entry--leaving {
+    animation: none;
+  }
+
+  .running-indicator {
+    animation: none;
+    opacity: 1;
+  }
+
+  .qala-current-line {
+    transition: none;
+  }
+
+  @keyframes var-flash {
+    0%,
+    100% {
+      background-color: var(--accent-soft);
+    }
+  }
+
+  .var-row--flashing {
+    animation: var-flash 600ms ease-out;
+  }
 }
