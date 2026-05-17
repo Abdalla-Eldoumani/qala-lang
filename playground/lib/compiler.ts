@@ -46,9 +46,13 @@ export async function loadQala(): Promise<QalaSession> {
     Qala: QalaClass;
   };
 
-  // instantiate from the copied public/ asset. passing a fetch promise
-  // lets the glue use WebAssembly.instantiateStreaming.
-  await wasm.default(fetch("/wasm/qala_compiler_bg.wasm"));
+  // instantiate from the copied public/ asset. await the fetch first and
+  // pass the resolved Response: the glue's __wbg_init prototype-checks its
+  // argument and logs a deprecation warning for anything that is not a
+  // plain options object or undefined -- a bare Promise trips that check.
+  // a Response still gets WebAssembly.instantiateStreaming, so streaming
+  // instantiation is preserved.
+  await wasm.default(await fetch("/wasm/qala_compiler_bg.wasm"));
 
   const inner = new wasm.Qala();
 
