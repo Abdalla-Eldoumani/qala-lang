@@ -47,7 +47,14 @@ export function useQala(): UseQala {
     let cancelled = false;
     loadQala()
       .then((session) => {
-        if (cancelled) return;
+        // the component unmounted while loadQala was in flight (notably
+        // under dev strict mode, which mounts/unmounts/mounts). the
+        // resolved session is unreachable, so free it rather than leave
+        // it for the FinalizationRegistry.
+        if (cancelled) {
+          session.free();
+          return;
+        }
         sessionRef.current = session;
         setStatus("ready");
       })
