@@ -358,6 +358,10 @@ pub struct VmState {
     pub chunk_index: usize,
     /// the instruction pointer: a byte offset into that chunk's `code`.
     pub ip: usize,
+    /// the 1-based source line of the instruction at `ip`, for the editor's
+    /// current-line highlight. `0` means no line -- a synthesized instruction
+    /// or an out-of-range `ip`; the playground highlights nothing then.
+    pub current_line: usize,
     /// the value stack bottom-to-top, each slot rendered and type-tagged.
     pub stack: Vec<StateValue>,
     /// the current frame's in-scope local variables, name + typed value.
@@ -1931,9 +1935,21 @@ impl Vm {
             }
         };
 
+        // the 1-based source line of the current instruction, mirroring the
+        // runtime-error path's lookup. 0 when frames is empty (the terminal
+        // snapshot), when the chunk is missing, or when ip is past the source
+        // map -- the playground reads 0 as "no line to highlight".
+        let current_line = self
+            .program
+            .chunks
+            .get(chunk_index)
+            .and_then(|c| c.source_lines.get(ip).copied())
+            .unwrap_or(0) as usize;
+
         VmState {
             chunk_index,
             ip,
+            current_line,
             stack,
             variables,
             console: self.console.clone(),
@@ -3998,6 +4014,38 @@ fn main() -> i64 is pure { return run() }
         assert_eq!(s3.ip, 7);
         assert_eq!(s3.stack.len(), 1, "ADD popped two, pushed one");
         assert_eq!(s3.stack[0].rendered, "30", "10 + 20 == 30");
+    }
+
+    #[test]
+    fn state_current_line_tracks_the_source_map_then_is_zero_after_halt() {
+        // PGUI-08: get_state surfaces the 1-based source line of the
+        // instruction at ip, read from the chunk's source_lines map. emit_const
+        // writes every byte of CONST + HALT against the line it is given here,
+        // so the whole chunk maps to line 7.
+        let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::I64(1), 7);
+        chunk.write_op(Opcode::Halt, 7);
+        let mut vm = Vm::new(program_with(chunk), "x".to_string());
+
+        // a stepped program: ip points inside the chunk, so source_lines.get(ip)
+        // hits and current_line is the mapped line.
+        assert_eq!(vm.step().expect("step 1"), StepOutcome::Ran);
+        let stepped = vm.get_state();
+        assert_eq!(stepped.ip, 3, "CONST advanced ip past its 3 bytes");
+        assert_eq!(
+            stepped.current_line, 7,
+            "current_line is the source line the source map records for ip"
+        );
+
+        // after the program halts the frame stack is empty: the terminal
+        // snapshot puts ip one past the chunk's code, source_lines.get(ip)
+        // misses, and current_line falls back to 0 -- "no line to highlight".
+        assert_eq!(vm.step().expect("step 2"), StepOutcome::Halted);
+        let halted = vm.get_state();
+        assert_eq!(
+            halted.current_line, 0,
+            "a finished program has no current line"
+        );
     }
 
     #[test]
