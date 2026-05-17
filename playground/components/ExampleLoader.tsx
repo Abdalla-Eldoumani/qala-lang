@@ -57,10 +57,17 @@ export default function ExampleLoader({
   // the editor holds the user's own text (the placeholder shows then).
   const display = displayFor(loadedExample);
 
-  // a selection loads that example. the <select> value is always pinned
-  // to the loaded file (or the placeholder), so picking the same option
-  // again would not fire onChange -- acceptable: re-loading an unchanged
-  // example is a no-op the user would not ask for, and a reset is Reset.
+  // a selection loads that example. the <select> value is pinned to the
+  // loaded file so the trigger can show the loaded example's name (the
+  // UI-SPEC surface 7 contract). a native select does not fire onChange
+  // when the already-selected option is re-picked, so directly after a
+  // load the same example cannot be re-picked. that dead-zone is narrow
+  // and harmless: it lasts only until the first edit -- and until the
+  // first edit the editor still holds the pristine example, so a reload
+  // would change nothing. the first edit clears loadedExample (the hook),
+  // the value snaps to the placeholder, and every option fires again.
+  // re-picking the same example to discard edits is therefore always
+  // reachable once there are edits to discard.
   function handleChange(event: ChangeEvent<HTMLSelectElement>) {
     const file = event.target.value;
     if (file === "") return;
