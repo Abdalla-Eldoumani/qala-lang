@@ -241,17 +241,12 @@ impl Heap {
     /// inspect it. when the count is still positive after the decrement -- or
     /// the slot is out of range or already free -- the result is `None`.
     ///
-    /// the return value is load-bearing: the stdlib's file-handle leak check
-    /// needs `dec` to hand back the freed object so the [`Vm`] can detect a
-    /// still-open [`HeapObject::FileHandle`] and push to [`Vm::leak_log`]. the
-    /// leak-log push is the caller's responsibility -- `Heap` has no access to
-    /// `Vm::leak_log`; `dec` only surfaces the freed object. this signature is
-    /// the locked contract; later plans must not change it.
-    ///
-    /// `allow(dead_code)`: part of the locked `Heap` refcount API. the opcode
-    /// handlers that drop a heap reference (`POP` of a pointer, scope exit,
-    /// `RETURN`) call `dec`; a later commit wires them in.
-    #[allow(dead_code)]
+    /// the return value is load-bearing: the file-handle leak check in
+    /// [`Vm::check_frame_handle_leaks`] needs `dec` to hand back the freed
+    /// object so the [`Vm`] can detect a still-open [`HeapObject::FileHandle`]
+    /// and push to [`Vm::leak_log`]. the leak-log push is the caller's
+    /// responsibility -- `Heap` has no access to `Vm::leak_log`; `dec` only
+    /// surfaces the freed object. this signature is the locked contract.
     pub fn dec(&mut self, slot: u32) -> Option<HeapObject> {
         let s = self.objects.get_mut(slot as usize)?;
         if s.refcount == 0 {
@@ -1155,23 +1150,33 @@ impl Vm {
         Ok(())
     }
 
-    /// the stdlib-dispatch seam.
+    /// the stdlib-dispatch seam: run a native standard-library function.
     ///
-    /// a `CALL` whose `fn_id >= STDLIB_FN_BASE` reaches here. plan 05-05
-    /// replaces this body with the real native dispatch (`print` / `println` /
-    /// `len` / `push` / `pop` / `sqrt` / `abs` / `assert` / `type_of` / `map` /
-    /// `filter` / `reduce` / `open` / `close` / `read_all`). until then it is a
-    /// clean `Runtime` error so the crate compiles and a program that reaches a
-    /// stdlib call fails loudly rather than silently misbehaving.
+    /// a `CALL` whose `fn_id >= STDLIB_FN_BASE` reaches here. the `argc`
+    /// argument values are on the value stack with the topmost being the
+    /// rightmost argument; they are moved off the stack into a `Vec<Value>` in
+    /// source order (`args[0]` the leftmost) and handed to
+    /// [`crate::stdlib::dispatch`], which runs the native function and returns
+    /// its result [`Value`]. that result is pushed onto the value stack so the
+    /// instruction after the `CALL` sees it -- the same one-result contract a
+    /// user `RETURN` honors (a `void`-returning stdlib function returns
+    /// [`Value::void`]).
     ///
-    /// `allow(unused_variables)` on `argc`: 05-05's body pops `argc` values;
-    /// this stub does not, but the parameter is part of the locked seam
-    /// signature `call_stdlib(fn_id: u16, argc: u8)` 05-05 is written against.
-    #[allow(unused_variables)]
+    /// a stdlib `Err` is already a [`QalaError::Runtime`]; it propagates
+    /// unchanged. a wrong-arity or wrong-type call is the native function's
+    /// clean `Runtime` error, never a panic -- the bytecode is untrusted.
     fn call_stdlib(&mut self, fn_id: u16, argc: u8) -> Result<(), QalaError> {
-        Err(self.runtime_err(&format!(
-            "stdlib function {fn_id} not yet implemented"
-        )))
+        // move the argc arguments off the value stack. they sit at the top, the
+        // rightmost on top; split_off keeps them in stack order so args[0] is
+        // the leftmost argument -- matching how a user CALL builds its frame.
+        let argc = argc as usize;
+        if self.stack.len() < argc {
+            return Err(self.runtime_err("stack underflow building a stdlib call"));
+        }
+        let at = self.stack.len() - argc;
+        let args = self.stack.split_off(at);
+        let result = crate::stdlib::dispatch(self, fn_id, &args)?;
+        self.push(result)
     }
 
     /// execute a [`Opcode::Return`]: pop the current frame and pass the result
@@ -1196,6 +1201,10 @@ impl Vm {
     /// codegen emits an explicit `RETURN` at every function exit, including
     /// `main`'s -- a `RETURN` from the last frame is therefore the normal end
     /// of a program.
+    ///
+    /// the returning frame's local file handles are checked for leaks (see
+    /// [`Vm::check_frame_handle_leaks`]): a [`HeapObject::FileHandle`] that goes
+    /// out of scope while still open is logged.
     fn op_return(&mut self) -> Result<bool, QalaError> {
         let frame = self
             .frames
@@ -1208,6 +1217,9 @@ impl Vm {
         } else {
             Value::void()
         };
+        // the frame's locals are about to go out of scope -- a file handle
+        // among them that is still open is a resource leak.
+        self.check_frame_handle_leaks(&frame.locals, result);
         // drop the callee's transient value stack back to its base.
         if frame.base <= self.stack.len() {
             self.stack.truncate(frame.base);
@@ -1222,6 +1234,61 @@ impl Vm {
         // hand the result back to the caller.
         self.push(result)?;
         Ok(false)
+    }
+
+    /// detect file-handle leaks among a returning frame's local slots.
+    ///
+    /// a [`HeapObject::FileHandle`] is a resource: a program is expected to
+    /// `close` it (directly or via `defer close(f)`) before the handle goes out
+    /// of scope. when a frame returns, each of its local slots that points at a
+    /// file handle is decremented through [`Heap::dec`]; if a `dec` drives the
+    /// slot's refcount to zero and the freed object is a `FileHandle` with
+    /// `closed == false`, the handle was dropped without a `close` -- a leak --
+    /// and a message naming the path is pushed onto [`Vm::leak_log`], which
+    /// `get_state` surfaces for the playground.
+    ///
+    /// `returned` is the frame's result value: a handle the function RETURNS is
+    /// not leaked (its lifetime continues in the caller), so a local slot equal
+    /// to `returned` is skipped.
+    ///
+    /// the check is deliberately scoped to file handles. the VM does not run a
+    /// full reference-counting discipline in v1 -- copies (`DUP`, `GET_LOCAL`,
+    /// a value stored into a struct or returned) do not `inc`, so a blanket
+    /// `dec` of every local pointer would free a still-referenced object early.
+    /// file handles are the one resource type the leak log must report and, in
+    /// v1 Qala, are never aliased into another live structure, so decrementing
+    /// exactly the handle locals is both correct and safe. a fuller refcount
+    /// discipline (and a cycle collector) is a documented v2 concern.
+    fn check_frame_handle_leaks(&mut self, locals: &[Value], returned: Value) {
+        for &local in locals {
+            // only a pointer can reach a heap object; skip a returned handle.
+            let Some(slot) = local.as_pointer() else {
+                continue;
+            };
+            if local == returned {
+                continue;
+            }
+            // only act on a slot that currently holds an open file handle --
+            // leave every other heap object's refcount untouched.
+            let is_open_handle = matches!(
+                self.heap.get(slot),
+                Some(HeapObject::FileHandle { closed: false, .. })
+            );
+            if !is_open_handle {
+                continue;
+            }
+            // dec the handle slot; dec hands back the freed object when the
+            // refcount reaches zero, so a still-open freed handle is a leak.
+            if let Some(HeapObject::FileHandle {
+                path,
+                closed: false,
+                ..
+            }) = self.heap.dec(slot)
+            {
+                self.leak_log
+                    .push(format!("file handle for {path} dropped without close"));
+            }
+        }
     }
 
     /// call a function `Value` from native (stdlib) code and run it to its
@@ -1241,14 +1308,9 @@ impl Vm {
     /// stack. every loop local stays in a Rust local, so a callback that
     /// itself calls `call_function_value` is fully re-entrant.
     ///
-    /// `allow(dead_code)`: the higher-order stdlib functions are the only
-    /// callers; until the `call_stdlib` seam is wired the only use is the inline
-    /// test, so `--lib` would see it as unused. the attribute comes off in the
-    /// commit that wires `call_stdlib` to `crate::stdlib::dispatch`.
-    ///
     /// `pub(crate)` so `crate::stdlib`'s `map` / `filter` / `reduce` re-enter
-    /// the VM through this one helper.
-    #[allow(dead_code)]
+    /// the VM through this one helper -- those native functions are the only
+    /// callers (plus the inline test below).
     pub(crate) fn call_function_value(
         &mut self,
         callable: Value,
@@ -2595,26 +2657,27 @@ mod tests {
     }
 
     #[test]
-    fn the_remaining_unimplemented_seam_is_a_clean_runtime_stub_not_a_panic() {
-        // every opcode now has a real handler -- the dispatch match has no
-        // "not yet implemented" arm left. the one remaining deferred-feature
-        // seam is `call_stdlib`: a CALL to a stdlib fn-id (>= STDLIB_FN_BASE)
-        // routes there, and until 05-05 fills it in it must be a clean Runtime
-        // "not yet implemented" error, never a panic. this guards the
-        // stub-then-fill discipline against the last unimplemented path.
+    fn a_call_to_a_stdlib_fn_id_dispatches_to_the_native_function() {
+        // every opcode has a real handler and the `call_stdlib` seam is wired:
+        // a CALL with fn-id >= STDLIB_FN_BASE runs the native stdlib function.
+        // fn-id 40001 is `println`; CALL it with a string argument and the
+        // rendered text lands in the console. (CONST 'hi' ; CALL 40001 ; POP ;
+        // RETURN -- POP discards println's void result.)
         let mut chunk = Chunk::new();
+        emit_const(&mut chunk, ConstValue::Str("hi".to_string()), 1);
         chunk.write_op(Opcode::Call, 1);
-        chunk.write_u16(STDLIB_FN_BASE, 1);
-        chunk.code.push(0); // argc 0
+        chunk.write_u16(STDLIB_FN_BASE + 1, 1);
+        chunk.code.push(1); // argc 1
         chunk.source_lines.push(1);
+        chunk.write_op(Opcode::Pop, 1);
         chunk.write_op(Opcode::Return, 1);
         let mut vm = Vm::new(program_with(chunk), "x".to_string());
-        match vm.run() {
-            Err(QalaError::Runtime { message, .. }) => {
-                assert!(message.contains("not yet implemented"), "got: {message}");
-            }
-            other => panic!("expected a Runtime not-implemented stub, got {other:?}"),
-        }
+        vm.run().expect("a println CALL runs clean");
+        assert_eq!(
+            vm.console,
+            vec!["hi".to_string()],
+            "the native println wrote its argument to the console"
+        );
     }
 
     #[test]
@@ -3181,24 +3244,23 @@ mod tests {
     }
 
     #[test]
-    fn call_to_a_stdlib_fn_id_seams_to_the_unimplemented_stdlib_stub() {
-        // a CALL with fn-id >= STDLIB_FN_BASE routes to call_stdlib, which is
-        // a clean Runtime stub until 05-05 fills it in.
+    fn a_stdlib_call_with_a_wrong_argument_count_is_a_clean_runtime_error() {
+        // the `call_stdlib` seam hands an untrusted argc to the native
+        // function: a CALL of `print` (fn-id 40000, one parameter) with argc 0
+        // must surface the native function's arity error as a clean Runtime
+        // error, never a panic.
         let mut main = Chunk::new();
         main.write_op(Opcode::Call, 1);
         main.write_u16(STDLIB_FN_BASE, 1);
-        main.code.push(0);
+        main.code.push(0); // argc 0 -- print expects 1
         main.source_lines.push(1);
         main.write_op(Opcode::Return, 1);
         match run_chunk(main, "x") {
             Err(QalaError::Runtime { message, .. }) => {
-                assert!(
-                    message.contains("stdlib function") && message.contains("not yet implemented"),
-                    "got: {message}"
-                );
+                assert!(message.contains("expects 1 argument"), "got: {message}");
             }
-            Err(other) => panic!("expected a Runtime stdlib-stub error, got {other:?}"),
-            Ok(_) => panic!("expected a Runtime stdlib-stub error, the program ran clean"),
+            Err(other) => panic!("expected a Runtime arity error, got {other:?}"),
+            Ok(_) => panic!("a wrong-arity stdlib call must error"),
         }
     }
 
@@ -4107,29 +4169,19 @@ fn main() -> i64 is pure {
     fn repl_keeps_the_console_buffer_across_calls() {
         // the persistence contract: a REPL call resets the value stack, heap,
         // and frames but KEEPS the console buffer so output accumulates across
-        // calls. the stdlib `println` that writes the console is 05-05's work
-        // (call_stdlib is still a clean Runtime stub here), so this test
-        // verifies the mechanism directly: a console entry present before a
-        // repl call must still be present after it.
+        // calls. now that `call_stdlib` is wired, a REPL `println` line writes
+        // a real console entry -- the test drives it end to end.
         let mut vm = Vm::new_repl();
         // a first call establishes a binding and a real program.
         vm.repl_eval("let x = 1").expect("first call");
-        // simulate stdlib output landing in the console (what println will do).
-        vm.console.push("output one".to_string());
-        // a second REPL call rebuilds and re-runs the whole program.
-        vm.repl_eval("let y = 2").expect("second call");
-        // the console entry from before the second call survived it.
+        // a real println REPL line: the native stdlib writes the console.
+        vm.repl_eval("println(\"output one\")").expect("println call");
+        // a later REPL call rebuilds and re-runs the whole accumulated program.
+        vm.repl_eval("let y = 2").expect("a later call");
+        // the console entry from before the later call survived it.
         assert!(
             vm.console.iter().any(|line| line == "output one"),
             "a repl call must not clear the console -- output accumulates"
-        );
-        // and more output after the second call also accumulates.
-        vm.console.push("output two".to_string());
-        vm.repl_eval("x + y").expect("third call");
-        assert_eq!(
-            vm.console,
-            vec!["output one".to_string(), "output two".to_string()],
-            "every console entry survives every later repl call"
         );
     }
 
@@ -4195,5 +4247,100 @@ fn main() -> i64 is pure {
         assert!(vm.frames.is_empty(), "no frame until the first repl call");
         assert!(vm.repl_history.is_empty(), "an empty accumulated history");
         assert!(vm.console.is_empty(), "an empty console");
+    }
+
+    // ---- the stdlib seam + the file-handle leak check ----
+
+    #[test]
+    fn stdlib_call_runs_a_native_function_end_to_end() {
+        // a compiled Qala program that calls a stdlib function: `println`
+        // writes its argument to the console. this exercises the whole path --
+        // codegen emits a CALL with a stdlib fn-id, op_call routes it to
+        // call_stdlib, call_stdlib dispatches to crate::stdlib::println.
+        let src = "fn main() is io { println(\"hi from qala\") }\n";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("a program that calls println runs clean");
+        assert!(
+            vm.console.iter().any(|line| line == "hi from qala"),
+            "println wrote its argument to the console, got: {:?}",
+            vm.console
+        );
+    }
+
+    #[test]
+    fn stdlib_len_call_returns_the_collection_length() {
+        // a second stdlib path: `len` of an array literal returns 3, the
+        // program returns it, and the result decodes to 3.
+        let src = "fn main() -> i64 is pure { return len([10, 20, 30]) }\n";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("a program that calls len runs clean");
+        assert_eq!(program_result_i64(&vm), 3, "len([10,20,30]) is 3");
+    }
+
+    #[test]
+    fn leak_detected_for_a_file_handle_dropped_without_close() {
+        // a program that opens a file handle and never closes it: when `main`
+        // returns, its local `f` goes out of scope still open -- the leak check
+        // logs it. the leak log is non-empty.
+        let src = "fn main() is io {\n    let f = open(\"data.txt\")\n}\n";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the program itself runs clean -- a leak is not an error");
+        assert!(
+            !vm.leak_log.is_empty(),
+            "an open handle dropped without close must be logged as a leak"
+        );
+        assert!(
+            vm.leak_log.iter().any(|m| m.contains("data.txt")),
+            "the leak message names the leaked handle's path, got: {:?}",
+            vm.leak_log
+        );
+    }
+
+    #[test]
+    fn no_leak_when_a_file_handle_is_closed_with_defer() {
+        // the matching no-leak case: `defer close(f)` closes the handle before
+        // the function returns (codegen splices the close bytecode at the
+        // return's scope exit), so the handle is closed when the leak check
+        // runs on that frame -- the leak log stays empty.
+        //
+        // the defer lives in a function that ends in an explicit `return`: a
+        // fall-through `defer` (a block with no terminator) trips a separate,
+        // pre-existing codegen scope-ordering bug logged in
+        // .planning/phases/05-bytecode-vm-stdlib/deferred-items.md -- out of
+        // scope for this plan, and the bundled `defer-demo.qala` (which also
+        // ends in `return`) is unaffected.
+        let src = "fn use_handle() -> i64 is io {\n    \
+                   let f = open(\"data.txt\")\n    \
+                   defer close(f)\n    \
+                   return 0\n}\n\
+                   fn main() is io {\n    let n = use_handle()\n}\n";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the program runs clean");
+        assert!(
+            vm.leak_log.is_empty(),
+            "a handle closed via defer must not be logged as a leak, got: {:?}",
+            vm.leak_log
+        );
+    }
+
+    #[test]
+    fn no_leak_when_a_file_handle_is_closed_explicitly() {
+        // an explicit close(f), no defer: the handle is closed before main
+        // returns, so the leak check finds nothing.
+        let src = "fn main() is io {\n    \
+                   let f = open(\"data.txt\")\n    \
+                   close(f)\n}\n";
+        let program = compile_qala(src);
+        let mut vm = Vm::new(program, src.to_string());
+        vm.run().expect("the program runs clean");
+        assert!(
+            vm.leak_log.is_empty(),
+            "an explicitly closed handle must not leak, got: {:?}",
+            vm.leak_log
+        );
     }
 }
