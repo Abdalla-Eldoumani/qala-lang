@@ -455,8 +455,15 @@ impl<'a> Codegen<'a> {
 
     /// pop the topmost scope AND emit its deferred expressions, reversed
     /// (LIFO). used at a block's fall-through exit. each defer's bytecode is
-    /// followed by a POP when the defer's result type is not `void` -- a
-    /// defer is evaluated for effect, its value discarded.
+    /// followed by a POP: a defer is evaluated for effect, its result value
+    /// discarded.
+    ///
+    /// the POP is unconditional. a deferred expression is a function call
+    /// (`defer close(f)`), and the VM pushes a result value for every call --
+    /// a `void`-returning call pushes a `void` (the VM's uniform one-value-
+    /// per-expression convention). so a void defer leaves a `void` on the
+    /// stack that MUST be popped: otherwise it sits above the function's real
+    /// return value and the next `RETURN` returns the stray `void` instead.
     fn pop_scope_and_emit_defers(&mut self, line: u32) -> Result<(), QalaError> {
         let scope = match self.scopes.pop() {
             Some(s) => s,
@@ -464,9 +471,7 @@ impl<'a> Codegen<'a> {
         };
         for deferred in scope.deferred.iter().rev() {
             self.compile_expr(deferred)?;
-            if !matches!(deferred.ty(), QalaType::Void) {
-                self.chunk_mut().write_op(Opcode::Pop, line);
-            }
+            self.chunk_mut().write_op(Opcode::Pop, line);
         }
         Ok(())
     }
@@ -509,11 +514,11 @@ impl<'a> Codegen<'a> {
                 to_emit.push(deferred.clone());
             }
         }
+        // each defer's result is discarded with an unconditional POP -- see
+        // pop_scope_and_emit_defers for why a void defer also leaves a value.
         for deferred in &to_emit {
             self.compile_expr(deferred)?;
-            if !matches!(deferred.ty(), QalaType::Void) {
-                self.chunk_mut().write_op(Opcode::Pop, line);
-            }
+            self.chunk_mut().write_op(Opcode::Pop, line);
         }
         Ok(())
     }
@@ -1426,22 +1431,23 @@ impl<'a> Codegen<'a> {
                 });
             }
         };
-        // DUP the scrutinee so the Err/None branch still has it to RETURN.
-        self.chunk_mut().write_op(Opcode::Dup, line);
-        // MATCH_VARIANT(ok_id, miss-> err_branch): on a hit it consumes the
-        // dup and pushes the Ok/Some payload; on a miss it leaves the dup.
+        // MATCH_VARIANT(ok_id, miss-> err_branch) directly on the scrutinee --
+        // no DUP. `?` is a single Ok-or-Err test, not a multi-arm re-test, so
+        // one copy of the scrutinee suffices. on a HIT, MATCH_VARIANT consumes
+        // the scrutinee and pushes the Ok/Some payload, leaving exactly the
+        // unwrapped value on the stack. on a MISS it leaves the scrutinee
+        // untouched and branches -- and that scrutinee IS the Err/None value
+        // the err branch RETURNs.
         self.chunk_mut().write_op(Opcode::MatchVariant, line);
         self.chunk_mut().write_u16(ok_id, line);
         let miss_patch = self.chunk_mut().code.len();
         self.chunk_mut().write_i16(i16::MAX, line);
-        // on a hit, MATCH_VARIANT left the payload; the original scrutinee
-        // copy (the one DUP made) is still below it -- pop it so only the
-        // unwrapped payload remains.
-        self.chunk_mut().write_op(Opcode::Pop, line);
+        // hit: MATCH_VARIANT already left only the unwrapped payload -- there
+        // is nothing to pop. jump past the err branch.
         let skip_err = self.chunk_mut().emit_jump(Opcode::Jump, line);
-        // err branch: the MATCH_VARIANT missed and left the scrutinee dup on
-        // the stack. fire the defers up to the fn body, then RETURN -- the
-        // dup IS the Err/None value the function returns.
+        // err branch: the MATCH_VARIANT missed and left the scrutinee on the
+        // stack. fire the defers up to the fn body, then RETURN -- the
+        // scrutinee IS the Err/None value the function returns.
         self.chunk_mut().patch_jump(miss_patch)?;
         self.emit_defers_for_exit(ExitKind::QuestionProp, line)?;
         self.chunk_mut().write_op(Opcode::Return, line);
@@ -1471,15 +1477,19 @@ impl<'a> Codegen<'a> {
                 });
             }
         };
-        self.chunk_mut().write_op(Opcode::Dup, line);
+        // MATCH_VARIANT directly on the scrutinee -- no DUP, the same single-
+        // test reasoning as `?`. on a HIT it consumes the scrutinee and pushes
+        // the unwrapped success payload. on a MISS it leaves the scrutinee on
+        // the stack and branches.
         self.chunk_mut().write_op(Opcode::MatchVariant, line);
         self.chunk_mut().write_u16(ok_id, line);
         let miss_patch = self.chunk_mut().code.len();
         self.chunk_mut().write_i16(i16::MAX, line);
-        // hit: pop the scrutinee dup, leaving the unwrapped success payload.
-        self.chunk_mut().write_op(Opcode::Pop, line);
+        // hit: MATCH_VARIANT already left only the unwrapped payload. jump past
+        // the fallback.
         let skip_fallback = self.chunk_mut().emit_jump(Opcode::Jump, line);
-        // miss: pop the scrutinee dup, then evaluate the fallback.
+        // miss: the scrutinee MATCH_VARIANT left is the Err/None value, no
+        // longer needed -- POP it, then evaluate the fallback in its place.
         self.chunk_mut().patch_jump(miss_patch)?;
         self.chunk_mut().write_op(Opcode::Pop, line);
         self.compile_expr(fallback)?;
@@ -1867,6 +1877,12 @@ impl<'a> Codegen<'a> {
             // the `(name, slot)` bindings this arm's pattern introduces --
             // one for a bare binding, one per destructured variant field.
             let mut bindings: Vec<(String, u16)> = Vec::new();
+            // a guarded binding pattern on a non-last arm DUPs the scrutinee
+            // (so a guard miss still leaves it for the next arm) and the SET_
+            // LOCAL consumes the copy; the surviving original must then be
+            // POPped on the guard-success path, before the arm body. this flag
+            // tells the shared guard-emission code below to emit that POP.
+            let mut binding_keeps_scrutinee = false;
             match &arm.pattern {
                 Pattern::Wildcard { .. } => {
                     // `_` matches anything: consume the scrutinee, run body.
@@ -1890,8 +1906,17 @@ impl<'a> Codegen<'a> {
                         self.chunk_mut().write_i16(i16::MAX, line);
                         fail_jumps.push(patch);
                     } else {
-                        // a genuine binding: matches anything, binds the
-                        // scrutinee value.
+                        // a genuine binding: matches the pattern unconditionally,
+                        // binds the scrutinee value. a binding can still FAIL
+                        // its arm via a guard, so on a non-last guarded arm the
+                        // scrutinee must survive a guard miss: DUP it, and the
+                        // SET_LOCAL below consumes the copy. without a guard the
+                        // arm always matches (later arms are dead) -- no DUP,
+                        // SET_LOCAL consumes the scrutinee directly.
+                        if !is_last && arm.guard.is_some() {
+                            self.chunk_mut().write_op(Opcode::Dup, line);
+                            binding_keeps_scrutinee = true;
+                        }
                         let slot = self.next_slot();
                         self.bind_hidden_slot(slot);
                         self.chunk_mut().write_op(Opcode::SetLocal, line);
@@ -1975,6 +2000,14 @@ impl<'a> Codegen<'a> {
             if let Some(guard) = &arm.guard {
                 self.compile_expr(guard)?;
                 fail_jumps.push(self.chunk_mut().emit_jump(Opcode::JumpIfFalse, line));
+            }
+            // a guarded binding pattern on a non-last arm DUPed the scrutinee so
+            // a guard miss leaves it for the next arm. control reaches here only
+            // on a guard hit (the JUMP_IF_FALSE above jumped away on a miss), so
+            // POP the now-unneeded scrutinee before the arm body runs -- the
+            // body's value is the match result, with nothing stale beneath it.
+            if binding_keeps_scrutinee {
+                self.chunk_mut().write_op(Opcode::Pop, line);
             }
             self.compile_match_arm_body(&arm.body)?;
             self.pop_scope_and_emit_defers(line)?;
@@ -2914,8 +2947,9 @@ mod tests {
         cg.current_fn_id = 0;
         cg.push_scope();
         // a Void-typed Call -- the defer body. `pop_scope_and_emit_defers`
-        // compiles it (the arg CONST + the CALL) and pops the scope. a Void
-        // result needs no trailing POP.
+        // compiles it (the arg CONST + the CALL) and pops the scope. the call
+        // leaves a result value on the stack -- a `void` for a void call --
+        // which the defer discards with a trailing POP.
         let call = TypedExpr::Call {
             callee: Box::new(TypedExpr::Ident {
                 name: "println".to_string(),
@@ -2938,14 +2972,10 @@ mod tests {
         }
         cg.pop_scope_and_emit_defers(1).expect("emit defers");
         assert!(cg.scopes.is_empty(), "scope should be popped");
-        // the defer body emitted: CONST("a") then CALL(println). a Void
-        // result adds no POP.
+        // the defer body emitted: CONST("a"), CALL(println), then POP -- the
+        // call leaves a result value (a `void` here) that the defer discards.
         let ops = opcodes(&cg.program.chunks[0].code);
-        assert_eq!(ops, vec![Opcode::Const, Opcode::Call]);
-        assert!(
-            !ops.contains(&Opcode::Pop),
-            "a Void defer body needs no POP"
-        );
+        assert_eq!(ops, vec![Opcode::Const, Opcode::Call, Opcode::Pop]);
     }
 
     // Test 8: a fn with two params has them in slots 0 and 1.
@@ -3358,7 +3388,9 @@ mod tests {
         assert_eq!(consts.last(), Some(&ConstValue::Str("hello, world!".to_string())));
     }
 
-    // Test 7: `?` propagation emits DUP + MATCH_VARIANT + RETURN.
+    // Test 7: `?` propagation emits MATCH_VARIANT + RETURN. it does NOT DUP --
+    // `?` is a single Ok-or-Err test; MATCH_VARIANT consumes the scrutinee on a
+    // hit and leaves it on a miss, so one copy suffices.
     #[test]
     fn compile_expr_try_emits_match_variant_and_return() {
         let src = "fn get() -> Result<i64, str> is pure { return Ok(1) }\n\
@@ -3367,11 +3399,11 @@ mod tests {
         let f_id = p.fn_names.iter().position(|n| n == "f").unwrap();
         let ops = opcodes(&p.chunks[f_id].code);
         assert!(ops.contains(&Opcode::MatchVariant), "try should MATCH_VARIANT");
-        assert!(ops.contains(&Opcode::Dup), "try should DUP the scrutinee");
         assert!(ops.contains(&Opcode::Return), "try should RETURN on the err path");
     }
 
-    // Test 8: `or` fallback emits DUP + MATCH_VARIANT + the fallback.
+    // Test 8: `or` fallback emits MATCH_VARIANT + the fallback. like `?`, no
+    // DUP -- a single test, the scrutinee copy is consumed on a hit.
     #[test]
     fn compile_expr_or_else_emits_match_variant_and_fallback() {
         let src = "fn get() -> Result<i64, str> is pure { return Ok(1) }\n\
@@ -3379,7 +3411,6 @@ mod tests {
         let (code, _) = compile_expr_of(src, "f");
         let ops = opcodes(&code);
         assert!(ops.contains(&Opcode::MatchVariant));
-        assert!(ops.contains(&Opcode::Dup));
         // the fallback `0` is a CONST somewhere after the MATCH_VARIANT.
         assert!(ops.contains(&Opcode::Const));
     }
