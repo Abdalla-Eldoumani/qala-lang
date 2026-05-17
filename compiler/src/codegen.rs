@@ -4014,7 +4014,7 @@ mod tests {
         vm.run().expect("the program runs without error");
         assert_eq!(
             vm.console,
-            vec!["42"],
+            vec!["42\n"],
             "the defer ran and printed the block-local value"
         );
     }

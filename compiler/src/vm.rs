@@ -2714,7 +2714,7 @@ mod tests {
         vm.run().expect("a println CALL runs clean");
         assert_eq!(
             vm.console,
-            vec!["hi".to_string()],
+            vec!["hi\n".to_string()],
             "the native println wrote its argument to the console"
         );
     }
@@ -4269,7 +4269,7 @@ fn main() -> i64 is pure {
         vm.repl_eval("let y = 2").expect("a later call");
         // the console entry from before the later call survived it.
         assert!(
-            vm.console.iter().any(|line| line == "output one"),
+            vm.console.iter().any(|line| line.trim_end_matches('\n') == "output one"),
             "a repl call must not clear the console -- output accumulates"
         );
     }
@@ -4351,7 +4351,7 @@ fn main() -> i64 is pure {
         let mut vm = Vm::new(program, src.to_string());
         vm.run().expect("a program that calls println runs clean");
         assert!(
-            vm.console.iter().any(|line| line == "hi from qala"),
+            vm.console.iter().any(|line| line.trim_end_matches('\n') == "hi from qala"),
             "println wrote its argument to the console, got: {:?}",
             vm.console
         );
