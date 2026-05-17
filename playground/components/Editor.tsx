@@ -49,8 +49,10 @@ export default function QalaEditor({
   // the last compile result drives the diagnostic markers; null before
   // the first compile. lastState drives the current-line decoration;
   // null before the first step. dirty true means the source changed
-  // since the last successful compile -- markers and the decoration are
-  // both stale and get cleared. plan 08-05 wires these from useQala.
+  // since the last successful compile -- the current-line decoration is
+  // stale and gets cleared, but the diagnostic markers stay (a failed
+  // compile leaves the source dirty, so its errors must remain visible).
+  // plan 08-05 wires these from useQala.
   //
   // the three step-through props are optional: the phase 7 page renders
   // this editor with value/onChange only, and plan 08-05 adds the wiring.
@@ -85,11 +87,14 @@ export default function QalaEditor({
     monacoRef.current = monaco;
   }
 
-  // diagnostic markers. keyed on lastCompile and dirty: a dirty source has
-  // a stale compile, so its squiggles are wrong and get cleared; otherwise
-  // the diagnostics are mapped straight to monaco markers. both the
-  // MonacoDiagnostic positions and monaco markers are 1-based, so the
-  // line/column values pass through with no offset conversion.
+  // diagnostic markers. keyed on lastCompile only: the diagnostics of the
+  // last compile -- a failed compile's errors or a successful compile's
+  // warnings -- map straight to monaco markers and stay visible while the
+  // source is edited (monaco shifts the marker ranges to follow the edits)
+  // until the next compile refreshes them. clearing on dirty would hide a
+  // failed compile's errors, since a failed compile leaves the source
+  // dirty. both the MonacoDiagnostic positions and monaco markers are
+  // 1-based, so the line/column values pass through with no conversion.
   useEffect(() => {
     const editor = editorRef.current;
     const monaco = monacoRef.current;
@@ -99,7 +104,7 @@ export default function QalaEditor({
     const model = editor.getModel();
     if (!model) return;
 
-    if (dirty || !lastCompile) {
+    if (!lastCompile) {
       monaco.editor.setModelMarkers(model, MARKER_OWNER, []);
       return;
     }
@@ -120,7 +125,7 @@ export default function QalaEditor({
       }),
     );
     monaco.editor.setModelMarkers(model, MARKER_OWNER, markers);
-  }, [lastCompile, dirty]);
+  }, [lastCompile]);
 
   // the current-source-line highlight. keyed on lastState and dirty: a
   // dirty source invalidates the vm snapshot, so the highlight is cleared.
