@@ -376,21 +376,23 @@ pub struct Vm {
     /// the call-frame stack. capped at [`MAX_FRAMES`]; the topmost frame is
     /// the one currently executing.
     frames: Vec<CallFrame>,
-    /// the heap.
-    heap: Heap,
+    /// the heap. `pub(crate)` so `crate::stdlib` allocates result objects
+    /// (`push`, `pop`, `open`, `map`, ...) and reads argument objects through
+    /// it -- the native functions need the same heap the opcode handlers use.
+    pub(crate) heap: Heap,
     /// captured `print` / `println` output. the VM runs in WASM where stdout
     /// is invisible; the playground renders this buffer instead.
     ///
-    /// read by [`Vm::get_state`] for the snapshot; written by the stdlib
-    /// `print` / `println` functions a later plan (05-05) adds.
-    console: Vec<String>,
+    /// read by [`Vm::get_state`] for the snapshot; written by `crate::stdlib`'s
+    /// `print` / `println`. `pub(crate)` so those native functions append here.
+    pub(crate) console: Vec<String>,
     /// resource-leak log: a [`HeapObject::FileHandle`] freed while still open
     /// is recorded here, surfaced for the playground.
     ///
-    /// read by [`Vm::get_state`] for the snapshot; written by the
-    /// heap-decrement leak check a later plan (05-05) wires into the `RETURN`
-    /// and scope-exit paths.
-    leak_log: Vec<String>,
+    /// read by [`Vm::get_state`] for the snapshot; written by the heap-decrement
+    /// leak check the `call_stdlib` wiring adds. `pub(crate)` so that check (and
+    /// any future leak source) can append a leak message.
+    pub(crate) leak_log: Vec<String>,
     /// persistent global slots, indexed by `GET_GLOBAL` / `SET_GLOBAL`. kept
     /// across REPL calls.
     globals: Vec<Value>,
@@ -527,7 +529,11 @@ impl Vm {
     /// cannot be resolved (an empty frame stack, a missing chunk, an `ip` past
     /// the source map, a line number past the source) the span is a harmless
     /// zero-width span -- this never panics.
-    fn runtime_err(&self, message: &str) -> QalaError {
+    ///
+    /// `pub(crate)` so the native stdlib (`crate::stdlib`) raises a wrong-type
+    /// or wrong-arity argument as the same line-bearing `Runtime` error every
+    /// opcode handler uses.
+    pub(crate) fn runtime_err(&self, message: &str) -> QalaError {
         let span = self.error_span();
         QalaError::Runtime {
             span,
@@ -1235,11 +1241,15 @@ impl Vm {
     /// stack. every loop local stays in a Rust local, so a callback that
     /// itself calls `call_function_value` is fully re-entrant.
     ///
-    /// `allow(dead_code)`: the higher-order stdlib functions a later plan adds
-    /// are the only callers; the helper is part of the locked VM surface and
-    /// is declared now so 05-05 has the re-entry point ready.
+    /// `allow(dead_code)`: the higher-order stdlib functions are the only
+    /// callers; until the `call_stdlib` seam is wired the only use is the inline
+    /// test, so `--lib` would see it as unused. the attribute comes off in the
+    /// commit that wires `call_stdlib` to `crate::stdlib::dispatch`.
+    ///
+    /// `pub(crate)` so `crate::stdlib`'s `map` / `filter` / `reduce` re-enter
+    /// the VM through this one helper.
     #[allow(dead_code)]
-    fn call_function_value(
+    pub(crate) fn call_function_value(
         &mut self,
         callable: Value,
         args: &[Value],
@@ -1491,10 +1501,13 @@ impl Vm {
     ///   `Enum::Variant` with no payload) -- rendered recursively.
     /// - a file handle: a `<file "path">` placeholder; the VM does no real I/O.
     ///
-    /// reused by [`Vm::op_to_str`], [`Vm::op_concat_n`], and 05-05's
+    /// reused by [`Vm::op_to_str`], [`Vm::op_concat_n`], and the native stdlib's
     /// `print` / `println`. a dangling pointer (a freed slot) is rendered as
     /// `<dangling>` rather than erroring -- a display routine must never fail.
-    fn value_to_string(&self, v: Value) -> String {
+    ///
+    /// `pub(crate)` so `crate::stdlib`'s `print` / `println` render their
+    /// argument through the one display routine the rest of the VM uses.
+    pub(crate) fn value_to_string(&self, v: Value) -> String {
         // a tagged scalar: bool / byte / void / function decode directly.
         if let Some(b) = v.as_bool() {
             return if b { "true".to_string() } else { "false".to_string() };
@@ -1561,9 +1574,9 @@ impl Vm {
     ///
     /// the single source of truth for "what type is this value at runtime",
     /// reused by [`Vm::get_state`] (to type-tint each stack slot and variable)
-    /// AND by 05-05's `type_of` stdlib function -- both must agree, so the
-    /// logic lives here once. the names match the typechecker's canonical
-    /// lowercase spelling:
+    /// AND by `crate::stdlib`'s `type_of` function -- both must agree, so the
+    /// logic lives here once and `type_of` is `pub(crate)`-reachable. the names
+    /// match the typechecker's canonical lowercase spelling:
     /// - a primitive: `i64`, `f64`, `bool`, `byte`, `void`, `str`.
     /// - an array: `[T]` where `T` is the element type of the first element,
     ///   e.g. `[i64]`. an empty array has no element to inspect, so it renders
@@ -1576,7 +1589,7 @@ impl Vm {
     /// - a function value: `fn`.
     /// - a dangling pointer (a freed heap slot): `?` -- a type name must
     ///   always be produced; this never errors.
-    fn runtime_type_name(&self, v: Value) -> String {
+    pub(crate) fn runtime_type_name(&self, v: Value) -> String {
         // tagged scalars decode without touching the heap.
         if v.as_bool().is_some() {
             return "bool".to_string();
