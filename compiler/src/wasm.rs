@@ -99,6 +99,7 @@ fn empty_state() -> crate::vm::VmState {
     crate::vm::VmState {
         chunk_index: 0,
         ip: 0,
+        current_line: 0,
         stack: Vec::new(),
         variables: Vec::new(),
         console: Vec::new(),
