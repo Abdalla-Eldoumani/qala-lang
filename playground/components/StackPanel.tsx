@@ -204,6 +204,15 @@ export default function StackPanel({
   // (the documented derive-state-during-render pattern). react re-renders
   // synchronously before paint, so the leaving row is in the very commit
   // that drops the popped slot's live row.
+  //
+  // known limitation: the diff keys on stack depth and slot index, so an
+  // instruction that both pops and pushes (a binary op pops two operands
+  // and pushes one result, net depth -1) is seen only as a pop -- one
+  // leave animation plays and the pushed result, landing on a slot that
+  // already held an operand, updates in place with no push slide. the
+  // net height is right; the mixed instruction is just quieter than a
+  // bare push or bare pop. animating it would need value identity or a
+  // VM-provided per-slot id; index keys cannot express it.
   if (state !== prevState) {
     const prevStack = prevState?.stack ?? [];
     const nextStack = state?.stack ?? [];
