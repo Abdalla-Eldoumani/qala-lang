@@ -130,19 +130,6 @@ fn one_arg(vm: &Vm, args: &[Value], name: &str) -> Result<Value, QalaError> {
     }
 }
 
-/// decode `value` as an `i64`. an `i64` runtime value is a pointer to a
-/// [`HeapObject::Int`] (the uniform-heap-box rule). a non-pointer, or a pointer
-/// to a non-`Int`, is a `Runtime` "expected an integer".
-fn as_i64(vm: &Vm, value: Value, name: &str) -> Result<i64, QalaError> {
-    let slot = value
-        .as_pointer()
-        .ok_or_else(|| vm.runtime_err(&format!("{name}: expected an integer")))?;
-    match vm.heap.get(slot) {
-        Some(HeapObject::Int(n)) => Ok(*n),
-        _ => Err(vm.runtime_err(&format!("{name}: expected an integer"))),
-    }
-}
-
 /// allocate a [`HeapObject::Int`] for `n` and return a pointer to it. a heap
 /// exhaustion is a `Runtime` error.
 fn alloc_int(vm: &mut Vm, n: i64) -> Result<Value, QalaError> {
@@ -215,30 +202,28 @@ fn make_ok(vm: &mut Vm, payload: Value) -> Result<Value, QalaError> {
 
 // ---- the fifteen native functions ------------------------------------------
 
-/// `print(x)` -- render `x` and append it to the VM console without a line
-/// break.
+/// `print(x)` -- render `x` and append it to the VM console.
 ///
-/// the console is a `Vec<String>` the playground renders as a sequence of
-/// lines. `print` has no newline, so it appends its text to the LAST console
-/// entry when one exists, and starts a fresh entry only when the console is
-/// empty -- so `print("a"); print("b")` reads back as one line `ab`. `println`
-/// is what ends a line. returns `void`.
+/// the console is a `Vec<String>` -- one entry per call. `print` pushes its
+/// rendered text as its own entry. `print` is specified as the no-newline
+/// counterpart of `println`, but the v1 console buffer is a flat list of
+/// strings with no sub-line cursor, so a `print` entry is shown as its own
+/// console line; true mid-line concatenation (`print("a"); print("b")`
+/// rendering as one line `ab`) is a documented v1 limitation -- a console with
+/// a line cursor is a future enhancement. the bundled examples use only
+/// `println`. returns `void`.
 fn print(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let arg = one_arg(vm, args, "print")?;
     let text = vm.value_to_string(arg);
-    match vm.console.last_mut() {
-        Some(last) => last.push_str(&text),
-        None => vm.console.push(text),
-    }
+    vm.console.push(text);
     Ok(Value::void())
 }
 
-/// `println(x)` -- render `x` and append it to the VM console as a finished
-/// line.
+/// `println(x)` -- render `x` and append it to the VM console as a line.
 ///
 /// each `println` pushes one console entry. the playground renders one entry
-/// per line, so a program's `println` calls read back as the lines it printed.
-/// returns `void`.
+/// per line, so a program's `println` calls read back as exactly the lines it
+/// printed. returns `void`.
 fn println(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let arg = one_arg(vm, args, "println")?;
     let text = vm.value_to_string(arg);
@@ -271,17 +256,18 @@ fn abs(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     if let Some(x) = arg.as_f64() {
         return Ok(Value::from_f64(x.abs()));
     }
-    // otherwise the argument must be a heap Int.
-    if let Some(slot) = arg.as_pointer() {
-        if let Some(HeapObject::Int(n)) = vm.heap.get(slot) {
-            let n = *n;
-            let result = n
-                .checked_abs()
-                .ok_or_else(|| vm.runtime_err("abs: integer overflow"))?;
-            return alloc_int(vm, result);
-        }
-    }
-    Err(vm.runtime_err("abs: expected an integer or a float"))
+    // otherwise the argument must be a pointer to a heap Int.
+    let int = arg
+        .as_pointer()
+        .and_then(|slot| match vm.heap.get(slot) {
+            Some(HeapObject::Int(n)) => Some(*n),
+            _ => None,
+        })
+        .ok_or_else(|| vm.runtime_err("abs: expected an integer or a float"))?;
+    let result = int
+        .checked_abs()
+        .ok_or_else(|| vm.runtime_err("abs: integer overflow"))?;
+    alloc_int(vm, result)
 }
 
 /// `assert(condition: bool)` -- a `false` condition aborts the program.
@@ -761,15 +747,19 @@ mod tests {
         let line = string(&mut vm, "first line");
         println(&mut vm, &[line]).expect("println");
         assert_eq!(vm.console, vec!["first line".to_string()]);
-        // print with no newline appends to the last line.
+        // print pushes its own console entry (the v1 line-list convention).
         let a = string(&mut vm, "a");
         let b = string(&mut vm, "b");
         print(&mut vm, &[a]).expect("print a");
         print(&mut vm, &[b]).expect("print b");
         assert_eq!(
             vm.console,
-            vec!["first line".to_string(), "ab".to_string()],
-            "two prints land on one fresh line"
+            vec![
+                "first line".to_string(),
+                "a".to_string(),
+                "b".to_string(),
+            ],
+            "each print and println appends one console entry"
         );
     }
 
