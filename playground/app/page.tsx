@@ -38,7 +38,7 @@ function EditorHeader({
         <span className="font-[family-name:var(--font-display)] text-[28px] font-normal leading-[1.2] text-text-primary">
           Qala
         </span>
-        <span className="hidden text-[12px] font-medium leading-[1.4] text-text-secondary min-[640px]:inline">
+        <span className="hidden text-[12px] font-medium leading-[1.4] text-text-secondary min-[768px]:inline">
           a language that means what it says
         </span>
       </div>
