@@ -1,39 +1,48 @@
 "use client";
 
 // the playground shell: a thin orchestrator. it calls useQala once and
-// renders the responsive grid -- the editor, the four placeholder panels,
-// the editor header, and the run/step controls. it holds two pieces of
-// local UI state (the desktop bytecode-collapsed flag and the mobile
-// active tab); execution state lives in rust, owned by the hook.
+// renders the responsive grid -- the editor, the four real panels, the
+// editor header with the example loader, and the controls bar. it holds
+// two pieces of local UI state (the desktop bytecode-collapsed flag and
+// the mobile active tab); execution state lives in rust, owned by the
+// hook. the page passes the hook's one VmState snapshot to every panel,
+// so the panels update together on each step -- no panel calls the
+// bridge itself.
 //
 // the editor is imported through next/dynamic with ssr false: monaco
 // touches document/window and cannot server-render. that import plus the
 // "use client" directive in Editor.tsx are the two layers of protection.
 
 import dynamic from "next/dynamic";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useQala } from "@/lib/use-qala";
 import Controls from "@/components/Controls";
 import BytecodePanel from "@/components/BytecodePanel";
 import StackPanel from "@/components/StackPanel";
 import VariablesPanel from "@/components/VariablesPanel";
 import ConsolePanel from "@/components/ConsolePanel";
+import ExampleLoader from "@/components/ExampleLoader";
 
 const Editor = dynamic(() => import("@/components/Editor"), { ssr: false });
 
 type MobileTab = "stack" | "variables" | "console";
 
-// the editor header: the wordmark, the quiet subtitle, and the tablet
-// bytecode toggle. the ExampleLoader slot is left empty -- it is phase 8.
+// the editor header: the wordmark at the leading edge, then -- at the
+// trailing edge -- the example loader and the tablet bytecode toggle.
+// the example loader sits before the toggle in source order.
 function EditorHeader({
   bytecodeShown,
   onToggleBytecode,
+  loadedExample,
+  onLoadExample,
 }: {
   bytecodeShown: boolean;
   onToggleBytecode: () => void;
+  loadedExample: string | null;
+  onLoadExample: (file: string) => void;
 }) {
   return (
-    <header className="flex items-baseline justify-between border-b border-border bg-surface p-[var(--space-4)]">
+    <header className="flex items-center justify-between border-b border-border bg-surface p-[var(--space-4)]">
       <div className="flex items-baseline gap-[var(--space-3)]">
         <span className="font-[family-name:var(--font-display)] text-[28px] font-normal leading-[1.2] text-text-primary">
           Qala
@@ -42,19 +51,28 @@ function EditorHeader({
           a language that means what it says
         </span>
       </div>
-      {/* the tablet bytecode toggle: visible only at the tablet width */}
-      <button
-        type="button"
-        onClick={onToggleBytecode}
-        aria-pressed={bytecodeShown}
-        className={`hidden rounded-[var(--radius-button)] border px-[var(--space-3)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent min-[768px]:block min-[1200px]:hidden ${
-          bytecodeShown
-            ? "border-accent text-accent"
-            : "border-border text-text-secondary hover:border-text-secondary"
-        }`}
-      >
-        Bytecode
-      </button>
+      <div className="flex items-center gap-[var(--space-3)]">
+        {/* the example loader: present at every breakpoint. it loads a
+            bundled example into the editor; the hook marks the load
+            dirty, so the panels then show needs-compile. */}
+        <ExampleLoader
+          loadedExample={loadedExample}
+          loadExample={onLoadExample}
+        />
+        {/* the tablet bytecode toggle: visible only at the tablet width */}
+        <button
+          type="button"
+          onClick={onToggleBytecode}
+          aria-pressed={bytecodeShown}
+          className={`hidden rounded-[var(--radius-button)] border px-[var(--space-3)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent min-[768px]:block min-[1200px]:hidden ${
+            bytecodeShown
+              ? "border-accent text-accent"
+              : "border-border text-text-secondary hover:border-text-secondary"
+          }`}
+        >
+          Bytecode
+        </button>
+      </div>
     </header>
   );
 }
@@ -131,7 +149,29 @@ function MobileTabs({
 }
 
 export default function Page() {
-  const { status, source, setSource, run, step } = useQala();
+  // one useQala call drives the whole page. the snapshots (lastCompile,
+  // lastState, lastRun) and the run-loop methods are passed into the
+  // editor and the panels; the hook owns the WASM session and the loop.
+  const {
+    status,
+    source,
+    setSource,
+    compile,
+    step,
+    reset,
+    running,
+    play,
+    pause,
+    speed,
+    setSpeed,
+    dirty,
+    replEval,
+    loadedExample,
+    loadExample,
+    lastCompile,
+    lastRun,
+    lastState,
+  } = useQala();
 
   // local UI state -- not execution state. the bytecode panel collapse
   // (desktop) and the visible mobile tab live here, in the page.
@@ -139,15 +179,60 @@ export default function Page() {
   const [bytecodeShown, setBytecodeShown] = useState(false);
   const [mobileTab, setMobileTab] = useState<MobileTab>("stack");
 
+  // a program is compiled when the last compile succeeded and produced a
+  // disassembly. this one derived signal drives the console mode (program
+  // vs repl) and the Controls disabled matrix. it stays true after an
+  // edit -- the separate dirty flag is the stale signal -- so the panels
+  // and the controls reflect "a program exists, but it is stale".
+  const programCompiled = Boolean(lastCompile?.ok && lastCompile.disassembly);
+
+  // the Run handler. when the source is dirty, Run compiles first, then
+  // starts the animated loop -- the compile-then-run affordance. this is
+  // wiring, not business logic: it only sequences two hook calls so the
+  // page stays a thin orchestrator. compile is synchronous (it calls the
+  // bridge and updates the snapshot in the same tick), so play() runs the
+  // freshly compiled program.
+  const handleRun = useCallback(() => {
+    if (dirty) compile();
+    play();
+  }, [dirty, compile, play]);
+
   // the editor region: the loading / error surface, or the editor itself.
+  // the editor reads the compile snapshot for its diagnostic underlines,
+  // the VM-state snapshot for the current-line highlight, and dirty for
+  // the needs-compile rule.
   const editorRegion =
     status === "loading" ? (
       <LoadingSurface />
     ) : status === "error" ? (
       <ErrorSurface />
     ) : (
-      <Editor value={source} onChange={setSource} />
+      <Editor
+        value={source}
+        onChange={setSource}
+        lastCompile={lastCompile}
+        lastState={lastState}
+        dirty={dirty}
+      />
     );
+
+  // the controls bar -- rendered in two places (in the editor column from
+  // tablet up, pinned to the viewport bottom on mobile). both copies wire
+  // the same hook methods, so this builds the element once.
+  const controlsBar = (
+    <Controls
+      status={status}
+      running={running}
+      dirty={dirty}
+      programCompiled={programCompiled}
+      speed={speed}
+      setSpeed={setSpeed}
+      onRun={handleRun}
+      onStep={step}
+      onPause={pause}
+      onReset={reset}
+    />
+  );
 
   // the desktop grid columns. when the bytecode panel is collapsed its
   // track shrinks to auto (the slim re-expand rail) and the editor and
@@ -175,11 +260,11 @@ export default function Page() {
           <EditorHeader
             bytecodeShown={bytecodeShown}
             onToggleBytecode={() => setBytecodeShown((v) => !v)}
+            loadedExample={loadedExample}
+            onLoadExample={loadExample}
           />
           <div className="min-h-0 flex-1 overflow-hidden">{editorRegion}</div>
-          <div className="hidden min-[768px]:block">
-            <Controls status={status} onRun={run} onStep={step} />
-          </div>
+          <div className="hidden min-[768px]:block">{controlsBar}</div>
         </section>
 
         {/* the bytecode panel: desktop column (collapsible), hidden on
@@ -209,27 +294,60 @@ export default function Page() {
             >
               collapse
             </button>
-            <BytecodePanel className="min-h-0 flex-1" />
+            <BytecodePanel
+              className="min-h-0 flex-1"
+              compile={lastCompile}
+              state={lastState}
+              dirty={dirty}
+            />
           </div>
         )}
 
         {/* the state panels: Variables, Stack, Console stacked on
             desktop/tablet; tabbed on mobile */}
         <aside className="hidden min-h-0 min-[768px]:flex min-[768px]:flex-col min-[768px]:gap-[var(--space-2)]">
-          <VariablesPanel className="min-h-0 flex-1" />
-          <StackPanel className="min-h-0 flex-1" />
-          <ConsolePanel className="min-h-0 flex-1" />
+          <VariablesPanel
+            className="min-h-0 flex-1"
+            state={lastState}
+            dirty={dirty}
+          />
+          <StackPanel
+            className="min-h-0 flex-1"
+            state={lastState}
+            dirty={dirty}
+          />
+          <ConsolePanel
+            className="min-h-0 flex-1"
+            state={lastState}
+            lastRun={lastRun}
+            programCompiled={programCompiled}
+            replEval={replEval}
+          />
         </aside>
 
         {/* mobile: the same three panels behind a tab switcher */}
         <section className="flex min-h-0 flex-col overflow-hidden rounded-[var(--radius-panel)] border border-border bg-surface min-[768px]:hidden">
           <MobileTabs active={mobileTab} onSelect={setMobileTab} />
           <div className="min-h-0 flex-1 overflow-auto">
-            {mobileTab === "stack" && <StackPanel className="border-0" />}
-            {mobileTab === "variables" && (
-              <VariablesPanel className="border-0" />
+            {mobileTab === "stack" && (
+              <StackPanel className="border-0" state={lastState} dirty={dirty} />
             )}
-            {mobileTab === "console" && <ConsolePanel className="border-0" />}
+            {mobileTab === "variables" && (
+              <VariablesPanel
+                className="border-0"
+                state={lastState}
+                dirty={dirty}
+              />
+            )}
+            {mobileTab === "console" && (
+              <ConsolePanel
+                className="border-0"
+                state={lastState}
+                lastRun={lastRun}
+                programCompiled={programCompiled}
+                replEval={replEval}
+              />
+            )}
           </div>
         </section>
       </main>
@@ -238,9 +356,7 @@ export default function Page() {
           viewport. it is the last flex child of the h-dvh column, so the
           dynamic viewport unit reflows it above the keyboard rather than
           hiding it. from tablet up the bar lives inside the editor column. */}
-      <div className="min-[768px]:hidden">
-        <Controls status={status} onRun={run} onStep={step} />
-      </div>
+      <div className="min-[768px]:hidden">{controlsBar}</div>
     </div>
   );
 }
