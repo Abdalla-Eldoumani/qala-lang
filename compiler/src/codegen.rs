@@ -456,15 +456,30 @@ impl<'a> Codegen<'a> {
     /// per-expression convention). so a void defer leaves a `void` on the
     /// stack that MUST be popped: otherwise it sits above the function's real
     /// return value and the next `RETURN` returns the stray `void` instead.
+    ///
+    /// IMPORTANT: the deferred expressions are collected (cloned) BEFORE the
+    /// scope is popped, so that any locals declared in this scope are still
+    /// visible to `compile_expr`. only after all defers are emitted is the
+    /// scope removed. `emit_defers_for_exit` (the control-flow exit path)
+    /// never pops a scope and therefore never had this ordering issue; this
+    /// function previously popped first, which broke `defer close(f)` on a
+    /// fall-through exit when `f` was declared in the same block.
     fn pop_scope_and_emit_defers(&mut self, line: u32) -> Result<(), QalaError> {
-        let scope = match self.scopes.pop() {
-            Some(s) => s,
+        // collect the deferred list while the scope is still visible to name
+        // resolution. cloned out so the immutable borrow of `self.scopes`
+        // ends before `compile_expr` takes a mutable borrow of `self`.
+        let deferred: Vec<TypedExpr> = match self.scopes.last() {
+            Some(s) => s.deferred.iter().rev().cloned().collect(),
             None => return Ok(()),
         };
-        for deferred in scope.deferred.iter().rev() {
-            self.compile_expr(deferred)?;
+        // emit each deferred expression -- the scope's locals are still on
+        // the scope stack and resolve normally.
+        for expr in &deferred {
+            self.compile_expr(expr)?;
             self.chunk_mut().write_op(Opcode::Pop, line);
         }
+        // pop the scope only after all defers have been compiled.
+        self.scopes.pop();
         Ok(())
     }
 
@@ -3973,6 +3988,38 @@ mod tests {
 
     // Test 13: a defer plus a `break` -- the defer fires on the break path
     // AND on the per-iteration fall-through (cleanup emitted for both).
+    #[test]
+    fn stmt_defer_resolves_block_local_on_fall_through() {
+        // regression: a defer whose body references a local declared in the
+        // same block used to fail codegen with "unresolved name" when the
+        // block fell through (no explicit return). the bug was that
+        // pop_scope_and_emit_defers popped the scope BEFORE compiling the
+        // deferred expressions, making block-local names invisible. the fix
+        // collects the deferred list first, then pops.
+        //
+        // this source is the minimal repro from deferred-items.md -- it must
+        // compile AND run correctly: the defer call executes and its side
+        // effect (a println) appears in the console.
+        // capture wraps println with a str conversion via interpolation so the
+        // typechecker accepts the i64 argument.
+        let src = "fn capture(n: i64) is io { println(\"{n}\") }\n\
+                   fn main() is io {\n\
+                     let v = 42\n\
+                     defer capture(v)\n\
+                   }";
+        // compile -- previously this would error with "unresolved name: v".
+        let p = compile_ok(src);
+        // run -- the deferred capture(v) must execute and print "42".
+        let mut vm = crate::vm::Vm::new(p, src.to_string());
+        vm.run().expect("the program runs without error");
+        assert_eq!(
+            vm.console,
+            vec!["42"],
+            "the defer ran and printed the block-local value"
+        );
+    }
+
+    // Test 14a: defer with break fires on both paths.
     #[test]
     fn stmt_defer_with_break_fires_on_both_paths() {
         let src = "fn cleanup() is io { }\n\
