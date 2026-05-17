@@ -118,6 +118,13 @@ impl std::fmt::Display for ConstValue {
 #[allow(dead_code)]
 const QNAN: u64 = 0x7FF8_0000_0000_0000;
 
+/// kind tag for a function value. the low data field carries the `u16`
+/// function id directly -- a function is NOT a heap object, it is a tagged
+/// scalar like a `bool` or a `byte`. this tag sits one step below `TAG_BOOL`
+/// and one step above `QNAN`, so it is still a quiet-NaN pattern the FPU
+/// never emits, and `is_tagged` covers it.
+const TAG_FN: u64 = 0x7FFB_0000_0000_0000;
+
 /// kind tag for a [`bool`] value. the low data field carries `0` or `1`.
 const TAG_BOOL: u64 = 0x7FFC_0000_0000_0000;
 
@@ -132,7 +139,7 @@ const TAG_VOID: u64 = 0x7FFE_0000_0000_0000;
 const TAG_PTR: u64 = 0x7FFF_0000_0000_0000;
 
 /// masks off the top 16 bits -- the kind-select field. a tagged value's top
-/// 16 bits land in `0x7FFC..=0x7FFF`; a real `f64` (including a computed NaN,
+/// 16 bits land in `0x7FFB..=0x7FFF`; a real `f64` (including a computed NaN,
 /// whose top bits are `0x7FF8`) does not.
 const KIND_MASK: u64 = 0xFFFF_0000_0000_0000;
 
@@ -187,16 +194,26 @@ impl Value {
         Value(TAG_PTR | slot as u64)
     }
 
+    /// box a function value. `id` is the function's index into
+    /// `Program.chunks` (a CALL operand). a function value is a tagged scalar,
+    /// NOT a heap object: the `u16` id rides directly in the data field. the
+    /// VM's CONST handler builds one of these for a `ConstValue::Function`,
+    /// and the higher-order stdlib functions (`map` / `filter` / `reduce`)
+    /// recover the id via [`Value::as_function`].
+    pub fn function(id: u16) -> Value {
+        Value(TAG_FN | id as u64)
+    }
+
     /// the raw 64-bit pattern. exposed for the VM's `get_state` rendering and
     /// for tests that need to inspect the encoding directly.
     pub fn bits(self) -> u64 {
         self.0
     }
 
-    /// `true` when this value is a tagged box (a `bool`, `byte`, `void`, or
-    /// pointer), `false` when it is a real `f64`.
+    /// `true` when this value is a tagged box (a function, `bool`, `byte`,
+    /// `void`, or pointer), `false` when it is a real `f64`.
     ///
-    /// the test masks the top 16 bits and range-checks `0x7FFC..=0x7FFF`. a
+    /// the test masks the top 16 bits and range-checks `0x7FFB..=0x7FFF`. a
     /// genuine computed `NaN` has top bits `0x7FF8` and is therefore NOT
     /// tagged -- it correctly reads back as an `f64`. never use
     /// [`f64::is_nan`] for this test: a real NaN and a boxed value share the
@@ -204,7 +221,7 @@ impl Value {
     /// them.
     pub fn is_tagged(self) -> bool {
         let top = self.0 & KIND_MASK;
-        (TAG_BOOL..=TAG_PTR).contains(&top)
+        (TAG_FN..=TAG_PTR).contains(&top)
     }
 
     /// decode this value as an `f64`. returns `Some` for any value that is
@@ -253,6 +270,17 @@ impl Value {
     pub fn as_pointer(self) -> Option<u32> {
         if self.0 & KIND_MASK == TAG_PTR {
             Some((self.0 & 0xFFFF_FFFF) as u32)
+        } else {
+            None
+        }
+    }
+
+    /// decode this value as a function id. returns `None` when the value is
+    /// not a boxed function. the data field is masked to 16 bits so the
+    /// result is exactly the `u16` id [`Value::function`] stored.
+    pub fn as_function(self) -> Option<u16> {
+        if self.0 & KIND_MASK == TAG_FN {
+            Some((self.0 & 0xFFFF) as u16)
         } else {
             None
         }
@@ -440,6 +468,7 @@ mod tests {
         assert_eq!(v.as_byte(), None);
         assert!(!v.as_void());
         assert_eq!(v.as_pointer(), None);
+        assert_eq!(v.as_function(), None);
     }
 
     #[test]
@@ -529,6 +558,8 @@ mod tests {
             assert!(!f.is_tagged(), "float {:#018x} read as tagged", f.bits());
         }
         let boxes = [
+            Value::function(0),
+            Value::function(u16::MAX),
             Value::bool(true),
             Value::bool(false),
             Value::byte(0),
@@ -543,11 +574,11 @@ mod tests {
     }
 
     #[test]
-    fn the_four_tag_prefixes_are_distinct_and_none_equals_the_bare_qnan() {
-        // a computed NaN never decodes as a tagged value: the four reserved
+    fn the_five_tag_prefixes_are_distinct_and_none_equals_the_bare_qnan() {
+        // a computed NaN never decodes as a tagged value: the five reserved
         // tag prefixes are pairwise distinct and all sit strictly above the
         // canonical-NaN prefix QNAN (0x7FF8).
-        let tags = [TAG_BOOL, TAG_BYTE, TAG_VOID, TAG_PTR];
+        let tags = [TAG_FN, TAG_BOOL, TAG_BYTE, TAG_VOID, TAG_PTR];
         for (i, a) in tags.iter().enumerate() {
             for b in &tags[i + 1..] {
                 assert_ne!(a, b, "two tag prefixes collide");
@@ -555,9 +586,43 @@ mod tests {
             assert!(*a > QNAN, "tag prefix {a:#018x} not above QNAN");
             // the canonical NaN's top 16 bits are below the tagged range.
             assert!(
-                (QNAN & KIND_MASK) < TAG_BOOL,
+                (QNAN & KIND_MASK) < TAG_FN,
                 "QNAN prefix is inside the tagged range"
             );
         }
+    }
+
+    #[test]
+    fn function_round_trips_low_high_and_mid_ids() {
+        // a function value is a tagged scalar carrying the u16 fn-id directly;
+        // no heap object. every id round-trips through function/as_function.
+        for id in [0u16, 1, 0x1234, u16::MAX] {
+            let v = Value::function(id);
+            assert!(v.is_tagged(), "a function must be tagged");
+            assert_eq!(
+                v.as_function(),
+                Some(id),
+                "function round-trip failed for id {id}"
+            );
+            // a function is no other kind.
+            assert_eq!(v.as_bool(), None);
+            assert_eq!(v.as_byte(), None);
+            assert_eq!(v.as_f64(), None);
+            assert_eq!(v.as_pointer(), None);
+            assert!(!v.as_void());
+        }
+    }
+
+    #[test]
+    fn a_function_is_not_a_pointer_and_a_pointer_is_not_a_function() {
+        // the two tags must not alias: a heap pointer at slot 5 and a function
+        // with id 5 are distinct values that decode to distinct kinds.
+        let ptr = Value::pointer(5);
+        let func = Value::function(5);
+        assert_ne!(ptr.bits(), func.bits(), "pointer and function tags alias");
+        assert_eq!(ptr.as_pointer(), Some(5));
+        assert_eq!(ptr.as_function(), None);
+        assert_eq!(func.as_function(), Some(5));
+        assert_eq!(func.as_pointer(), None);
     }
 }
