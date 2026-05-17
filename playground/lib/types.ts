@@ -5,10 +5,13 @@
 //   compiler/src/vm.rs          VmState/StateValue/NamedValue
 //   compiler/src/diagnostics.rs MonacoDiagnostic
 //
-// a rust Option<T> serializes as the value or json null, so disassembly,
-// error, value, and category are union-with-null types, not optional `?`
-// properties -- they are always present on the object, their value is null
-// when the rust side was None.
+// a rust Option<T> serializes through serde-wasm-bindgen's default
+// Serializer as the value or `undefined`. serialize_missing_as_null is
+// false in 0.6.5, so a rust None becomes JsValue::UNDEFINED, not NULL.
+// disassembly, error, value, and category are therefore optional `?`
+// properties: the key is absent (value undefined) when the rust side was
+// None. note `undefined === null` is false -- test these with `=== undefined`
+// or a truthiness check, never `=== null`.
 
 // diagnostics.rs MonacoDiagnostic: severity 0 = warning, 1 = error.
 export interface MonacoDiagnostic {
@@ -18,7 +21,7 @@ export interface MonacoDiagnostic {
   end_column: number; // 1-based end column (exclusive)
   severity: number; // 0 = warning, 1 = error
   message: string;
-  category: string | null; // snake_case warning category; null for errors
+  category?: string; // snake_case warning category; absent for errors
 }
 
 // vm.rs StateValue: a rendered value plus its runtime type name.
@@ -46,7 +49,7 @@ export interface VmState {
 // wasm.rs CompileResult.
 export interface CompileResult {
   ok: boolean; // true on a clean compile (warnings ok)
-  disassembly: string | null; // a string on success, null on error
+  disassembly?: string; // a string on success, absent on error
   diagnostics: MonacoDiagnostic[]; // warnings on success, errors on failure
 }
 
@@ -54,21 +57,21 @@ export interface CompileResult {
 export interface RunResult {
   ok: boolean; // true when the program ran to Halt
   state: VmState; // final or fault-point snapshot
-  error: MonacoDiagnostic | null; // a diagnostic on a runtime fault
+  error?: MonacoDiagnostic; // a diagnostic on a runtime fault, else absent
 }
 
 // wasm.rs StepResult. status is a plain string, not a tagged enum.
 export interface StepResult {
   status: "ran" | "halted" | "error";
   state: VmState;
-  error: MonacoDiagnostic | null;
+  error?: MonacoDiagnostic; // a diagnostic on a runtime fault, else absent
 }
 
 // wasm.rs ReplResult -- declared now for phase 8's console; not used
 // by phase 7's useQala surface.
 export interface ReplResult {
   ok: boolean;
-  value: StateValue | null;
+  value?: StateValue; // the evaluated value; absent when there is none
   console: string[];
-  error: MonacoDiagnostic | null;
+  error?: MonacoDiagnostic; // a diagnostic on a runtime fault, else absent
 }
