@@ -42,6 +42,10 @@ const RUN_SPEED_MS: Record<RunSpeed, number> = {
   fast: 80,
 };
 
+// the localStorage key the editor source is persisted under. text only --
+// never vm state (PGUI-09).
+const STORAGE_KEY = "qala.editor.source";
+
 export interface UseQala {
   status: QalaStatus;
   source: string;
@@ -69,6 +73,10 @@ export interface UseQala {
   // null when the session is not ready. the hook keeps no transcript --
   // that is the ConsolePanel's own state.
   replEval: (line: string) => ReplResult | null;
+  // the currently loaded example name, or null when the editor holds the
+  // user's own text. session state -- not derived by content-matching.
+  loadedExample: string | null;
+  loadExample: (file: string) => void;
   // last bridge snapshots -- read-only views, never mirrored vm state
   lastCompile: CompileResult | null;
   lastRun: RunResult | StepResult | null;
@@ -87,6 +95,7 @@ export function useQala(): UseQala {
   const [lastState, setLastState] = useState<VmState | null>(null);
   const [version, setVersion] = useState(0);
   const [dirty, setDirty] = useState(false);
+  const [loadedExample, setLoadedExample] = useState<string | null>(null);
 
   // the run loop. the timer id lives in a ref so it survives re-renders.
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -202,17 +211,78 @@ export function useQala(): UseQala {
     speedRef.current = RUN_SPEED_MS[next];
   }, []);
 
-  // set the editor source. a user edit: marks the program dirty and stops
-  // the run loop SYNCHRONOUSLY -- in this same call, not a later effect, so
-  // no further tick steps the now-invalid program.
+  // set the editor source. a user edit: marks the program dirty, clears the
+  // loaded-example name (the text is no longer that example), and stops the
+  // run loop SYNCHRONOUSLY -- in this same call, not a later effect, so no
+  // further tick steps the now-invalid program.
   const setSource = useCallback(
     (next: string) => {
       setSourceState(next);
       setDirty(true);
+      setLoadedExample(null);
       clearLoop();
     },
     [clearLoop],
   );
+
+  // load a bundled example into the editor. fetches the .qala file, sets
+  // the source (which marks dirty, stops the loop, and clears
+  // loadedExample), then sets loadedExample AFTER -- so the example name is
+  // set last and survives setSource's clear.
+  const loadExample = useCallback(
+    (file: string) => {
+      fetch(`/examples/${file}.qala`)
+        .then((res) => res.text())
+        .then((text) => {
+          setSource(text);
+          setLoadedExample(file);
+        })
+        .catch(() => {
+          // a failed fetch leaves the editor as it was -- nothing to surface.
+        });
+    },
+    [setSource],
+  );
+
+  // read the editor source from localStorage on mount. a client-only
+  // effect -- localStorage is browser-only, so reading it during render
+  // would cause a hydration mismatch. setSourceState here bypasses the
+  // dirty/loaded-example side effects of setSource (a restore is not an
+  // edit).
+  //
+  // both branches apply the source asynchronously -- the restore through a
+  // microtask, the first-visit fetch through its promise -- so no setState
+  // runs synchronously inside the effect body.
+  useEffect(() => {
+    const saved = window.localStorage.getItem(STORAGE_KEY);
+    if (saved !== null) {
+      // a return visit -- the key is present. restore the text verbatim,
+      // even if it is "" (a user who cleared the editor and reloaded gets
+      // their empty editor back, not fibonacci).
+      queueMicrotask(() => {
+        setSourceState(saved);
+      });
+    } else {
+      // first visit -- the key is ABSENT (not ""). preload the fibonacci
+      // example so the editor is never empty on a fresh visit. the write
+      // effect below then persists it, so the next visit is a return visit.
+      fetch("/examples/fibonacci.qala")
+        .then((res) => res.text())
+        .then((text) => {
+          setSourceState(text);
+          setLoadedExample("fibonacci");
+        })
+        .catch(() => {
+          // the fetch failed -- leave the editor empty, no surface needed.
+        });
+    }
+  }, []);
+
+  // persist the editor source to localStorage whenever it changes. an
+  // immediate write per change -- the writes are small text writes.
+  useEffect(() => {
+    window.localStorage.setItem(STORAGE_KEY, source);
+  }, [source]);
 
   const compile = useCallback(() => {
     const s = sessionRef.current;
@@ -282,6 +352,8 @@ export function useQala(): UseQala {
     setSpeed,
     dirty,
     replEval,
+    loadedExample,
+    loadExample,
     lastCompile,
     lastRun,
     lastState,
