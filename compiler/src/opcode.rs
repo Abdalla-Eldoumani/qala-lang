@@ -146,10 +146,13 @@ pub enum Opcode {
     /// pop `u16` values off the stack (top is the last element), push a heap
     /// tuple containing them in stack order.
     MakeTuple = 37,
-    /// pop `u16` values off the stack (top is the last field's value), push a
-    /// heap struct. the field order is locked by the struct declaration;
-    /// codegen emits the values in declaration order so the VM pairs them
-    /// without a per-field name index.
+    /// build a heap struct. the `u16` operand is a struct id -- an index into
+    /// `Program.structs`, NOT a bare field count. the VM reads the field
+    /// count from `Program.structs[id].field_count`, pops that many values
+    /// off the stack (top is the last field's value), and labels the struct
+    /// with `Program.structs[id].name`. the field order is locked by the
+    /// struct declaration; codegen emits the values in declaration order so
+    /// the VM pairs them without a per-field name index.
     MakeStruct = 38,
     /// construct an enum variant value: variant id `u16`, then `u8` payload
     /// values already on the stack (top is the rightmost payload field). the
