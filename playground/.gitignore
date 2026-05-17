@@ -6,8 +6,9 @@ node_modules
 out
 build
 
-# generated typescript shim
+# generated typescript shim and incremental build cache
 next-env.d.ts
+tsconfig.tsbuildinfo
 
 # wasm artifact copied from the gitignored lib/wasm/ by copy-wasm.mjs
 public/wasm
