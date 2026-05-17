@@ -12,13 +12,21 @@
 //
 // the hard part is the pop. react unmounts an element the instant it
 // leaves the array, which kills a leave animation before it can play.
-// the fix: a "leaving" set holds each popped value one extra render with
-// the stack-pop class; onAnimationEnd unmounts it. a timeout fallback
-// covers a non-firing animationend (a backgrounded tab) -- the fallback
-// timers are tracked in a ref and cleared on every diff and on unmount
-// so they cannot leak.
+// the fix: a "leaving" set holds each popped value with the stack-pop
+// class until onAnimationEnd unmounts it. the leaving set is derived
+// DURING RENDER -- when the state reference changes, the diff against
+// the previous snapshot runs in the render body and updates the leaving
+// state in the same pass (the documented derive-state-during-render
+// pattern, guarded by a state-identity check so it cannot loop). this
+// is what makes the leaving row mount in the same commit the live row
+// unmounts; a post-commit effect would mount it one render late and the
+// slide-down would play after the value already vanished. a timeout
+// fallback covers a non-firing animationend (a backgrounded tab) -- the
+// fallback timers are armed in an effect (a side effect, not a render
+// step), tracked in a ref, and cleared on supersede and on unmount so
+// they cannot leak.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { StateValue, VmState } from "@/lib/types";
 
 // the panel renders at most the top 20 entries; a deeper stack puts only
@@ -144,108 +152,117 @@ export default function StackPanel({
   // rendered alongside the live stack until their animation ends.
   const [leaving, setLeaving] = useState<LeavingEntry[]>([]);
 
-  // the previous stack, kept in a ref so storing it does not itself
-  // trigger a render. the diff effect reads it, computes the difference,
-  // then writes the new stack here as the next "previous".
-  const prevStackRef = useRef<StateValue[]>([]);
+  // the state snapshot the leaving set was last derived against. this is
+  // the anchor for the derive-during-render diff: a render where `state`
+  // differs from this is a new step, and the diff runs in the render
+  // body. it is state (not a ref) so the guarded update-during-render
+  // settles consistently across react's render passes, and prevState's
+  // stack IS the previous stack -- no separate previous-stack store.
+  const [prevState, setPrevState] = useState<VmState | null>(null);
 
   // the fallback timeout ids for the leaving entries, keyed by leave id.
-  // tracked so they can be cleared on every diff and on unmount -- a
+  // tracked so they can be cleared when superseded and on unmount -- a
   // leaked animation-fallback timer is the exact failure this panel is
   // built to avoid.
   const fallbackTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
 
-  // a monotonic counter for unique leave ids. a ref, not state -- it must
-  // not trigger a render when it advances.
-  const leaveSeqRef = useRef(0);
-
-  // clear and forget every pending fallback timer. called before each
-  // diff (the timers belong to the prior diff's leaving entries) and on
-  // unmount.
-  function clearFallbackTimers() {
-    for (const timer of fallbackTimersRef.current.values()) {
-      clearTimeout(timer);
-    }
-    fallbackTimersRef.current.clear();
-  }
+  // a monotonic counter for unique leave ids. state, not a ref: the
+  // render-phase diff reads it to build the ids, and the react-hooks
+  // rules forbid reading a ref during render -- so it is state, bumped
+  // in the same guarded update-during-render block as the diff. it gives
+  // each step's leaving entries a fresh key so the stack-pop keyframe
+  // replays even when the same slot is popped on two consecutive steps.
+  const [leaveSeq, setLeaveSeq] = useState(0);
 
   // remove a leaving entry once its animation has ended (or its fallback
-  // fired) and drop its fallback timer.
-  function finishLeave(id: string) {
+  // fired) and drop its fallback timer. stable so the timer-arming effect
+  // can depend on it without re-running every render.
+  const finishLeave = useCallback((id: string) => {
     setLeaving((current) => current.filter((entry) => entry.id !== id));
     const timer = fallbackTimersRef.current.get(id);
     if (timer !== undefined) {
       clearTimeout(timer);
       fallbackTimersRef.current.delete(id);
     }
-  }
+  }, []);
 
-  // the diff. it runs after each new state: it compares the previous
-  // stack to the new one and drives the leave animations. a longer stack
-  // is a push -- the push slide is free, the LiveEntry mounts with the
-  // entering class. a shorter stack is a pop -- the popped values move
-  // into the leaving set. an instant clear (a Reset, a null state) drops
-  // the leaving set with no animation.
+  // the diff, computed DURING RENDER. when `state` is a new reference --
+  // the hook hands a fresh VmState per step -- this compares the previous
+  // snapshot's stack to the new one and updates the leaving set in the
+  // same render pass. a shorter stack means the top (prev - next) slots
+  // were popped: each popped value becomes a leaving entry with a fresh
+  // id, walked low-to-high so the array is bottom-first like the live
+  // entries (the column-reverse body then renders the highest popped
+  // slot highest). a push, an in-place update, a Reset, or a null state
+  // produces no leaving entries, so the set is emptied -- a Reset is an
+  // instant clear, not a sequence of pops.
   //
-  // the diff is computed synchronously here -- including the synchronous
-  // clearFallbackTimers and prevStackRef write, so a fast re-entrant
-  // step always sees a correct previous -- but the resulting setLeaving
-  // is deferred to a microtask. the react compiler forbids a synchronous
-  // setState inside an effect body (it can cascade renders); a
-  // queueMicrotask runs the update right after this commit, which is the
-  // same visible result without the cascade.
-  useEffect(() => {
-    const prevStack = prevStackRef.current;
+  // the setState calls run during render but are GUARDED by the
+  // state-identity check, so they run once per new step and cannot loop
+  // (the documented derive-state-during-render pattern). react re-renders
+  // synchronously before paint, so the leaving row is in the very commit
+  // that drops the popped slot's live row.
+  if (state !== prevState) {
+    const prevStack = prevState?.stack ?? [];
     const nextStack = state?.stack ?? [];
-
-    // the prior diff's fallback timers belong to entries that are about
-    // to be superseded; clear them so they cannot fire late.
-    clearFallbackTimers();
-
-    // a Reset or an error surfaces as a null or empty state. clear the
-    // leaving set with no slide-down -- a Reset is an instant clear, not
-    // a sequence of pops. a shorter stack means the top (prev - next)
-    // slots were popped: each popped value becomes a leaving entry with
-    // a fresh id, walked low-to-high so the array is bottom-first like
-    // the live entries (the column-reverse body then renders the highest
-    // popped slot highest). a push or an in-place update has no leave
-    // animation, so the leaving set is simply emptied.
     const popped: LeavingEntry[] = [];
     if (nextStack.length > 0 && nextStack.length < prevStack.length) {
       for (let slot = nextStack.length; slot < prevStack.length; slot++) {
-        leaveSeqRef.current += 1;
+        // the id pairs this step's sequence number with the slot: the
+        // slot is unique among one step's pops, the sequence number
+        // separates this step from the next, so a slot popped on two
+        // consecutive steps gets two distinct keys and two animations.
         popped.push({
-          id: `leave-${leaveSeqRef.current}`,
+          id: `leave-${leaveSeq}-${slot}`,
           value: prevStack[slot],
           slot,
         });
       }
     }
+    setPrevState(state);
+    setLeaving(popped);
+    // advance the sequence only when this step actually popped, so the
+    // counter tracks pops, not every step.
+    if (popped.length > 0) setLeaveSeq((seq) => seq + 1);
+  }
 
-    // apply the state change after this commit, then arm the fallback
-    // timers for exactly the entries that were committed as leaving.
-    queueMicrotask(() => {
-      setLeaving(popped);
-      for (const entry of popped) {
-        const timer = setTimeout(
-          () => finishLeave(entry.id),
-          LEAVE_FALLBACK_MS,
-        );
-        fallbackTimersRef.current.set(entry.id, timer);
+  // arm the fallback timers for the current leaving set. this is a side
+  // effect -- arming a setTimeout, not a setState -- so it belongs in an
+  // effect, not the render body. it diffs the live leaving ids against
+  // the timer map: it clears a timer whose entry has left (superseded or
+  // already finished) and arms one for any leaving entry that lacks one,
+  // so an entry mid-animation keeps its original fallback clock.
+  useEffect(() => {
+    const timers = fallbackTimersRef.current;
+    const liveIds = new Set(leaving.map((entry) => entry.id));
+    for (const [id, timer] of timers) {
+      if (!liveIds.has(id)) {
+        clearTimeout(timer);
+        timers.delete(id);
       }
-    });
-
-    prevStackRef.current = nextStack;
-    // the effect keys on the state identity: the hook hands a fresh
-    // VmState object per step, so a new step is a new reference.
-  }, [state]);
+    }
+    for (const entry of leaving) {
+      if (!timers.has(entry.id)) {
+        timers.set(
+          entry.id,
+          setTimeout(() => finishLeave(entry.id), LEAVE_FALLBACK_MS),
+        );
+      }
+    }
+  }, [leaving, finishLeave]);
 
   // clear the fallback timers on unmount so a navigated-away panel
   // leaves nothing running.
   useEffect(() => {
-    return () => clearFallbackTimers();
+    const timers = fallbackTimersRef.current;
+    return () => {
+      for (const timer of timers.values()) {
+        clearTimeout(timer);
+      }
+      timers.clear();
+    };
   }, []);
 
   // the panel frame, kept distinct from the body so the chrome (frame,
