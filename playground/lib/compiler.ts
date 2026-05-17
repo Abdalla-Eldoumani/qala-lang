@@ -36,6 +36,11 @@ export interface QalaSession {
   getState(): VmState;
   disassemble(): string;
   reset(): void;
+  // drop the rust-side allocation. the wasm-pack glue also registers each
+  // Qala in a FinalizationRegistry, so this is not required for correctness,
+  // but a caller that abandons a session (an unmount mid-load) should free
+  // it eagerly rather than wait for GC.
+  free(): void;
 }
 
 export async function loadQala(): Promise<QalaSession> {
@@ -67,6 +72,9 @@ export async function loadQala(): Promise<QalaSession> {
     disassemble: () => inner.disassemble() as string,
     reset: () => {
       inner.reset();
+    },
+    free: () => {
+      inner.free();
     },
   };
 }
