@@ -12,7 +12,7 @@
 // the animation cleanly even mid-flash (a fast run loop). a row whose
 // value did not change keeps its key, does not remount, and stays quiet.
 
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import type { NamedValue, VmState } from "@/lib/types";
 
 // one variable row: the name, a colon separator, the rendered value, and
@@ -54,31 +54,36 @@ export default function VariablesPanel({
   // the per-variable change counter, name -> count. a row's key is
   // `${name}:${count}`; incrementing a count remounts that row and
   // restarts its flash. this is state because the render reads it to
-  // build the keys -- the effect bumps it and the re-render flashes the
-  // changed rows.
+  // build the keys; the render-phase diff bumps it and the re-render
+  // flashes the changed rows.
   const [flashCounts, setFlashCounts] = useState<Map<string, number>>(
     new Map(),
   );
 
-  // the previous frame's variables, kept in a ref so storing it does not
-  // itself trigger a render. the diff effect reads it, finds the changed
-  // and newly-in-scope names, then writes the new variables here as the
-  // next "previous".
-  const prevVarsRef = useRef<NamedValue[]>([]);
+  // the state snapshot the flash set was last derived against. the
+  // anchor for the derive-during-render diff: a render where `state`
+  // differs from this is a new step. it is state (not a ref) so the
+  // guarded update-during-render settles consistently across react's
+  // render passes, and prevState's variables ARE the previous variables.
+  const [prevState, setPrevState] = useState<VmState | null>(null);
 
-  // the diff. on each new state it compares the previous variables to
-  // the new ones: a name whose rendered value differs flashes; a name
-  // not in the previous set is newly in scope and also flashes; a name
-  // that left scope just unmounts. a frame change (the whole set swaps
-  // on a call or return) is therefore not a sea of flashes -- only a
-  // genuine value change or a newly-in-scope name bumps a counter.
+  // the diff, computed DURING RENDER. when `state` is a new reference --
+  // the hook hands a fresh VmState per step -- this compares the previous
+  // snapshot's variables to the new ones: a name whose rendered value
+  // differs flashes; a name not in the previous set is newly in scope
+  // and also flashes; a name that left scope just unmounts. a frame
+  // change (the whole set swaps on a call or return) is therefore not a
+  // sea of flashes -- only a genuine value change or a newly-in-scope
+  // name bumps a counter. computing this in render rather than a
+  // post-commit effect is what makes the changed row mount with its new
+  // key in the same commit its value updates, so the flash starts on the
+  // exact render the value changes.
   //
-  // the counter bump is a setState; the react compiler forbids a
-  // synchronous setState inside an effect body, so it is deferred to a
-  // microtask -- the same visible result, one commit later, without the
-  // cascading-render the rule guards against.
-  useEffect(() => {
-    const prevVars = prevVarsRef.current;
+  // the setState calls run during render but are GUARDED by the
+  // state-identity check, so they run once per new step and cannot loop
+  // (the documented derive-state-during-render pattern).
+  if (state !== prevState) {
+    const prevVars = prevState?.variables ?? [];
     const nextVars = state?.variables ?? [];
 
     // the previous rendered value for each name, for the change test.
@@ -97,13 +102,11 @@ export default function VariablesPanel({
       }
     }
 
-    prevVarsRef.current = nextVars;
-
-    // nothing changed -- skip the setState entirely so a step that
-    // touched no variable does not churn a render.
-    if (flashing.length === 0) return;
-
-    queueMicrotask(() => {
+    setPrevState(state);
+    // bump a counter only for the changed names, and only when something
+    // changed -- a step that touched no variable leaves flashCounts as
+    // its own reference, so react bails out of that part of the update.
+    if (flashing.length > 0) {
       setFlashCounts((current) => {
         const next = new Map(current);
         for (const name of flashing) {
@@ -111,10 +114,8 @@ export default function VariablesPanel({
         }
         return next;
       });
-    });
-    // the effect keys on the state identity: the hook hands a fresh
-    // VmState object per step, so a new step is a new reference.
-  }, [state]);
+    }
+  }
 
   // the panel frame, kept distinct from the body so the chrome (frame,
   // header, bottom rule) renders identically in every state.
