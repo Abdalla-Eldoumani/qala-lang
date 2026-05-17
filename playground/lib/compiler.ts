@@ -8,7 +8,13 @@
 // the casts in loadQala's returned methods are the single controlled any
 // boundary the root CLAUDE.md sanctions: the generated qala_compiler.d.ts
 // types every Qala method return as any, so the wrapper narrows them once.
-import type { CompileResult, RunResult, StepResult, VmState } from "./types";
+import type {
+  CompileResult,
+  ReplResult,
+  RunResult,
+  StepResult,
+  VmState,
+} from "./types";
 
 // the wasm-pack glue's default export: the async init function.
 // the generated qala_compiler.d.ts types it loosely; we narrow here.
@@ -35,6 +41,10 @@ export interface QalaSession {
   step(): StepResult;
   getState(): VmState;
   disassemble(): string;
+  // evaluate one Qala expression line through the rust repl vm. state
+  // persists across calls on the same session. a malformed line comes
+  // back as an ok-false ReplResult, never a throw.
+  replEval(source: string): ReplResult;
   reset(): void;
   // drop the rust-side allocation. the wasm-pack glue also registers each
   // Qala in a FinalizationRegistry, so this is not required for correctness,
@@ -70,6 +80,7 @@ export async function loadQala(): Promise<QalaSession> {
     step: () => inner.step() as StepResult,
     getState: () => inner.get_state() as VmState,
     disassemble: () => inner.disassemble() as string,
+    replEval: (source) => inner.repl_eval(source) as ReplResult,
     reset: () => {
       inner.reset();
     },
