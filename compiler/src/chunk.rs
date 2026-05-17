@@ -31,7 +31,7 @@
 use crate::errors::QalaError;
 use crate::opcode::Opcode;
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::ConstValue;
 use std::fmt::Write as _;
 
 /// a compiled function (or top-level chunk): instruction bytes + a parallel
@@ -48,8 +48,9 @@ pub struct Chunk {
     /// the per-function constant pool, indexed by u16 from CONST / FIELD /
     /// MAKE_ENUM_VARIANT operands. append-only -- a rewound CONST leaves a
     /// dangling entry, harmless because disassemble walks instructions, not
-    /// pool entries.
-    pub constants: Vec<Value>,
+    /// pool entries. holds [`ConstValue`] entries; the VM converts each to a
+    /// runtime [`crate::value::Value`] when it executes the CONST.
+    pub constants: Vec<ConstValue>,
     /// the 1-based source line of the byte at the same index in `code`.
     /// multi-byte instructions duplicate the line across operand bytes so
     /// `source_lines[i]` is valid for any `i in 0..code.len()`.
@@ -137,7 +138,7 @@ impl Chunk {
     /// constants per chunk is more than realistic; debug builds assert
     /// the cap, production builds keep the cast for v1. widening to u32
     /// is a v2 concern.
-    pub fn add_constant(&mut self, v: Value) -> u16 {
+    pub fn add_constant(&mut self, v: ConstValue) -> u16 {
         let idx = self.constants.len();
         debug_assert!(
             idx <= u16::MAX as usize,
@@ -480,7 +481,7 @@ mod tests {
 
     /// build a chunk that emits a single CONST instruction for `v` on
     /// line 1. the constant lives at pool index 0.
-    fn chunk_with_const(v: Value) -> Chunk {
+    fn chunk_with_const(v: ConstValue) -> Chunk {
         let mut c = Chunk::new();
         let idx = c.add_constant(v);
         c.write_op(Opcode::Const, 1);
@@ -545,11 +546,11 @@ mod tests {
     #[test]
     fn add_constant_returns_sequential_indices_without_dedupe() {
         let mut c = Chunk::new();
-        assert_eq!(c.add_constant(Value::I64(1)), 0);
-        assert_eq!(c.add_constant(Value::I64(2)), 1);
-        assert_eq!(c.add_constant(Value::Str("x".to_string())), 2);
+        assert_eq!(c.add_constant(ConstValue::I64(1)), 0);
+        assert_eq!(c.add_constant(ConstValue::I64(2)), 1);
+        assert_eq!(c.add_constant(ConstValue::Str("x".to_string())), 2);
         // NO dedupe: the same value pushed twice gets a new index.
-        assert_eq!(c.add_constant(Value::I64(1)), 3);
+        assert_eq!(c.add_constant(ConstValue::I64(1)), 3);
         assert_eq!(c.constants.len(), 4);
     }
 
@@ -740,7 +741,7 @@ mod tests {
     // format.
     #[test]
     fn disassemble_of_one_const_instruction_matches_the_locked_format() {
-        let c = chunk_with_const(Value::I64(42));
+        let c = chunk_with_const(ConstValue::I64(42));
         let p = program_with_chunk(c.clone());
         let out = c.disassemble(&p);
         // locked format: byte-offset right-aligned 4, opcode name padded 9,
@@ -760,7 +761,7 @@ mod tests {
 
         let mut c = Chunk::new();
         // CONST (u16 idx)
-        let const_idx = c.add_constant(Value::I64(7));
+        let const_idx = c.add_constant(ConstValue::I64(7));
         c.write_op(Opcode::Const, 1);
         c.write_u16(const_idx, 1);
         // GET_LOCAL 0
@@ -827,9 +828,9 @@ mod tests {
         p.fn_names.push("helper".to_string());
 
         let mut c = Chunk::new();
-        let i0 = c.add_constant(Value::I64(1));
-        let i1 = c.add_constant(Value::Str("hi".to_string()));
-        let i2 = c.add_constant(Value::F64(2.5));
+        let i0 = c.add_constant(ConstValue::I64(1));
+        let i1 = c.add_constant(ConstValue::Str("hi".to_string()));
+        let i2 = c.add_constant(ConstValue::F64(2.5));
 
         c.write_op(Opcode::Const, 1);
         c.write_u16(i0, 1);
@@ -881,7 +882,7 @@ mod tests {
         c.write_u16(0, 4);
         c.write_i16(0, 4);
 
-        let _ = c.add_constant(Value::I64(0));
+        let _ = c.add_constant(ConstValue::I64(0));
         p.chunks.push(c.clone());
 
         let out = c.disassemble(&p);
@@ -898,14 +899,14 @@ mod tests {
         p.fn_names.push("helper".to_string());
 
         let mut a = Chunk::new();
-        let idx_a = a.add_constant(Value::I64(0));
+        let idx_a = a.add_constant(ConstValue::I64(0));
         a.write_op(Opcode::Const, 1);
         a.write_u16(idx_a, 1);
         a.write_op(Opcode::Pop, 1);
         a.write_op(Opcode::Return, 1);
 
         let mut b = Chunk::new();
-        let idx_b = b.add_constant(Value::I64(1));
+        let idx_b = b.add_constant(ConstValue::I64(1));
         b.write_op(Opcode::Const, 1);
         b.write_u16(idx_b, 1);
         b.write_op(Opcode::Pop, 1);
@@ -940,7 +941,7 @@ mod tests {
         p.fn_names.push("main".to_string());
 
         let mut a = Chunk::new();
-        let idx = a.add_constant(Value::I64(0));
+        let idx = a.add_constant(ConstValue::I64(0));
         a.write_op(Opcode::Const, 1);
         a.write_u16(idx, 1);
         a.write_op(Opcode::Pop, 1);
@@ -962,9 +963,9 @@ mod tests {
         p.fn_names.push("main".to_string());
         p.fn_names.push("helper".to_string());
 
-        let mut a = chunk_with_const(Value::I64(0));
+        let mut a = chunk_with_const(ConstValue::I64(0));
         a.write_op(Opcode::Return, 1);
-        let mut b = chunk_with_const(Value::I64(1));
+        let mut b = chunk_with_const(ConstValue::I64(1));
         b.write_op(Opcode::Return, 1);
 
         p.chunks.push(a);
