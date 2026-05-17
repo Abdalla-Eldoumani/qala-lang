@@ -188,8 +188,16 @@ impl Heap {
                 s.refcount = 1;
                 return Some(slot);
             }
-            // unreachable in practice -- a free-list index is always valid.
-            // fall through to the append path rather than panic.
+            // the free-list index does not exist in the slab -- this violates the
+            // invariant that only valid, previously-freed indices are pushed onto
+            // the free list. do not silently drop the slot: push it back so the
+            // slab stays consistent, then fall through to the append path.
+            debug_assert!(
+                false,
+                "heap free-list contained out-of-range index {slot}; slab len={}",
+                self.objects.len()
+            );
+            self.free.push(slot);
         }
         if self.objects.len() >= MAX_HEAP {
             return None;
