@@ -232,9 +232,17 @@ impl Heap {
     /// increment the refcount of the object at `slot`. a bad or freed slot is
     /// a silent no-op -- the VM never crashes on a stray inc.
     ///
-    /// `allow(dead_code)`: part of the locked `Heap` refcount API. the opcode
-    /// handlers that copy a heap value (`DUP` of a pointer, `GET_LOCAL`,
-    /// struct/array construction) call `inc`; a later commit wires them in.
+    /// **v1 aliasing invariant**: v1 does NOT alias heap values. every heap
+    /// object has exactly one logical owner; values are moved (or copied as
+    /// tagged scalars) rather than duplicated with shared ownership. as a
+    /// consequence, `inc` is currently unused -- the opcode handlers that
+    /// could in principle produce a second reference to the same slot
+    /// (`DUP` of a pointer, `GET_LOCAL`, `GET_GLOBAL`, `MAKE_ARRAY`,
+    /// `MAKE_TUPLE`, `MAKE_STRUCT`, `MAKE_ENUM_VARIANT`) do not call `inc`
+    /// today. before any v2 work allows genuine aliasing, every one of those
+    /// sites must be audited and wired to `inc` first, or use-after-free
+    /// becomes possible. the `#[allow(dead_code)]` keeps this function present
+    /// as the documented extension point without triggering a compiler warning.
     #[allow(dead_code)]
     pub fn inc(&mut self, slot: u32) {
         if let Some(s) = self.objects.get_mut(slot as usize).filter(|s| s.refcount > 0) {
