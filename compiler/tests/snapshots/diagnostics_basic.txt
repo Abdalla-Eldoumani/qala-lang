@@ -21,6 +21,7 @@ error: pure function `f` calls io function `println`
 1  |   fn f() is pure { println("hi") }
    |                    ^^^^^^^^^^^^^
    |
+   = note: pure functions cannot call functions with io effects
    = hint: remove the `is pure` annotation, or refactor to remove the io call
 
 ===
