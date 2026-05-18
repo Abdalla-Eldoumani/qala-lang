@@ -96,7 +96,7 @@ error: pure function `compute` calls io function `println`
   --> main.qala:7:5
    |
 7  |     println("debug")
-   |     ^^^^^^^ this function has io effects
+   |     ^^^^^^^
    |
    = note: pure functions cannot call functions with io effects
    = hint: remove the `is pure` annotation, or refactor to remove the io call
