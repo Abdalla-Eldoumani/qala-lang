@@ -983,7 +983,7 @@ mod tests {
     /// read a bundled example from `playground/public/examples/`.
     fn example_source(name: &str) -> String {
         let path = format!(
-            "{}/../playground/public/examples/{name}.qala",
+            "{}/../../playground/public/examples/{name}.qala",
             env!("CARGO_MANIFEST_DIR"),
         );
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))

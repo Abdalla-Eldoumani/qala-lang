@@ -4659,7 +4659,7 @@ fn f(v: Fruit) -> i64 is pure {
         // playground must lex, parse, AND typecheck with zero errors.
         for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
             let path = format!(
-                "{}/../playground/public/examples/{}.qala",
+                "{}/../../playground/public/examples/{}.qala",
                 env!("CARGO_MANIFEST_DIR"),
                 name
             );

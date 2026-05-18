@@ -783,7 +783,7 @@ mod tests {
             "defer-demo",
         ] {
             let path = format!(
-                "{}/../playground/public/examples/{name}.qala",
+                "{}/../../playground/public/examples/{name}.qala",
                 env!("CARGO_MANIFEST_DIR"),
             );
             let src = std::fs::read_to_string(&path)

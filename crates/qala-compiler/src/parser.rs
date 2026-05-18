@@ -3714,7 +3714,7 @@ mod tests {
             "defer-demo",
         ] {
             let path = format!(
-                "{}/../playground/public/examples/{}.qala",
+                "{}/../../playground/public/examples/{}.qala",
                 env!("CARGO_MANIFEST_DIR"),
                 name
             );
