@@ -9,18 +9,16 @@ fn area(s: Shape) -> f64 is pure {
         Circle(r) => 3.14159 * r * r,
         Rect(w, h) => w * h,
         Triangle(a, b, c) => {
-            let s = (a + b + c) / 2.0
-            sqrt(s * (s - a) * (s - b) * (s - c))
+            let half = (a + b + c) / 2.0
+            sqrt(half * (half - a) * (half - b) * (half - c))
         }
     }
 }
 
 fn classify(value: i64) -> str is pure {
-    match value {
-        v if v > 0 => "positive",
-        v if v < 0 => "negative",
-        _ => "zero",
-    }
+    if value > 0 { return "positive" }
+    if value < 0 { return "negative" }
+    return "zero"
 }
 
 fn main() is io {
