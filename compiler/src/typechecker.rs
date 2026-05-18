@@ -3681,6 +3681,10 @@ mod tests {
             .filter(|w| w.category == "redundant_annotation")
             .collect();
         assert_eq!(red.len(), 1, "{warnings:?}");
+        assert!(
+            red[0].message.contains("redundant type annotation"),
+            "{red:?}"
+        );
     }
 
     #[test]
@@ -4338,6 +4342,7 @@ mod tests {
             .filter(|w| w.category == "unreachable_code")
             .collect();
         assert_eq!(w.len(), 1, "{warnings:?}");
+        assert!(w[0].message.contains("unreachable statement"), "{w:?}");
     }
 
     #[test]
