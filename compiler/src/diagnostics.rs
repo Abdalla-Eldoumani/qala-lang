@@ -227,6 +227,9 @@ impl From<QalaError> for Diagnostic {
         // listed together.
         match &err {
             QalaError::EffectViolation { caller_effect, callee_effect, .. } => {
+                notes.push(format!(
+                    "pure functions cannot call functions with {callee_effect} effects"
+                ));
                 hints.push(format!(
                     "remove the `is {caller_effect}` annotation, or refactor to remove the {callee_effect} call"
                 ));
@@ -368,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn from_qala_error_effect_violation_adds_locked_hint() {
+    fn from_qala_error_effect_violation_adds_locked_note_and_hint() {
         let err = QalaError::EffectViolation {
             span: sp(),
             caller: "compute".to_string(),
@@ -378,12 +381,15 @@ mod tests {
         };
         let d: Diagnostic = err.into();
         assert_eq!(
+            d.notes,
+            vec!["pure functions cannot call functions with io effects".to_string()]
+        );
+        assert_eq!(
             d.hints,
             vec![
                 "remove the `is pure` annotation, or refactor to remove the io call".to_string()
             ]
         );
-        assert!(d.notes.is_empty());
     }
 
     #[test]
