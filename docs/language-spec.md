@@ -37,10 +37,12 @@ C uses preprocessor macros (fragile, untyped). C++ uses templates (complex, slow
 Any expression or block prefixed with `comptime` executes during compilation. The result is embedded as a constant. Same syntax, same types, same semantics as runtime code.
 
 ```
-let squares = comptime {
-    let mut result: [i64; 100] = [0; 100]
-    for i in 0..100 { result[i] = i * i }
-    result
+let minutes_per_week = comptime 7 * 24 * 60
+
+let table_size = comptime {
+    let rows = 8
+    let cols = 8
+    rows * cols
 }
 ```
 
@@ -125,11 +127,14 @@ Side effects in interpolations are evaluated left-to-right, in source order.
 Most bugs come from unexpected mutation. Rust, Swift, and Kotlin all default to immutable.
 
 ```
-let x = 5         // immutable
-let mut y = 10    // mutable
+let x = 5         // bound once
+let y = x + 1     // a new binding, not a change to x
 ```
 
-Parameters are always immutable. Reassignment requires `let mut`.
+A `let` binds a value once. Parameters and `let` bindings are immutable. Qala v1
+has no assignment statement: a binding is never reassigned, and there is no
+index or field assignment. `let mut` is reserved syntax that parses but has no
+operative effect in v1. To compute a new value, bind a new name.
 
 ## 10. ARM64 compilation target (v2)
 
