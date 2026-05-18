@@ -143,9 +143,15 @@ push([T], T) -> void    is alloc
 Append a value to a dynamic array. `push` grows the array on the heap, so it
 carries the `alloc` effect. It is generic over the element type.
 
+`push` needs a dynamic `[T]`. In v1 an array literal is always a fixed-size
+`[T; N]`, and the two are separate types the compiler does not coerce between.
+A dynamic array comes from `map`, so the example builds one with `map` first.
+
 ```
+fn id(x: i64) -> i64 is pure { return x }
+
 fn build() -> [i64] is alloc {
-    let xs = [1, 2]
+    let xs = map([1, 2], id)
     push(xs, 3)
     return xs
 }
@@ -160,9 +166,19 @@ pop([T]) -> Option<T>    is alloc
 Remove the last element of a dynamic array and return it as `Option<T>`. An
 empty array gives `None`. Like `push`, it touches the heap and carries `alloc`.
 
+`pop` also wants a dynamic `[T]`, so `drop_last` builds one with `map` before
+calling `last`. See the note on `push` above for why a literal does not work.
+
 ```
+fn id(x: i64) -> i64 is pure { return x }
+
 fn last(xs: [i64]) -> Option<i64> is alloc {
     return pop(xs)
+}
+
+fn drop_last() -> Option<i64> is alloc {
+    let xs = map([1, 2, 3], id)
+    return last(xs)
 }
 ```
 
