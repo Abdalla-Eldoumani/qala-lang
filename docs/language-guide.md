@@ -64,6 +64,12 @@ You build larger types out of the primitives:
   compile time.
 - A dynamic array, written `[i64]`: any number of `i64` values, length known at
   runtime.
+
+In v1 an array literal is always a fixed-size `[T; N]`, and a fixed array is a
+separate type from a dynamic `[T]` that the compiler does not coerce between.
+A dynamic array value comes from `map`: `map([1, 2], id)` returns a `[i64]`. The
+`push` and `pop` built-ins, which need a dynamic array, work on the result of
+`map`.
 - A tuple: a fixed group of values, each with its own type.
 - A struct: named fields, each with its own type.
 - An enum: a type that is one of several named variants. A variant can carry
