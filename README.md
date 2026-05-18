@@ -2,13 +2,26 @@
 
 A statically typed programming language where saying is doing.
 
-Qala (قال) is the Arabic word for "he said" or "to say." In Arabic, when you say something with qala, you are making a declaration -- stating what is. Qala the language works the same way. When you write a function marked `is pure`, it is pure. The compiler guarantees it. When you write `defer close(f)`, the file closes. The compiler guarantees that too. There is no gap between what you write and what happens.
+Qala (قال) is the Arabic word for "he said" or "to say." In Arabic, when you say
+something with qala, you are making a declaration, stating what is. Qala the
+language works the same way. When you write a function marked `is pure`, it is
+pure. The compiler guarantees it. When you write `defer close(f)`, the file
+closes. The compiler guarantees that too. There is no gap between what you write
+and what happens.
 
-This is the core idea: a language where your code is a truthful declaration of behavior. Side effects are visible in function signatures. Resources are managed explicitly. Types are known before the program runs. Nothing is hidden, nothing is implicit, nothing surprises you.
+This is the core idea: a language where your code is a truthful declaration of
+behavior. Side effects are visible in function signatures. Resources are managed
+explicitly. Types are known before the program runs. Nothing is hidden, nothing
+is implicit, nothing surprises you.
 
-If Haskell showed that purity makes programs easier to reason about, and Rust showed that compile-time guarantees prevent real bugs, Qala asks: what if we took those insights and made them accessible? No monads, no borrow checker, no lifetime annotations. Just clear annotations (`is pure`, `is io`), straightforward resource management (`defer`), and a type system that catches mistakes without getting in your way.
+If Haskell showed that purity makes programs easier to reason about, and Rust
+showed that compile-time guarantees prevent real bugs, Qala asks: what if we
+took those insights and made them accessible? No monads, no borrow checker, no
+lifetime annotations. Just clear annotations (`is pure`, `is io`),
+straightforward resource management (`defer`), and a type system that catches
+mistakes without getting in your way.
 
-## Try it
+## try it
 
 ```bash
 cd compiler && cargo test
@@ -18,7 +31,7 @@ cd ../playground && npm install && npm run dev
 
 Open http://localhost:3000.
 
-## A taste of Qala
+## a taste of Qala
 
 ```
 fn fibonacci(n: i64) -> i64 is pure {
@@ -27,40 +40,56 @@ fn fibonacci(n: i64) -> i64 is pure {
 }
 
 fn main() is io {
-    let results = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-        |> map(fibonacci)
-
-    for r in results {
-        println("{r}")
+    for i in 0..15 {
+        println("fib({i}) = {fibonacci(i)}")
     }
 }
 ```
 
-`fibonacci` is marked `is pure`. It takes values and returns a value. It cannot print, allocate, or crash. The compiler enforces this. `main` is marked `is io` because it prints to the console. The effects are right there in the signature. Reading the code tells you exactly what it does.
+`fibonacci` is marked `is pure`. It takes a value and returns a value. It cannot
+print, allocate, or crash. The compiler enforces this. `main` is marked `is io`
+because it prints to the console. The effects are right there in the signature.
+Reading the code tells you exactly what it does.
 
-## What Qala offers
+This is the `fibonacci` example, one of six bundled programs you can open and
+run in the playground.
 
-**Effect annotations.** Functions declare their side effects: `is pure`, `is io`, `is alloc`, `is panic`. The compiler tracks these and catches violations. This is how Qala keeps its promise: what you say is what happens.
+## what Qala offers
 
-**Scope-bound defer.** `defer close(f)` runs when the current scope exits. The compiler warns if a resource is acquired without a matching cleanup. Resource management is explicit, visible, and verified.
+**Effect annotations.** Functions declare their side effects: `is pure`,
+`is io`, `is alloc`, `is panic`. The compiler tracks these and catches
+violations. This is how Qala keeps its promise: what you say is what happens.
 
-**Compile-time evaluation.** `comptime` blocks execute during compilation, embedding the result as a constant. One concept replaces macros, const generics, and metaprogramming.
+**Scope-bound defer.** `defer close(f)` runs when the current scope exits. The
+compiler warns if a resource is acquired without a matching cleanup. Resource
+management is explicit, visible, and verified.
 
-**Pipeline operator.** `|>` passes the left value as the first argument to the right function. Data flows left to right, the way you read it.
+**Compile-time evaluation.** `comptime` blocks execute during compilation,
+embedding the result as a constant. One concept replaces macros, const generics,
+and metaprogramming.
 
-**Error handling.** `Result<T, E>` with `?` for propagation and `or` for inline fallbacks. Errors are values, not surprises.
+**Pipeline operator.** `|>` passes the left value as the first argument to the
+right function. Data flows left to right, the way you read it.
 
-**Exhaustive matching.** `match` requires all enum variants covered. Guard clauses supported. The compiler tells you what you forgot.
+**Error handling.** `Result<T, E>` with `?` for propagation and `or` for inline
+fallbacks. Errors are values, not surprises.
 
-**Structural interfaces.** If a type has the right methods, it satisfies the interface. No ceremony.
+**Exhaustive matching.** `match` requires all enum variants covered. Guard
+clauses supported. The compiler tells you what you forgot.
 
-**Immutable by default.** `let` is immutable. `let mut` opts into mutation. Fewer surprises.
+**Structural interfaces.** If a type has the right methods, it satisfies the
+interface. No ceremony.
+
+**Immutable bindings.** `let` binds a value once. Bindings do not change, and
+there is no assignment statement. To get a new value, bind a new name. Fewer
+surprises.
 
 **String interpolation.** `{expr}` inside strings evaluates and converts.
 
-## Error messages
+## error messages
 
-Qala's compiler produces rich diagnostics with source context, underlines, and suggestions:
+Qala's compiler produces rich diagnostics with source context, underlines, and
+suggestions:
 
 ```
 error: pure function `compute` calls io function `println`
@@ -69,15 +98,30 @@ error: pure function `compute` calls io function `println`
 7  |     println("debug")
    |     ^^^^^^^ this function has io effects
    |
-   = hint: remove `is pure`, or move the println outside this function
+   = note: pure functions cannot call functions with io effects
+   = hint: remove the `is pure` annotation, or refactor to remove the io call
 ```
 
-Warnings for unused variables, unreachable code, and unmatched defer help catch mistakes without blocking compilation.
+Warnings for unused variables, unreachable code, and unmatched defer help catch
+mistakes without blocking compilation.
 
-## How it works
+## documentation
 
-The compiler is a single Rust crate with a hand-written lexer, recursive descent parser with Pratt expression parsing, a single-pass type checker with effect inference, and a bytecode compiler with constant folding and dead code elimination. Emitted bytecode goes through a peephole optimizer before execution. The VM uses NaN-boxing for compact stack values and carries source maps for precise runtime error reporting. The web playground loads the entire pipeline as WebAssembly.
+- `docs/language-guide.md` teaches Qala from scratch.
+- `docs/stdlib-reference.md` lists every built-in function.
+- `docs/language-spec.md` is the full feature reference with design rationale.
+- `docs/design-philosophy.md` is a short piece on the idea behind the language.
 
-## License
+## how it works
+
+The compiler is a single Rust crate with a hand-written lexer, recursive descent
+parser with Pratt expression parsing, a single-pass type checker with effect
+inference, and a bytecode compiler with constant folding and dead code
+elimination. Emitted bytecode goes through a peephole optimizer before
+execution. The VM uses NaN-boxing for compact stack values and carries source
+maps for precise runtime error reporting. The web playground loads the entire
+pipeline as WebAssembly.
+
+## license
 
 MIT
