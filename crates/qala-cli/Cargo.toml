@@ -1,0 +1,11 @@
+[package]
+name = "qala-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line interface for the Qala programming language"
+license = "MIT"
+rust-version = "1.95.0"
+
+[[bin]]
+name = "qala"
+path = "src/main.rs"
