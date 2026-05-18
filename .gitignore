@@ -1,4 +1,5 @@
-compiler/target/
+crates/qala-compiler/target/
+target/
 playground/node_modules/
 playground/.next/
 playground/out/
