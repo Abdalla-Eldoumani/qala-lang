@@ -451,7 +451,17 @@ impl ShortCircuit {
 }
 
 /// the human name of an unsupported expression construct, for the rejection
-/// diagnostic. plan 13 (ARM-05) polishes this wording; plan 12 keeps it plain.
+/// diagnostic.
+///
+/// the match is EXHAUSTIVE over [`TypedExpr`] -- no `_` catch-all. a new typed
+/// AST variant therefore breaks this build and forces a deliberate decision
+/// (support it, or name it here) instead of silently degrading to a vacuous
+/// "this construct" message. the integer-core variants (`Int`, `Bool`,
+/// `Ident`, `Paren`, `Unary`, `Binary`, `Block`, `Call`, `Range`) are all
+/// handled by an explicit arm of [`compile_expr`] before this helper is
+/// reached -- they get an arm here only so the match stays exhaustive; the
+/// string they map to is phrased as a backend bug, because seeing it would
+/// mean `compile_expr` routed a handled variant into the rejection path.
 fn unsupported_expr_name(expr: &TypedExpr) -> &'static str {
     match expr {
         TypedExpr::Float { .. } => "floats",
@@ -469,9 +479,20 @@ fn unsupported_expr_name(expr: &TypedExpr) -> &'static str {
         TypedExpr::Match { .. } => "match expressions",
         TypedExpr::OrElse { .. } => "the `or` fallback",
         TypedExpr::Interpolation { .. } => "string interpolation",
-        // the integer-core variants and Call/Range are handled before this
-        // helper is reached.
-        _ => "this construct",
+        // the integer-core variants: `compile_expr` handles each in its own
+        // arm, so none of these can reach here. they are listed only to keep
+        // the match exhaustive -- the string names a backend bug, since
+        // reaching it means a handled variant was misrouted.
+        TypedExpr::Int { .. }
+        | TypedExpr::Bool { .. }
+        | TypedExpr::Ident { .. }
+        | TypedExpr::Paren { .. }
+        | TypedExpr::Unary { .. }
+        | TypedExpr::Binary { .. }
+        | TypedExpr::Block { .. }
+        | TypedExpr::Call { .. }
+        | TypedExpr::Range { .. } => "this construct (arm64 backend bug: a \
+            supported expression reached the unsupported-construct path)",
     }
 }
 
