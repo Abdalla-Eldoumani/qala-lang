@@ -27,7 +27,7 @@ const QALA_LANGUAGE_ID = "qala";
 const MARKER_OWNER = "qala";
 
 function handleBeforeMount(monaco: Monaco) {
-  // register only once -- beforeMount can fire again on remount.
+  // register only once: beforeMount can fire again on remount.
   const already = monaco.languages
     .getLanguages()
     .some((l: languages.ILanguageExtensionPoint) => l.id === QALA_LANGUAGE_ID);
@@ -49,7 +49,7 @@ export default function QalaEditor({
   // the last compile result drives the diagnostic markers; null before
   // the first compile. lastState drives the current-line decoration;
   // null before the first step. dirty true means the source changed
-  // since the last successful compile -- the current-line decoration is
+  // since the last successful compile: the current-line decoration is
   // stale and gets cleared, but the diagnostic markers stay (a failed
   // compile leaves the source dirty, so its errors must remain visible).
   // plan 08-05 wires these from useQala.
@@ -57,7 +57,7 @@ export default function QalaEditor({
   // the three step-through props are optional: the phase 7 page renders
   // this editor with value/onChange only, and plan 08-05 adds the wiring.
   // the defaults are the inert "no compile, not stepping, not dirty"
-  // state -- the editor shows no markers, no line highlight, no rule.
+  // state: the editor shows no markers, no line highlight, no rule.
   lastCompile = null,
   lastState = null,
   dirty = false,
@@ -88,8 +88,8 @@ export default function QalaEditor({
   }
 
   // diagnostic markers. keyed on lastCompile only: the diagnostics of the
-  // last compile -- a failed compile's errors or a successful compile's
-  // warnings -- map straight to monaco markers and stay visible while the
+  // last compile (a failed compile's errors or a successful compile's
+  // warnings) map straight to monaco markers and stay visible while the
   // source is edited (monaco shifts the marker ranges to follow the edits)
   // until the next compile refreshes them. clearing on dirty would hide a
   // failed compile's errors, since a failed compile leaves the source
@@ -131,7 +131,7 @@ export default function QalaEditor({
   // dirty source invalidates the vm snapshot, so the highlight is cleared.
   // current_line is 1-based; 0 means "no line" (a synthesized instruction
   // or an out-of-range ip) and also clears the highlight. this is a
-  // distinct highlight from the bytecode panel's ip highlight -- this one
+  // distinct highlight from the bytecode panel's ip highlight: this one
   // keys on a source line, that one on a byte offset.
   useEffect(() => {
     const editor = editorRef.current;
@@ -172,10 +172,10 @@ export default function QalaEditor({
       {dirty && (
         // the quiet needs-compile signal: a 2px --warning rule on the
         // leading inner edge, shown only while dirty. not a banner, not
-        // an overlay -- the editor stays fully editable underneath it.
+        // an overlay: the editor stays fully editable underneath it.
         <div
           aria-hidden
-          title="source changed -- compile to run"
+          title="source changed, compile to run"
           className="pointer-events-none absolute inset-y-0 left-0 z-10 w-[2px] bg-warning"
         />
       )}
