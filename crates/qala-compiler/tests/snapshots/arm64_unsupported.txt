@@ -1,0 +1,6 @@
+error: the arm64 backend does not yet support floats
+  --> 2:13
+   |
+2  |       let x = 1.5
+   |               ^^^
+   |
