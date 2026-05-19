@@ -18,16 +18,38 @@
 //!
 //! the integer core handles `i64` and `bool`: integer literals, boolean
 //! literals, identifier loads, parenthesised expressions, the unary `!` and
-//! `-`, the binary `+ - * / %`, the six comparisons, and the short-circuit
-//! `&&` / `||`. every other expression construct -- a float, a string, a
-//! struct literal, a method call, a call, a range -- is unsupported and
-//! returns a [`QalaError`], never a panic.
+//! `-`, the binary `+ - * / %`, the six comparisons, the short-circuit
+//! `&&` / `||`, and a call to a user function. every other expression
+//! construct -- a float, a string, a struct literal, a method call, a range,
+//! a call to a stdlib function -- is unsupported and returns a [`QalaError`],
+//! never a panic.
+//!
+//! ## a call expression
+//!
+//! a [`TypedExpr::Call`] to a user function lowers to AAPCS64 argument passing
+//! and a `bl`. because every `compile_expr` lands its result in `x0`,
+//! evaluating argument 1 into `x0` would clobber argument 0 -- so each
+//! argument is evaluated and immediately `str`-ed to an argument scratch slot
+//! (reserved by [`FrameLayout::plan_frame`](super::frame::FrameLayout)), and
+//! after all arguments are evaluated a run of `ldr x0`, `ldr x1`, ... loads
+//! the slots into the AAPCS64 argument registers. then `bl <name>`; the
+//! result is in `x0`. this ordering is correct for a NESTED call: an argument
+//! that is itself a call runs to completion -- its own argument `str`s, its
+//! own `bl`, its result in `x0` -- before the outer call's `str` for that
+//! argument captures it.
 
 use crate::ast::{BinOp, UnaryOp};
 use crate::errors::QalaError;
+use crate::span::Span;
 use crate::typed_ast::TypedExpr;
 
 use super::Arm64Backend;
+
+/// the AAPCS64 integer-argument register count: arguments 0-7 go in `x0`-`x7`,
+/// a ninth argument would spill onto the stack. the integer core supports at
+/// most this many arguments per call; a stack-passed argument is a Phase 13+
+/// extension.
+const MAX_CALL_ARGS: usize = 8;
 
 /// the inclusive upper bound for emitting an `i64` literal as a bare `mov`.
 ///
@@ -81,13 +103,13 @@ impl Arm64Backend {
             // in mod.rs for this plan (plan 12-02 replaces it with the full
             // scope-aware version in stmt.rs).
             TypedExpr::Block { block, .. } => self.compile_block(block),
-            // Call and Range are out of this plan's scope: Call arrives in plan
-            // 12-03, Range in plan 12-02 (inside a `for`). Until then both are
-            // a clean unsupported-construct rejection.
-            TypedExpr::Call { span, .. } => Err(QalaError::Type {
-                span: *span,
-                message: "the arm64 backend does not yet support calls".to_string(),
-            }),
+            // a call to a user function: AAPCS64 argument passing and a bl.
+            TypedExpr::Call { callee, args, span, .. } => {
+                self.compile_call(callee, args, *span)
+            }
+            // a Range only appears as a `for` iterable -- `stmt.rs`'s For arm
+            // matches it directly. a Range reaching `compile_expr` is a Range
+            // used as a value, which the integer core does not support.
             TypedExpr::Range { span, .. } => Err(QalaError::Type {
                 span: *span,
                 message: "the arm64 backend does not yet support ranges".to_string(),
@@ -260,6 +282,89 @@ impl Arm64Backend {
         self.asm
             .emit_insn(&format!("mov     x0, {}", kind.settle_value()));
         self.asm.emit_label(&done);
+        Ok(())
+    }
+
+    /// emit a call to a user function: AAPCS64 argument passing and a `bl`,
+    /// the result left in `x0`.
+    ///
+    /// rejects, with a clean [`QalaError`], a call the integer core does not
+    /// support: a computed callee (one that is not a plain identifier), a
+    /// callee that resolves to a stdlib function rather than a user-declared
+    /// one (the stdlib and `printf` output arrive in Phase 13), and a call
+    /// with more than eight arguments (a stack-passed argument is a Phase 13+
+    /// extension -- a well-typed program cannot reach this since the callee
+    /// has at most eight parameters, but the guard is defensive so a `bl` is
+    /// never emitted with a wrong argument count).
+    fn compile_call(
+        &mut self,
+        callee: &TypedExpr,
+        args: &[TypedExpr],
+        span: Span,
+    ) -> Result<(), QalaError> {
+        // the callee must be a plain identifier -- a computed callee (a call
+        // returning a function, a field holding one) is out of the integer
+        // core.
+        let name = match callee {
+            TypedExpr::Ident { name, .. } => name,
+            _ => {
+                return Err(QalaError::Type {
+                    span,
+                    message: "the arm64 backend does not yet support computed callees"
+                        .to_string(),
+                });
+            }
+        };
+        // the name must be a user-declared function. a name not in `fn_names`
+        // resolves to a stdlib function (`print`, `println`, `sqrt`, `len`,
+        // ...) -- the stdlib is Phase 13, so reject it cleanly here.
+        if !self.fn_names.contains(name) {
+            return Err(QalaError::Type {
+                span,
+                message: format!(
+                    "the arm64 backend does not yet support the `{name}` function"
+                ),
+            });
+        }
+        // at most eight arguments -- AAPCS64 passes the rest on the stack,
+        // which the integer core does not do. defensive: a well-typed call
+        // cannot exceed the callee's parameter count, which `compile_fn`
+        // already capped at eight.
+        if args.len() > MAX_CALL_ARGS {
+            return Err(QalaError::Type {
+                span,
+                message: "the arm64 backend supports at most 8 arguments".to_string(),
+            });
+        }
+
+        // approach (a): evaluate every argument into x0 and immediately spill
+        // it to its argument scratch slot, BEFORE loading any argument
+        // register. evaluating argument i+1 into x0 would clobber argument i,
+        // so the load into x0..x{n-1} happens only after every argument is
+        // safely in a slot. this is also what makes a nested call correct: a
+        // call argument that is itself a call runs fully -- its own spills,
+        // its own bl, its result in x0 -- and only then is that x0 spilled.
+        let mut arg_offsets = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let slot = self.frame().arg_slot(i).ok_or_else(|| QalaError::Type {
+                span,
+                message: format!("arm64 backend: call argument {i} has no scratch slot"),
+            })?;
+            // arg -> x0 (a nested call completes entirely here), then spill.
+            self.compile_expr(arg)?;
+            self.asm.emit_insn_commented(
+                &format!("str     x0, [fp, {slot}]"),
+                &format!("arg {i}"),
+            );
+            arg_offsets.push(slot);
+        }
+        // every argument is now in a slot -- load them into x0..x{n-1}.
+        for (i, slot) in arg_offsets.iter().enumerate() {
+            self.asm.emit_insn(&format!("ldr     x{i}, [fp, {slot}]"));
+        }
+        // the call. the result, by AAPCS64, is in x0 -- which is the result
+        // convention compile_expr upholds.
+        self.asm.emit_insn(&format!("bl      {name}"));
         Ok(())
     }
 }
@@ -545,6 +650,176 @@ mod tests {
         match err {
             QalaError::Type { message, .. } => {
                 assert!(message.contains("float"), "message: {message}");
+            }
+            other => panic!("expected QalaError::Type, got {other:?}"),
+        }
+    }
+
+    /// compile a whole multi-function program to assembly, panicking on a
+    /// backend error. unlike `emit_expr`, this runs the full `compile_arm64`
+    /// path, so the `fn_names` set is populated and a call resolves.
+    fn compile_program_ok(src: &str) -> String {
+        let tokens = Lexer::tokenize(src).expect("lex failed");
+        let ast = Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        super::super::compile_arm64(&typed, src)
+            .unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
+    }
+
+    /// the instruction lines of `caller`'s emitted function body -- the lines
+    /// between the `caller:` label and the `.Lcaller_epilogue:` label.
+    fn caller_body(asm: &str) -> Vec<String> {
+        asm.lines()
+            .skip_while(|l| !l.starts_with("caller:"))
+            .take_while(|l| !l.trim_start().starts_with(".Lcaller_epilogue"))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_call_to_a_user_function_emits_argument_spills_loads_and_a_bl() {
+        // `add3(1, 2, 3)`: three args spilled to scratch slots, then loaded
+        // into x0/x1/x2, then `bl add3`.
+        let asm = compile_program_ok(
+            "fn add3(a: i64, b: i64, c: i64) -> i64 { a + b + c }\n\
+             fn caller() -> i64 { add3(1, 2, 3) }",
+        );
+        let body = caller_body(&asm).join("\n");
+        // three argument spills, one per argument.
+        let spills = body.lines().filter(|l| l.contains("// arg ")).count();
+        assert_eq!(spills, 3, "three arguments -> three spills: {body}");
+        // the loads into the AAPCS64 argument registers.
+        assert!(body.contains("ldr     x0, [fp, "), "missing x0 load: {body}");
+        assert!(body.contains("ldr     x1, [fp, "), "missing x1 load: {body}");
+        assert!(body.contains("ldr     x2, [fp, "), "missing x2 load: {body}");
+        assert!(body.contains("bl      add3"), "missing the bl: {body}");
+    }
+
+    #[test]
+    fn a_call_loads_arguments_after_every_spill_not_interleaved() {
+        // the ordering trap: all three `str` spills must come before the first
+        // `ldr` load -- otherwise evaluating arg 1 would clobber arg 0 in x0.
+        let asm = compile_program_ok(
+            "fn add3(a: i64, b: i64, c: i64) -> i64 { a }\n\
+             fn caller() -> i64 { add3(1, 2, 3) }",
+        );
+        let body = caller_body(&asm);
+        let last_spill = body
+            .iter()
+            .rposition(|l| l.contains("str     x0, [fp, ") && l.contains("// arg "))
+            .expect("no argument spill");
+        let first_load = body
+            .iter()
+            .position(|l| l.contains("ldr     x0, [fp, "))
+            .expect("no x0 load");
+        assert!(
+            last_spill < first_load,
+            "every spill must precede the first load: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_emits_just_a_bl() {
+        // a zero-argument call: no spill, no load, just the `bl`.
+        let asm = compile_program_ok(
+            "fn answer() -> i64 { 42 }\n\
+             fn caller() -> i64 { answer() }",
+        );
+        let body = caller_body(&asm).join("\n");
+        assert!(body.contains("bl      answer"), "missing the bl: {body}");
+        assert!(!body.contains("// arg "), "a no-arg call spills nothing: {body}");
+    }
+
+    #[test]
+    fn a_nested_call_emits_two_bls_with_the_inner_call_first() {
+        // `outer(inner(5))`: the inner call must complete -- its own bl -- and
+        // leave its result in x0 BEFORE the outer call spills that x0 as its
+        // argument. so `bl inner` precedes the outer call's argument spill,
+        // which precedes `bl outer`.
+        let asm = compile_program_ok(
+            "fn inner(n: i64) -> i64 { n + 1 }\n\
+             fn outer(n: i64) -> i64 { n * 2 }\n\
+             fn caller() -> i64 { outer(inner(5)) }",
+        );
+        let body = caller_body(&asm);
+        let inner_bl = body
+            .iter()
+            .position(|l| l.contains("bl      inner"))
+            .expect("missing bl inner");
+        let outer_bl = body
+            .iter()
+            .position(|l| l.contains("bl      outer"))
+            .expect("missing bl outer");
+        assert!(inner_bl < outer_bl, "the inner call must run first: {body:?}");
+        // every argument spill: the inner call's own argument (5) spills
+        // BEFORE `bl inner`; the outer call's argument -- the inner call's x0
+        // result -- spills AFTER `bl inner`. the FIRST spill after `bl inner`
+        // captures that result and must precede `bl outer`.
+        let outer_spill = body
+            .iter()
+            .enumerate()
+            .find(|(idx, l)| {
+                *idx > inner_bl
+                    && l.contains("str     x0, [fp, ")
+                    && l.contains("// arg ")
+            })
+            .map(|(idx, _)| idx)
+            .expect("missing the outer-call argument spill after bl inner");
+        assert!(
+            outer_spill < outer_bl,
+            "the inner result is spilled between the two bls: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_to_a_stdlib_function_is_rejected_cleanly() {
+        // `abs` is a stdlib function, not a user function -- it is not in
+        // `fn_names`, so the backend rejects the call with a clean QalaError
+        // (the stdlib is Phase 13), never a panic, never a bl. `abs(i64)`
+        // type-checks to `i64`, so the rejection is the backend's, not the
+        // typechecker's.
+        let src = "fn caller() -> i64 { abs(-1) }";
+        let tokens = Lexer::tokenize(src).expect("lex failed");
+        let ast = Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        let err = super::super::compile_arm64(&typed, src)
+            .expect_err("a stdlib call must be rejected");
+        assert!(
+            err[0].message().contains("abs"),
+            "message: {:?}",
+            err[0].message()
+        );
+    }
+
+    #[test]
+    fn a_call_with_a_non_ident_callee_is_rejected_cleanly() {
+        // a computed callee -- here a parenthesised expression in callee
+        // position -- is outside the integer core. build the typed AST
+        // directly: the callee is a Paren, not an Ident.
+        use crate::types::QalaType;
+        let call = TypedExpr::Call {
+            callee: Box::new(TypedExpr::Paren {
+                inner: Box::new(TypedExpr::Int {
+                    value: 0,
+                    ty: QalaType::I64,
+                    span: Span::new(0, 1),
+                }),
+                ty: QalaType::I64,
+                span: Span::new(0, 3),
+            }),
+            args: vec![],
+            ty: QalaType::I64,
+            span: Span::new(0, 5),
+        };
+        let mut backend = Arm64Backend::new("");
+        let err = backend
+            .compile_expr(&call)
+            .expect_err("a computed callee must be rejected");
+        match err {
+            QalaError::Type { message, .. } => {
+                assert!(message.contains("computed callee"), "message: {message}");
             }
             other => panic!("expected QalaError::Type, got {other:?}"),
         }
