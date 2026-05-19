@@ -56,7 +56,11 @@ use super::Arm64Backend;
 /// a ninth argument would spill onto the stack. the integer core supports at
 /// most this many arguments per call; a stack-passed argument is a Phase 13+
 /// extension.
-const MAX_CALL_ARGS: usize = 8;
+///
+/// `pub(super)` so `print.rs` derives its `MAX_PRINTF_HOLES` from this one
+/// source -- the printf hole limit is this count minus the `x0` the format
+/// pointer takes.
+pub(super) const MAX_CALL_ARGS: usize = 8;
 
 /// the inclusive upper bound for emitting an `i64` literal as a bare `mov`.
 ///
