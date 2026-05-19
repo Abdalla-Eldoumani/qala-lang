@@ -417,6 +417,69 @@ mod tests {
     use crate::typechecker::check_program;
     use crate::typed_ast::TypedAst;
 
+    /// the four control-flow snapshot programs and their fixture file names.
+    /// each snapshot test compiles its program and asserts the output matches
+    /// the committed fixture; `generate_snapshot_fixtures` (ignored) rewrites
+    /// the fixtures from the emitter. one source of truth for both.
+    const SNAPSHOT_PROGRAMS: [(&str, &str); 4] = [
+        (
+            "arm64_let.s",
+            // several lets, a shadowing `let x`, and ident uses.
+            "fn let_demo(a: i64) -> i64 {\n\
+            \x20   let x = a + 1\n\
+            \x20   let y = x * 2\n\
+            \x20   let x = y - a\n\
+            \x20   x\n\
+            }\n",
+        ),
+        (
+            "arm64_if_else.s",
+            // a bare `if`, an `if`/`else`, and a separate `else if` chain.
+            // each function ends in a trailing fallback value so the body is
+            // always-returning regardless of which branches the typechecker
+            // proves terminating.
+            "fn sign(n: i64) -> i64 {\n\
+            \x20   if n == 0 { return 0 }\n\
+            \x20   if n > 0 { return 1 } else { return -1 }\n\
+            \x20   0\n\
+            }\n\
+            fn grade(s: i64) -> i64 {\n\
+            \x20   if s >= 90 { return 4 }\n\
+            \x20   else if s >= 80 { return 3 }\n\
+            \x20   else { return 2 }\n\
+            \x20   0\n\
+            }\n",
+        ),
+        (
+            "arm64_while.s",
+            // a `while` loop with both a `break` and a `continue`.
+            "fn loop_demo(c: bool) {\n\
+            \x20   while c {\n\
+            \x20       if c { break }\n\
+            \x20       continue\n\
+            \x20   }\n\
+            }\n",
+        ),
+        (
+            "arm64_for.s",
+            // an exclusive `for i in 0..n` and an inclusive `for j in 0..=n`.
+            "fn for_demo(n: i64) {\n\
+            \x20   for i in 0..n { }\n\
+            \x20   for j in 0..=n { }\n\
+            }\n",
+        ),
+    ];
+
+    /// read a snapshot fixture, normalising CRLF to LF for a Windows-stable
+    /// compare. the emitter always produces LF; a checked-out file may carry
+    /// CRLF.
+    fn read_snapshot(name: &str) -> String {
+        let path = format!("{}/tests/snapshots/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"))
+            .replace("\r\n", "\n")
+    }
+
     /// lex, parse, and typecheck `src` into a typed AST, asserting no errors.
     fn typecheck(src: &str) -> TypedAst {
         let tokens = Lexer::tokenize(src).expect("lex failed");
@@ -431,6 +494,55 @@ mod tests {
         let typed = typecheck(src);
         super::super::compile_arm64(&typed, src)
             .unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
+    }
+
+    /// the source of snapshot program `name`, from [`SNAPSHOT_PROGRAMS`].
+    fn snapshot_src(name: &str) -> &'static str {
+        SNAPSHOT_PROGRAMS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, src)| *src)
+            .unwrap_or_else(|| panic!("no snapshot program named {name}"))
+    }
+
+    #[test]
+    fn let_bindings_match_the_snapshot() {
+        let emitted = compile_ok(snapshot_src("arm64_let.s"));
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_let.s"),
+            "arm64 let emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn if_else_matches_the_snapshot() {
+        let emitted = compile_ok(snapshot_src("arm64_if_else.s"));
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_if_else.s"),
+            "arm64 if/else emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn while_loops_match_the_snapshot() {
+        let emitted = compile_ok(snapshot_src("arm64_while.s"));
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_while.s"),
+            "arm64 while emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn for_loops_match_the_snapshot() {
+        let emitted = compile_ok(snapshot_src("arm64_for.s"));
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_for.s"),
+            "arm64 for emission drifted from snapshot"
+        );
     }
 
     #[test]
