@@ -1,10 +1,10 @@
 //! the assembly-text builder for the ARM64 backend.
 //!
 //! [`Asm`] accumulates emitted instructions and labels into a `.text` section
-//! buffer (a `.data` buffer is held but stays empty for the integer core --
-//! the integer slice has no strings, no `printf`, nothing to place). [`Asm::finish`]
-//! prepends the fixed m4 `define` preamble and the `.text` section header,
-//! producing the complete CPSC 355-dialect `.asm` text.
+//! buffer and `printf` format strings into a `.data` section buffer.
+//! [`Asm::finish`] prepends the fixed m4 `define` preamble, the (omitted-if-
+//! empty) `.data` section, and the `.text` section header, producing the
+//! complete CPSC 355-dialect `.asm` text.
 //!
 //! the dialect, fixed: lowercase mnemonics and directives throughout, the m4
 //! `define(fp, x29)` / `define(lr, x30)` register-alias preamble, GAS sections,
@@ -16,26 +16,23 @@
 const INDENT: &str = "        ";
 
 /// the assembly-text builder. holds the `.text` section buffer (where every
-/// function's directives, prologue, body, and epilogue land) and an unused
-/// `.data` buffer reserved for Phase 13's format strings.
+/// function's directives, prologue, body, and epilogue land) and the `.data`
+/// section buffer of `printf` format strings.
 ///
 /// crate-private: only the `arm64` module builds assembly text.
 pub(crate) struct Asm {
-    /// the `.data` section buffer. the `printf` output path is the first
-    /// writer: a `print` / `println` of an `i64` registers its `"%lld"` /
-    /// `"%lld\n"` format string here. empty for a program with no output.
+    /// the `.data` section buffer. the `printf` output path is the only
+    /// writer: a `print` / `println` lowering interns its built format string
+    /// here via [`Asm::intern_format`]. empty for a program with no output.
     data: String,
     /// the `.text` section buffer: per-function directives, labels, and
     /// instructions, in emission order.
     text: String,
-    /// set once the println format string (`"%lld\n"`) has been registered
-    /// in the `.data` buffer -- guards against a duplicate registration. the
-    /// reader is the `printf` call lowering in `expr.rs`, the next commit.
-    #[allow(dead_code)]
-    println_fmt_used: bool,
-    /// set once the print format string (`"%lld"`) has been registered.
-    #[allow(dead_code)]
-    print_fmt_used: bool,
+    /// the format strings already interned, in interning order. the index of
+    /// a string in this list is the `N` in its `.Lfmt_N` label;
+    /// [`Asm::intern_format`] searches it so a repeated format string reuses
+    /// its first label rather than emitting a second `.data` entry.
+    format_strings: Vec<String>,
 }
 
 impl Asm {
@@ -46,35 +43,34 @@ impl Asm {
         Asm {
             data: String::new(),
             text: String::new(),
-            println_fmt_used: false,
-            print_fmt_used: false,
+            format_strings: Vec::new(),
         }
     }
 
-    /// ensure the `"%lld\n"` println format string is in the `.data`
-    /// section; return its label. registers the string on the first call
-    /// and is a no-op on every later call -- one shared label per program.
+    /// intern an arbitrary `printf` format string into the `.data` section and
+    /// return its unique label.
     ///
-    /// the caller is `compile_print_call` in `expr.rs`, added in the next
-    /// commit; the inline tests below exercise it in the meantime.
-    #[allow(dead_code)]
-    pub(crate) fn ensure_println_fmt(&mut self) -> &'static str {
-        if !self.println_fmt_used {
-            self.data.push_str(".Lfmt_println:  .string \"%lld\\n\"\n");
-            self.println_fmt_used = true;
+    /// `content` is the literal format string the interpolation lowering
+    /// built: real newline bytes where a `\n` belongs, `%lld` conversions for
+    /// the `i64` holes, `%%` for a literal percent. interning is by content --
+    /// a format string equal to one already interned returns that string's
+    /// existing `.Lfmt_N` label and emits nothing, so the `.data` section
+    /// holds one entry per distinct format string. a new string is appended as
+    /// `.Lfmt_N:  .string "<escaped>"`, where the escaping
+    /// ([`escape_for_string_directive`]) turns the real bytes into the GAS
+    /// `.string` source form.
+    pub(crate) fn intern_format(&mut self, content: &str) -> String {
+        if let Some(index) = self.format_strings.iter().position(|s| s == content) {
+            return format!(".Lfmt_{index}");
         }
-        ".Lfmt_println"
-    }
-
-    /// ensure the `"%lld"` print format string is in the `.data` section;
-    /// return its label. one shared label per program -- see [`Asm::ensure_println_fmt`].
-    #[allow(dead_code)]
-    pub(crate) fn ensure_print_fmt(&mut self) -> &'static str {
-        if !self.print_fmt_used {
-            self.data.push_str(".Lfmt_print:    .string \"%lld\"\n");
-            self.print_fmt_used = true;
-        }
-        ".Lfmt_print"
+        let index = self.format_strings.len();
+        let label = format!(".Lfmt_{index}");
+        self.format_strings.push(content.to_string());
+        self.data.push_str(&format!(
+            "{label}:  .string \"{}\"\n",
+            escape_for_string_directive(content)
+        ));
+        label
     }
 
     /// append a raw line, plus a trailing newline, to the `.text` buffer.
@@ -146,6 +142,31 @@ impl Asm {
     }
 }
 
+/// escape a literal string for a GAS `.string` directive body.
+///
+/// `.string` interprets C-style backslash escapes, so a real byte that would
+/// be misread inside the directive's double quotes is rewritten to its escape
+/// form: a backslash to `\\`, a double quote to `\"`, and the whitespace
+/// control bytes to `\n` / `\t` / `\r`. every other byte -- printable ASCII,
+/// the `%` of a `%lld` conversion, the doubled `%%` of a literal percent --
+/// is copied through unchanged. the printf lowering builds a format string
+/// with real newline bytes and `%lld` conversions; this turns that into the
+/// `.string` source form the assembler reads.
+fn escape_for_string_directive(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for ch in content.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,50 +236,82 @@ mod tests {
     }
 
     #[test]
-    fn ensure_println_fmt_registers_the_format_string_and_returns_its_label() {
+    fn intern_format_registers_the_format_string_and_returns_a_unique_label() {
         let mut asm = Asm::new();
-        assert_eq!(asm.ensure_println_fmt(), ".Lfmt_println");
+        assert_eq!(asm.intern_format("done\n"), ".Lfmt_0");
         let out = asm.finish();
         // the label+directive lands inside a .data section.
         assert!(out.contains("        .data\n"), "missing .data section: {out:?}");
         assert!(
-            out.contains(".Lfmt_println:  .string \"%lld\\n\"\n"),
-            "missing the println format string: {out:?}"
+            out.contains(".Lfmt_0:  .string \"done\\n\"\n"),
+            "missing the interned format string: {out:?}"
         );
     }
 
     #[test]
-    fn ensure_print_fmt_registers_the_format_string_and_returns_its_label() {
+    fn intern_format_numbers_distinct_strings_monotonically() {
+        // two different format strings get .Lfmt_0 and .Lfmt_1, both emitted.
         let mut asm = Asm::new();
-        assert_eq!(asm.ensure_print_fmt(), ".Lfmt_print");
+        assert_eq!(asm.intern_format("a"), ".Lfmt_0");
+        assert_eq!(asm.intern_format("b"), ".Lfmt_1");
         let out = asm.finish();
-        assert!(out.contains("        .data\n"), "missing .data section: {out:?}");
-        assert!(
-            out.contains(".Lfmt_print:    .string \"%lld\"\n"),
-            "missing the print format string: {out:?}"
-        );
-        // the print format string has no trailing newline escape.
-        assert!(!out.contains("%lld\\n"), "print must not carry a newline: {out:?}");
+        assert!(out.contains(".Lfmt_0:  .string \"a\"\n"), "{out:?}");
+        assert!(out.contains(".Lfmt_1:  .string \"b\"\n"), "{out:?}");
     }
 
     #[test]
-    fn ensure_println_fmt_registers_the_string_only_once() {
-        // a second call is a no-op -- one shared label per program.
+    fn intern_format_deduplicates_by_content() {
+        // interning the same content twice returns the first label and emits
+        // exactly one .data entry -- one entry per distinct format string.
         let mut asm = Asm::new();
-        asm.ensure_println_fmt();
-        asm.ensure_println_fmt();
+        let first = asm.intern_format("fib(%lld) = %lld\n");
+        let second = asm.intern_format("fib(%lld) = %lld\n");
+        assert_eq!(first, second, "an identical format string must reuse its label");
+        assert_eq!(first, ".Lfmt_0");
         let out = asm.finish();
         assert_eq!(
-            out.matches(".Lfmt_println:").count(),
+            out.matches(".Lfmt_0:").count(),
             1,
-            "the println format string must be registered exactly once: {out:?}"
+            "a repeated format string must be interned exactly once: {out:?}"
         );
     }
 
     #[test]
-    fn finish_still_omits_the_data_section_when_no_format_string_is_registered() {
-        // the empty-.data behaviour is unchanged when neither ensure_* is called.
+    fn intern_format_escapes_quotes_backslashes_and_newlines() {
+        // a format string with a real newline, a quote, and a backslash must
+        // reach the .string directive in escaped form.
+        let mut asm = Asm::new();
+        asm.intern_format("a\"b\\c\n");
+        let out = asm.finish();
+        assert!(
+            out.contains(".Lfmt_0:  .string \"a\\\"b\\\\c\\n\"\n"),
+            "the format string was not escaped for the .string directive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn intern_format_passes_percent_conversions_through_unescaped() {
+        // `.string` does not interpret `%`, so a `%lld` conversion and a
+        // doubled `%%` literal-percent are copied through verbatim.
+        let mut asm = Asm::new();
+        asm.intern_format("100%% done: %lld\n");
+        let out = asm.finish();
+        assert!(
+            out.contains(".Lfmt_0:  .string \"100%% done: %lld\\n\"\n"),
+            "percent conversions must pass through unescaped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn finish_still_omits_the_data_section_when_no_format_string_is_interned() {
+        // the empty-.data behaviour is unchanged when intern_format is unused.
         let asm = Asm::new();
         assert!(!asm.finish().contains(".data"));
+    }
+
+    #[test]
+    fn escape_for_string_directive_leaves_plain_text_untouched() {
+        // printable ASCII with no escape-worthy byte passes through unchanged.
+        assert_eq!(escape_for_string_directive("fib(%lld) = %lld"), "fib(%lld) = %lld");
     }
 }
