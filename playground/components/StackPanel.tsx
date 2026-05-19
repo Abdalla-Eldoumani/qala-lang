@@ -1,12 +1,11 @@
 // the stack panel: the playground's signature element, the animated
-// type-tinted value stack. phase 7 shipped this as a styled placeholder;
-// phase 8 fills the body with the real view. the panel frame and the
-// Stack header chrome are kept from phase 7 unchanged.
+// type-tinted value stack. the body is the real value-stack view; the
+// header carries the panel-header treatment shared by the state panels.
 //
 // the stack grows upward: index 0 (the bottom of the stack) sits at the
 // bottom of the panel body, the top of stack sits highest. a pushed
 // value slides in from the top edge; a popped value slides down and
-// fades. the slide animations are pure css -- the @keyframes live in
+// fades. the slide animations are pure css: the @keyframes live in
 // globals.css and this panel only applies the classes. no animation
 // library, no new dependency.
 //
@@ -14,14 +13,14 @@
 // leaves the array, which kills a leave animation before it can play.
 // the fix: a "leaving" set holds each popped value with the stack-pop
 // class until onAnimationEnd unmounts it. the leaving set is derived
-// DURING RENDER -- when the state reference changes, the diff against
+// DURING RENDER: when the state reference changes, the diff against
 // the previous snapshot runs in the render body and updates the leaving
 // state in the same pass (the documented derive-state-during-render
 // pattern, guarded by a state-identity check so it cannot loop). this
 // is what makes the leaving row mount in the same commit the live row
 // unmounts; a post-commit effect would mount it one render late and the
 // slide-down would play after the value already vanished. a timeout
-// fallback covers a non-firing animationend (a backgrounded tab) -- the
+// fallback covers a non-firing animationend (a backgrounded tab): the
 // fallback timers are armed in an effect (a side effect, not a render
 // step), tracked in a ref, and cleared on supersede and on unmount so
 // they cannot leak.
@@ -52,7 +51,7 @@ interface LeavingEntry {
 // classify a runtime type name into one of the four tint classes. the
 // match is on the three exact primitive names; every other name --
 // arrays like [i64], tuples, structs, enum variants like Shape::Circle,
-// void -- routes to the neutral tint without enumerating them. the tint
+// void, route to the neutral tint without enumerating them. the tint
 // classes themselves are defined in globals.css.
 function tintClass(typeName: string): string {
   if (typeName === "i64" || typeName === "f64") return "tint-number";
@@ -79,7 +78,7 @@ function depthOpacity(indexFromBottom: number, truncated: boolean): number {
 // parent, so a freshly-pushed slot mounts this fresh and the
 // stack-entry--entering class animates it in exactly once. an in-place
 // value change at an existing slot keeps the same key, so the component
-// updates with no slide -- which is correct: only a push or a pop slides.
+// updates with no slide, which is correct: only a push or a pop slides.
 function LiveEntry({
   value,
   opacity,
@@ -157,11 +156,11 @@ export default function StackPanel({
   // differs from this is a new step, and the diff runs in the render
   // body. it is state (not a ref) so the guarded update-during-render
   // settles consistently across react's render passes, and prevState's
-  // stack IS the previous stack -- no separate previous-stack store.
+  // stack IS the previous stack, so no separate previous-stack store.
   const [prevState, setPrevState] = useState<VmState | null>(null);
 
   // the fallback timeout ids for the leaving entries, keyed by leave id.
-  // tracked so they can be cleared when superseded and on unmount -- a
+  // tracked so they can be cleared when superseded and on unmount: a
   // leaked animation-fallback timer is the exact failure this panel is
   // built to avoid.
   const fallbackTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
@@ -170,7 +169,7 @@ export default function StackPanel({
 
   // a monotonic counter for unique leave ids. state, not a ref: the
   // render-phase diff reads it to build the ids, and the react-hooks
-  // rules forbid reading a ref during render -- so it is state, bumped
+  // rules forbid reading a ref during render, so it is state, bumped
   // in the same guarded update-during-render block as the diff. it gives
   // each step's leaving entries a fresh key so the stack-pop keyframe
   // replays even when the same slot is popped on two consecutive steps.
@@ -189,14 +188,14 @@ export default function StackPanel({
   }, []);
 
   // the diff, computed DURING RENDER. when `state` is a new reference --
-  // the hook hands a fresh VmState per step -- this compares the previous
+  // the hook hands a fresh VmState per step, this compares the previous
   // snapshot's stack to the new one and updates the leaving set in the
   // same render pass. a shorter stack means the top (prev - next) slots
   // were popped: each popped value becomes a leaving entry with a fresh
   // id, walked low-to-high so the array is bottom-first like the live
   // entries (the column-reverse body then renders the highest popped
   // slot highest). a push, an in-place update, a Reset, or a null state
-  // produces no leaving entries, so the set is emptied -- a Reset is an
+  // produces no leaving entries, so the set is emptied: a Reset is an
   // instant clear, not a sequence of pops.
   //
   // the setState calls run during render but are GUARDED by the
@@ -207,7 +206,7 @@ export default function StackPanel({
   //
   // known limitation: the diff keys on stack depth and slot index, so an
   // instruction that both pops and pushes (a binary op pops two operands
-  // and pushes one result, net depth -1) is seen only as a pop -- one
+  // and pushes one result, net depth -1) is seen only as a pop: one
   // leave animation plays and the pushed result, landing on a slot that
   // already held an operand, updates in place with no push slide. the
   // net height is right; the mixed instruction is just quieter than a
@@ -238,7 +237,7 @@ export default function StackPanel({
   }
 
   // arm the fallback timers for the current leaving set. this is a side
-  // effect -- arming a setTimeout, not a setState -- so it belongs in an
+  // effect (it arms a setTimeout, not a setState) so it belongs in an
   // effect, not the render body. it diffs the live leaving ids against
   // the timer map: it clears a timer whose entry has left (superseded or
   // already finished) and arms one for any leaving entry that lacks one,
@@ -278,9 +277,10 @@ export default function StackPanel({
   // header, bottom rule) renders identically in every state.
   const frame = (children: React.ReactNode) => (
     <section
+      aria-label="Stack"
       className={`flex flex-col overflow-hidden rounded-[var(--radius-panel)] border border-border bg-surface ${className ?? ""}`}
     >
-      <header className="border-b border-border p-[var(--space-3)] text-[12px] font-medium uppercase tracking-wide leading-[1.4] text-text-secondary">
+      <header className="border-b border-border px-[var(--space-3)] py-[var(--space-2)] text-[12px] font-semibold uppercase tracking-wide leading-[1.4] text-text-secondary">
         Stack
       </header>
       {children}
@@ -288,7 +288,7 @@ export default function StackPanel({
   );
 
   const message = (text: string) => (
-    <div className="p-[var(--space-4)] text-[14px] font-normal leading-[1.5] text-text-secondary">
+    <div className="px-[var(--space-4)] pt-[var(--space-6)] pb-[var(--space-4)] text-[14px] font-normal leading-[1.5] text-text-secondary">
       {text}
     </div>
   );
@@ -296,7 +296,7 @@ export default function StackPanel({
   // a dirty stack is stale: show the needs-compile sentence rather than a
   // frozen stale stack.
   if (dirty) {
-    return frame(message("stack is out of date -- compile to refresh"));
+    return frame(message("the stack is out of date, compile to refresh"));
   }
 
   const stack = state?.stack ?? [];
