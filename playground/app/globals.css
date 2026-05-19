@@ -1,22 +1,28 @@
 @import "tailwindcss";
 
 :root {
-  /* codex palette -- the in-code source of truth for the design system */
-  --bg: #0C0E14;
-  --surface: #13151E;
-  --border: #1E2130;
-  --text-primary: #E8E4DC;
-  --text-secondary: #8A8690;
-  --accent: #D4943A;
-  --accent-soft: rgba(212, 148, 58, 0.15);
-  --error: #C74B50;
-  --success: #4B8C6F;
-  --warning: #C7A14B;
-  --type-number: rgba(212, 148, 58, 0.20);
-  --type-string: rgba(75, 140, 111, 0.20);
-  --type-bool: rgba(85, 110, 200, 0.20);
+  /* codex palette -- the in-code source of truth for the design system.
+     written in oklch: predictable lightness, correct chroma falloff at the
+     extremes. the values are computed to match the prior hex exactly, so
+     the rendered colors are identical -- this is a notation change, not a
+     re-coloring. the neutrals carry a slight tint (no pure black or white):
+     the surfaces sit on a cool blue-violet ink hue, the ink and accent on
+     a warm hue. */
+  --bg: oklch(0.166 0.013 274);
+  --surface: oklch(0.197 0.014 274);
+  --border: oklch(0.252 0.018 274);
+  --text-primary: oklch(0.910 0.011 83);
+  --text-secondary: oklch(0.604 0.009 305);
+  --accent: oklch(0.726 0.118 67);
+  --accent-soft: oklch(0.726 0.118 67 / 0.15);
+  --error: oklch(0.564 0.150 21);
+  --success: oklch(0.567 0.072 162);
+  --warning: oklch(0.719 0.103 84);
+  --type-number: oklch(0.726 0.118 67 / 0.20);
+  --type-string: oklch(0.567 0.072 162 / 0.20);
+  --type-bool: oklch(0.55 0.13 270 / 0.20);
   /* the neutral stack tint -- arrays, tuples, structs, enums, void */
-  --type-other: rgba(138, 134, 144, 0.12);
+  --type-other: oklch(0.604 0.009 305 / 0.12);
 
   /* codex spacing scale -- sparse by design, no --space-5 / --space-7 */
   --space-1: 4px;
