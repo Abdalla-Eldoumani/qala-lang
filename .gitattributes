@@ -1,0 +1,12 @@
+# normalize line endings: the repository stores every text file with LF.
+* text=auto
+
+# the ARM64 backend snapshot fixtures are generated assembly test data, not
+# authored source. excluding them keeps GitHub's language report honest (Qala
+# is a Rust compiler with a TypeScript playground, not an Assembly project) and
+# collapses them in diffs.
+crates/qala-compiler/tests/snapshots/** linguist-generated
+
+# the language documentation is prose, not code, so it stays out of the
+# language statistics.
+docs/** linguist-documentation
