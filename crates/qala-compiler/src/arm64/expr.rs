@@ -57,11 +57,13 @@ impl Arm64Backend {
                 Ok(())
             }
             TypedExpr::Ident { name, span, .. } => {
-                // a parameter (or, from plan 12-02, a `let`) -- load its slot.
-                // an unresolved name is a backend bug, surfaced as an error
-                // rather than a panic (the typechecker already proved the name
-                // resolves, so this path is defensive).
-                let slot = self.frame().slot_of(name).ok_or_else(|| QalaError::Type {
+                // a `let`/`for` binding (resolved through the scope stack,
+                // newest-first so a shadowing binding wins) or a function
+                // parameter -- load its slot. an unresolved name is a backend
+                // bug, surfaced as an error rather than a panic (the
+                // typechecker already proved the name resolves, so this path
+                // is defensive).
+                let slot = self.resolve_name(name).ok_or_else(|| QalaError::Type {
                     span: *span,
                     message: format!("arm64 backend: name `{name}` has no stack slot"),
                 })?;
