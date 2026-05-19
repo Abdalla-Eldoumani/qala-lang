@@ -299,17 +299,18 @@ impl Arm64Backend {
         Ok(())
     }
 
-    /// emit a call to a user function: AAPCS64 argument passing and a `bl`,
-    /// the result left in `x0`.
+    /// emit a call expression: the `print` / `println` output built-ins lower
+    /// to a `printf` call, a user function lowers to AAPCS64 argument passing
+    /// and a `bl`. either way the (possibly discarded) result is left in `x0`.
     ///
     /// rejects, with a clean [`QalaError`], a call the integer core does not
     /// support: a computed callee (one that is not a plain identifier), a
-    /// callee that resolves to a stdlib function rather than a user-declared
-    /// one (the stdlib and `printf` output arrive in Phase 13), and a call
-    /// with more than eight arguments (a stack-passed argument is a Phase 13+
-    /// extension -- a well-typed program cannot reach this since the callee
-    /// has at most eight parameters, but the guard is defensive so a `bl` is
-    /// never emitted with a wrong argument count).
+    /// callee that resolves to a stdlib function other than `print` /
+    /// `println` (the higher-order stdlib is deferred beyond v2), and a call
+    /// with more than eight arguments (a stack-passed argument is out of
+    /// scope -- a well-typed program cannot reach this since the callee has at
+    /// most eight parameters, but the guard is defensive so a `bl` is never
+    /// emitted with a wrong argument count).
     fn compile_call(
         &mut self,
         callee: &TypedExpr,
@@ -329,9 +330,15 @@ impl Arm64Backend {
                 });
             }
         };
-        // the name must be a user-declared function. a name not in `fn_names`
-        // resolves to a stdlib function (`print`, `println`, `sqrt`, `len`,
-        // ...) -- the stdlib is Phase 13, so reject it cleanly here.
+        // `print` / `println` are the output built-ins: route them to the
+        // interpolation-to-printf lowering rather than treating them as a
+        // user-function `bl`.
+        if name == "print" || name == "println" {
+            return self.compile_print_call(name, args, span);
+        }
+        // every other name that is not a user-declared function resolves to a
+        // higher-order stdlib built-in (`map`, `filter`, `reduce`, `sqrt`,
+        // ...) -- all deferred beyond v2's integer slice, so reject it cleanly.
         if !self.fn_names.contains(name) {
             return Err(QalaError::Type {
                 span,
