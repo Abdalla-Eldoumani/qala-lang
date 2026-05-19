@@ -737,7 +737,7 @@ mod tests {
         // a float literal node round-trips through clone -- this is why the
         // node enums are PartialEq but not Eq.
         let f = Expr::Float {
-            value: 3.14,
+            value: 1.5,
             span: span(5),
         };
         assert_eq!(f.clone(), f);
