@@ -10,11 +10,12 @@
 //!
 //! this module emits, for `i64` and `bool`: arithmetic (`+ - * / %`), the six
 //! comparisons, the short-circuit `&&` / `||`, the unary `!` and `-`,
-//! parameter loads, and a function's prologue / body / epilogue following
-//! AAPCS64. control flow (`if` / `while` / `for`) and `let` bindings arrive in
-//! plan 12-02; calls arrive in plan 12-03. every construct outside the integer
-//! core -- a float, a string, a struct literal, a method, a `>8`-parameter
-//! function -- returns a [`QalaError`], never a panic, never a `todo!()`.
+//! parameter loads, `let` bindings in stack slots, control flow (`if` /
+//! `while` / `for` over a range), and a function's prologue / body / epilogue
+//! following AAPCS64. calls arrive in plan 12-03. every construct outside the
+//! integer core -- a float, a string, a struct literal, a method, a
+//! `>8`-parameter function, a `defer` -- returns a [`QalaError`], never a
+//! panic, never a `todo!()`.
 //!
 //! ## the dialect
 //!
@@ -29,24 +30,26 @@
 //! ## module layout
 //!
 //! `emit.rs` builds the assembly text; `frame.rs` plans each function's stack
-//! frame; `labels.rs` generates unique branch labels; `expr.rs` is a second
-//! `impl Arm64Backend` block holding the expression codegen. plan 12-02 adds
-//! `stmt.rs` for the full statement and control-flow codegen.
+//! frame; `labels.rs` generates unique branch labels; `expr.rs` and `stmt.rs`
+//! are further `impl Arm64Backend` blocks holding the expression codegen and
+//! the statement / control-flow codegen.
 
 mod emit;
 mod expr;
 mod frame;
 mod labels;
+mod stmt;
 
 use crate::errors::QalaError;
 use crate::span::LineIndex;
-use crate::typed_ast::{TypedAst, TypedBlock, TypedFnDecl, TypedItem, TypedStmt};
+use crate::typed_ast::{TypedAst, TypedFnDecl, TypedItem};
 use crate::types::QalaType;
 use std::collections::HashSet;
 
 use emit::Asm;
 use frame::FrameLayout;
 use labels::LabelGen;
+use stmt::LoopLabels;
 
 /// lower a typed program to AArch64 assembly text in the CPSC 355 dialect.
 ///
@@ -92,6 +95,21 @@ struct Arm64Backend {
     /// the name of the function currently being compiled, or `None` between
     /// functions. a `return` branches to `.L<current_fn>_epilogue`.
     current_fn: Option<String>,
+    /// the binding-scope stack: one frame per open block, each a list of
+    /// `(name, slot)` pairs for the `let` / `for` bindings declared in that
+    /// block. `compile_block` pushes a frame on entry and pops it on exit;
+    /// `resolve_name` searches it top-down so a shadowing binding wins. empty
+    /// between functions.
+    scopes: Vec<Vec<(String, i64)>>,
+    /// the active-loop stack: one [`LoopLabels`] record per enclosing `while`
+    /// or `for`. `break` / `continue` read the innermost record. empty outside
+    /// any loop.
+    loops: Vec<LoopLabels>,
+    /// the body binding-occurrence cursor. `plan_frame` assigned binding slots
+    /// in a fixed walk order; this counts how many `let` / `for` bindings the
+    /// statement walk has consumed, so the next one reads the right slot.
+    /// reset to 0 at the start of each function.
+    binding_cursor: usize,
     /// every user-declared function name, pre-scanned before the compile walk.
     /// plan 12-03 consults this to resolve a call target; this plan records it
     /// for that forward reference.
@@ -117,6 +135,9 @@ impl Arm64Backend {
             labels: LabelGen::new(),
             frame: None,
             current_fn: None,
+            scopes: Vec::new(),
+            loops: Vec::new(),
+            binding_cursor: 0,
             fn_names: HashSet::new(),
             errors: Vec::new(),
             src: src.to_string(),
@@ -181,6 +202,13 @@ impl Arm64Backend {
         // plan the frame; it stays the current frame for the whole body walk.
         self.frame = Some(FrameLayout::plan_frame(decl));
         self.current_fn = Some(decl.name.clone());
+        // reset the per-function statement-walk state: the binding cursor
+        // counts from 0 for each function, and the scope / loop stacks start
+        // empty (a previous function always balances them, but reset to be
+        // robust against an error-path early return).
+        self.binding_cursor = 0;
+        self.scopes.clear();
+        self.loops.clear();
 
         // a blank separator line before the function, for readability.
         self.asm.emit_line("");
@@ -282,79 +310,9 @@ impl Arm64Backend {
         Ok(())
     }
 
-    /// walk a block: every statement, then the trailing value expression.
-    ///
-    /// THIS PLAN's minimal version -- it emits the statements and the trailing
-    /// value with no scope handling. plan 12-02 replaces it with the full,
-    /// scope-aware `compile_block` in `stmt.rs` (a name-to-slot scope stack for
-    /// `let` bindings and shadowing).
-    fn compile_block(&mut self, block: &TypedBlock) -> Result<(), QalaError> {
-        for stmt in &block.stmts {
-            self.compile_stmt(stmt)?;
-        }
-        if let Some(value) = &block.value {
-            // the block's trailing value -- its result lands in x0.
-            self.compile_expr(value)?;
-        }
-        Ok(())
-    }
-
-    /// compile one statement.
-    ///
-    /// THIS PLAN's minimal version handles only `Expr` and `Return`. `Let`,
-    /// `If`, `While`, `For`, `Break`, and `Continue` return a clean
-    /// [`QalaError`] -- plan 12-02 replaces those arms with real codegen in
-    /// `stmt.rs`. `Defer` stays a permanent rejection (deferred beyond v2).
-    fn compile_stmt(&mut self, stmt: &TypedStmt) -> Result<(), QalaError> {
-        match stmt {
-            // a statement-position expression: its value is discarded, but the
-            // instructions still run (an effect, a call in a later plan).
-            TypedStmt::Expr { expr, .. } => self.compile_expr(expr),
-            // `return` or `return expr`: evaluate the value into x0, then jump
-            // to the function's single epilogue block.
-            TypedStmt::Return { value, span } => {
-                if let Some(e) = value {
-                    self.compile_expr(e)?;
-                }
-                let fn_name = self.current_fn.clone().ok_or_else(|| QalaError::Type {
-                    span: *span,
-                    message: "arm64 backend: return outside a function".to_string(),
-                })?;
-                let label = self.epilogue_label(&fn_name);
-                self.asm.emit_insn(&format!("b       {label}"));
-                Ok(())
-            }
-            // statements the later plans own.
-            TypedStmt::Let { span, .. } => Err(self.unsupported_stmt(*span, "let bindings")),
-            TypedStmt::If { span, .. } => {
-                Err(self.unsupported_stmt(*span, "if statements"))
-            }
-            TypedStmt::While { span, .. } => {
-                Err(self.unsupported_stmt(*span, "while loops"))
-            }
-            TypedStmt::For { span, .. } => Err(self.unsupported_stmt(*span, "for loops")),
-            TypedStmt::Break { span } => {
-                Err(self.unsupported_stmt(*span, "the break statement"))
-            }
-            TypedStmt::Continue { span } => {
-                Err(self.unsupported_stmt(*span, "the continue statement"))
-            }
-            TypedStmt::Defer { span, .. } => {
-                Err(self.unsupported_stmt(*span, "the defer statement"))
-            }
-        }
-    }
-
-    /// build the rejection error for a statement construct the integer core
-    /// does not yet emit.
-    fn unsupported_stmt(&self, span: crate::span::Span, what: &str) -> QalaError {
-        QalaError::Type {
-            span,
-            message: format!("the arm64 backend does not yet support {what}"),
-        }
-    }
-
     /// the local epilogue label for a named function: `.L<name>_epilogue`.
+    ///
+    /// `compile_fn` emits the label; `stmt.rs`'s `Return` arm branches to it.
     fn epilogue_label(&self, fn_name: &str) -> String {
         format!(".L{fn_name}_epilogue")
     }
@@ -537,11 +495,13 @@ mod tests {
 
     #[test]
     fn an_unsupported_statement_is_rejected_cleanly() {
-        // a `let` is plan 12-02's job; this plan rejects it with a clean error.
-        let src = "fn main() { let x = 1 }";
+        // `let` / `if` / `while` / `for` are now supported; `defer` stays a
+        // permanent rejection -- the backend rejects it with a clean error,
+        // never a panic and never bad assembly.
+        let src = "fn f() { let x = 1\ndefer x }";
         let typed = typecheck(src);
-        let err = compile_arm64(&typed, src).expect_err("a let must be rejected here");
-        assert!(err[0].message().contains("let"), "{:?}", err);
+        let err = compile_arm64(&typed, src).expect_err("a defer must be rejected");
+        assert!(err[0].message().contains("defer"), "{:?}", err);
     }
 
     #[test]
