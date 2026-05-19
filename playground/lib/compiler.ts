@@ -9,6 +9,7 @@
 // boundary the root CLAUDE.md sanctions: the generated qala_compiler.d.ts
 // types every Qala method return as any, so the wrapper narrows them once.
 import type {
+  Arm64Result,
   CompileResult,
   ReplResult,
   RunResult,
@@ -26,6 +27,7 @@ type QalaClass = new () => QalaInstance;
 
 interface QalaInstance {
   compile(source: string): unknown;
+  compile_arm64(source: string): unknown;
   run(): unknown;
   step(): unknown;
   get_state(): unknown;
@@ -37,6 +39,10 @@ interface QalaInstance {
 
 export interface QalaSession {
   compile(source: string): CompileResult;
+  // compile the current source through the ARM64 backend. a front-end
+  // error or an unsupported-construct rejection comes back as an
+  // ok-false Arm64Result, never a throw -- the same contract as compile.
+  compileArm64(source: string): Arm64Result;
   run(): RunResult;
   step(): StepResult;
   getState(): VmState;
@@ -76,6 +82,7 @@ export async function loadQala(): Promise<QalaSession> {
   // into the interface that mirrors the Rust serde struct.
   return {
     compile: (source) => inner.compile(source) as CompileResult,
+    compileArm64: (source) => inner.compile_arm64(source) as Arm64Result,
     run: () => inner.run() as RunResult,
     step: () => inner.step() as StepResult,
     getState: () => inner.get_state() as VmState,
