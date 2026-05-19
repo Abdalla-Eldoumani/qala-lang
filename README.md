@@ -23,15 +23,27 @@ lifetime annotations. Just clear annotations (`is pure`, `is io`),
 straightforward resource management (`defer`), and a type system that catches
 mistakes without getting in your way.
 
-## try it
+## install
 
 ```bash
-cd compiler && cargo test
-wasm-pack build --target web --out-dir ../playground/lib/wasm
-cd ../playground && npm install && npm run dev
+cargo install qala-cli
+qala --help
 ```
 
-Open http://localhost:3000.
+Or download a prebuilt `qala` binary for Linux, macOS, or Windows from the
+[releases page](https://github.com/Abdalla-Eldoumani/qala-lang/releases).
+
+## build from source
+
+Run from the workspace root.
+
+```bash
+cargo test --workspace
+wasm-pack build crates/qala-compiler --target web --out-dir ../../playground/lib/wasm
+cd playground && npm install && npm run dev
+```
+
+Open http://localhost:3000 for the playground.
 
 ## a taste of Qala
 
@@ -88,6 +100,16 @@ surprises.
 
 **String interpolation.** `{expr}` inside strings evaluates and converts.
 
+**A `qala` CLI.** A small command-line front end with `run`, `check`, `build`,
+and an interactive `repl`. Diagnostics render through the compiler's rich
+diagnostic path; program output goes to stdout, errors to stderr.
+
+**ARM64 backend.** A second codegen target emits AArch64 assembly text in the
+CPSC 355 hosted-Linux dialect: `qala build --target arm64 program.qala`. The
+integer core is verified end to end under QEMU. The output is meant to be
+pasted into the [AArch64 playground](https://aarch64-playground.vercel.app) to
+step through execution one instruction at a time.
+
 ## error messages
 
 Qala's compiler produces rich diagnostics with source context, underlines, and
@@ -116,13 +138,15 @@ mistakes without blocking compilation.
 
 ## how it works
 
-The compiler is a single Rust crate with a hand-written lexer, recursive descent
-parser with Pratt expression parsing, a single-pass type checker with effect
-inference, and a bytecode compiler with constant folding and dead code
-elimination. Emitted bytecode goes through a peephole optimizer before
-execution. The VM uses NaN-boxing for compact stack values and carries source
-maps for precise runtime error reporting. The web playground loads the entire
-pipeline as WebAssembly.
+The repository is a Cargo workspace with two crates. `crates/qala-compiler` is
+the compiler and bytecode VM: a hand-written lexer, a recursive-descent parser
+with Pratt expression parsing, a single-pass type checker with effect
+inference, and a bytecode compiler with constant folding, dead-code
+elimination, and a peephole pass. The VM uses NaN-boxing for compact stack
+values and carries source maps for precise runtime error reporting. The same
+typed AST also feeds a second codegen target that emits AArch64 assembly text.
+`crates/qala-cli` is the `qala` binary. The web playground loads the compiler
+as a WebAssembly module.
 
 ## license
 
