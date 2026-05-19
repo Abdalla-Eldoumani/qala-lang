@@ -35,12 +35,15 @@ const securityHeaders = [
     key: "Content-Security-Policy",
     value: [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'",
-      "style-src 'self' 'unsafe-inline'",
+      // @monaco-editor/react loads the editor runtime, workers, and AMD
+      // language packs from cdn.jsdelivr.net. without this allowance the
+      // editor sits on its "Loading..." placeholder forever.
+      "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net",
+      "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",
       "font-src 'self' data:",
       "img-src 'self' data:",
-      "connect-src 'self'",
-      "worker-src 'self' blob:",
+      "connect-src 'self' https://cdn.jsdelivr.net",
+      "worker-src 'self' blob: https://cdn.jsdelivr.net",
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",
