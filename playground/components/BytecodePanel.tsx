@@ -357,7 +357,16 @@ export default function BytecodePanel({
     { id: "arm64", label: "ARM64" },
   ];
 
+  // a ref per tab button so arrow-key navigation moves focus, not just
+  // selection: the WAI-ARIA tablist pattern keeps the focus ring on the
+  // active tab.
+  const tabRefs = useRef<Record<OutputTab, HTMLButtonElement | null>>({
+    bytecode: null,
+    arm64: null,
+  });
+
   // left/right arrow keys move between tabs, the native tablist pattern.
+  // selection and focus move together so the focus ring tracks the tab.
   const handleTabKeyDown = (event: React.KeyboardEvent) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
@@ -365,6 +374,7 @@ export default function BytecodePanel({
     const delta = event.key === "ArrowRight" ? 1 : -1;
     const next = (index + delta + tabs.length) % tabs.length;
     setActiveTab(tabs[next].id);
+    tabRefs.current[tabs[next].id]?.focus();
   };
 
   return (
@@ -381,6 +391,9 @@ export default function BytecodePanel({
           {tabs.map((tab) => (
             <button
               key={tab.id}
+              ref={(el) => {
+                tabRefs.current[tab.id] = el;
+              }}
               type="button"
               role="tab"
               aria-selected={activeTab === tab.id}
