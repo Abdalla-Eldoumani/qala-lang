@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { loadQala, type QalaSession } from "./compiler";
 import type {
+  Arm64Result,
   CompileResult,
   ReplResult,
   RunResult,
@@ -89,6 +90,10 @@ export interface UseQala {
   lastCompile: CompileResult | null;
   lastRun: RunResult | StepResult | null;
   lastState: VmState | null;
+  // the ARM64 backend's last output, refreshed in the same compile() call
+  // as lastCompile -- so the ARM64 view and the bytecode view always
+  // reflect the same source. null before the first compile.
+  lastArm64: Arm64Result | null;
   version: number;
 }
 
@@ -101,6 +106,7 @@ export function useQala(): UseQala {
   const [lastCompile, setLastCompile] = useState<CompileResult | null>(null);
   const [lastRun, setLastRun] = useState<RunResult | StepResult | null>(null);
   const [lastState, setLastState] = useState<VmState | null>(null);
+  const [lastArm64, setLastArm64] = useState<Arm64Result | null>(null);
   const [version, setVersion] = useState(0);
   // dirty starts true: at mount no compile has happened, so the source --
   // the "" initial, the restored text, or the first-visit preload, all
@@ -314,6 +320,9 @@ export function useQala(): UseQala {
     if (!s) return false;
     const result = s.compile(source);
     setLastCompile(result);
+    // refresh the ARM64 snapshot in the same tick, against the same
+    // source, so the ARM64 tab and the bytecode tab never disagree.
+    setLastArm64(s.compileArm64(source));
     setLastState(s.getState());
     setVersion((v) => v + 1);
     // a successful compile clears dirty -- the program now matches the
@@ -358,9 +367,14 @@ export function useQala(): UseQala {
     s.reset();
     if (lastCompile?.ok) {
       setLastCompile(s.compile(source));
+      // keep the two tabs in lockstep across a reset -- the assembly is
+      // static compiler output, unaffected by a VM reset, but a recompile
+      // here keeps the ARM64 snapshot consistent with lastCompile.
+      setLastArm64(s.compileArm64(source));
       setLastState(s.getState());
     } else {
       setLastCompile(null);
+      setLastArm64(null);
       setLastState(null);
     }
     setLastRun(null);
@@ -406,6 +420,7 @@ export function useQala(): UseQala {
     lastCompile,
     lastRun,
     lastState,
+    lastArm64,
     version,
   };
 }
