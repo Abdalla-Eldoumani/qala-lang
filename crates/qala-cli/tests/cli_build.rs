@@ -25,9 +25,40 @@ fn build_writes_a_bytecode_artifact() {
 }
 
 #[test]
-fn build_target_arm64_reports_not_yet_available_and_exits_nonzero() {
+fn build_target_arm64_writes_an_assembly_file() {
+    // `build --target arm64` on a pure-integer program compiles through the
+    // ARM64 backend and writes a .s assembly artifact, exit 0. the program is
+    // pure integer code -- a `println` would route through an unsupported
+    // stdlib call and the backend would (correctly) reject it.
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("prog.qala");
+    std::fs::write(&src_path, "fn main() {\n    let x = 2 + 3\n}\n").unwrap();
+    let out_path = dir.path().join("prog.s");
+
+    Command::cargo_bin("qala")
+        .unwrap()
+        .args(["build"])
+        .arg(&src_path)
+        .args(["--target", "arm64"])
+        .arg("-o")
+        .arg(&out_path)
+        .assert()
+        .success();
+
+    // the artifact exists and is the non-empty emitted assembly.
+    let assembly = std::fs::read_to_string(&out_path).unwrap();
+    assert!(!assembly.is_empty());
+    assert!(assembly.contains(".text")); // the GAS section header
+    assert!(assembly.contains("main:")); // the function label
+}
+
+#[test]
+fn build_target_arm64_rejects_an_unsupported_construct() {
+    // `build --target arm64` on a program using an unsupported construct -- a
+    // float -- renders a diagnostic to stderr and exits non-zero. the clean
+    // rejection path through the CLI: never a panic, never bad assembly.
     let mut src = tempfile::Builder::new().suffix(".qala").tempfile().unwrap();
-    write!(src, "fn main() is io {{\n  println(\"hi\")\n}}").unwrap();
+    write!(src, "fn main() {{\n    let x = 1.5\n}}").unwrap();
 
     Command::cargo_bin("qala")
         .unwrap()
@@ -36,5 +67,5 @@ fn build_target_arm64_reports_not_yet_available_and_exits_nonzero() {
         .args(["--target", "arm64"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("arm64 backend is not yet available"));
+        .stderr(predicate::str::contains("does not yet support"));
 }
