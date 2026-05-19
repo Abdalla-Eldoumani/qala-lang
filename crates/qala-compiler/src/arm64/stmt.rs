@@ -83,11 +83,11 @@ impl Arm64Backend {
                 return Err(e);
             }
         }
-        if let Some(value) = &block.value {
-            if let Err(e) = self.compile_expr(value) {
-                self.scopes.pop();
-                return Err(e);
-            }
+        if let Some(value) = &block.value
+            && let Err(e) = self.compile_expr(value)
+        {
+            self.scopes.pop();
+            return Err(e);
         }
         self.scopes.pop();
         Ok(())
