@@ -2,8 +2,9 @@
 //!
 //! [`FrameLayout`] holds, for one function, the map from a parameter name to
 //! its `[fp, N]` stack slot, an indexed list of slots for the body's `let`
-//! bindings and `for`-loop slots, the count of scratch spill slots the
-//! expression codegen needs, and the derived `alloc` / `dealloc` frame sizes.
+//! bindings and `for`-loop slots, a run of argument scratch slots for the
+//! body's calls, the count of scratch spill slots the expression codegen
+//! needs, and the derived `alloc` / `dealloc` frame sizes.
 //! [`FrameLayout::plan_frame`] builds it from a [`TypedFnDecl`] in one pass
 //! before the prologue is emitted.
 //!
@@ -25,6 +26,20 @@
 //! including a shadowing `let` and a `for`-loop variable, gets its own
 //! distinct slot.
 //!
+//! ## argument scratch slots: max args.len() over all calls in the function
+//!
+//! a `TypedExpr::Call` evaluates each argument into `x0` one at a time, then
+//! loads `x0`-`x{n-1}` from somewhere stable for the `bl` -- because every
+//! `compile_expr` lands its result in `x0`, evaluating arg 1 would clobber
+//! arg 0. the stable place is a run of ARGUMENT SCRATCH SLOTS: arg `i` is
+//! `str`-ed to argument slot `i`, and after all args are evaluated the slots
+//! are `ldr`-ed back into `x0`-`x{n-1}`. [`plan_frame`] reserves
+//! `max args.len()` slots -- the argument count of the call WITH THE MOST
+//! ARGUMENTS in the function -- and every call site REUSES that one run (each
+//! call finishes its `str`s and its `bl` before the next call touches the
+//! slots). the slots sit immediately past the body's binding slots;
+//! [`FrameLayout::arg_slot`] indexes them.
+//!
 //! ## frame geometry: positive offsets from `fp`
 //!
 //! the prologue is `stp fp, lr, [sp, alloc]!` then `mov fp, sp`, so `fp` ends
@@ -34,7 +49,9 @@
 //! `i` is at `[fp, 16 + 8*i]`. this matches the CPSC 355 reference
 //! `Week 8/example1_scores.asm`, which accesses its locals as
 //! `[fp, score1_s]` with `score1_s = 16`. (a negative `[fp, -N]` offset would
-//! address *below* `sp`, outside the frame -- a stack-corruption bug.)
+//! address *below* `sp`, outside the frame -- a stack-corruption bug.) the
+//! slot regions in `[fp, N]` order: saved pair, parameters, binding slots,
+//! argument scratch slots, expression scratch slots.
 //!
 //! ## the load-bearing detail: 16-byte stack alignment
 //!
@@ -93,13 +110,20 @@ pub(crate) struct FrameLayout {
     /// lockstep and indexes this by occurrence number, which survives a
     /// shadowing `let` that a name-keyed map could not.
     binding_slots: Vec<i64>,
+    /// the argument scratch slots for the body's calls -- `max args.len()`
+    /// slots, the argument count of the largest call in the function. every
+    /// call site reuses this one run: argument `i` of any call is `str`-ed to
+    /// `arg_slots[i]`, then `ldr`-ed back into `x{i}` before the `bl`. the
+    /// slots sit immediately past the binding slots. read by [`arg_slot`].
+    arg_slots: Vec<i64>,
     /// the number of scratch spill slots reserved for the expression codegen's
     /// nested-binary-operator spill discipline. their offsets sit immediately
-    /// past the named and binding slots.
+    /// past the named, binding, and argument slots.
     #[allow(dead_code)]
     scratch_count: i64,
     /// the byte offset of the first scratch spill slot: `[fp, 16]` past the
-    /// saved pair, plus the named slots, is where the scratch stack begins.
+    /// saved pair, plus the named, binding, and argument slots, is where the
+    /// scratch stack begins.
     scratch_base: i64,
     /// how many scratch slots are currently claimed. the expression codegen
     /// claims on entering a binary op and releases on leaving; this never
@@ -119,14 +143,17 @@ impl FrameLayout {
     /// pair occupies `[fp, 0]` and `[fp, 8]`; then the parameters at
     /// `[fp, 16 + 8*i]`; then the body's binding slots (every `let` and, per
     /// `for`, the loop variable and a dedicated `end`-bound slot) in walk
-    /// order; then the scratch spill slots.
+    /// order; then the argument scratch slots (`max args.len()` over the
+    /// body's calls, reused per call site); then the expression scratch slots.
     ///
-    /// the binding slots are assigned by [`collect_binding_slots`], a recursive
+    /// the binding slots are assigned by [`count_binding_slots`], a recursive
     /// walk over `decl.body` that descends into nested `if`/`while`/`for`
     /// blocks. no slot is reused -- a shadowing `let` and every `for` variable
-    /// get their own distinct slot. the scratch reservation is derived from a
-    /// pre-walk: [`max_spill_depth`] returns the maximum number of
-    /// binary-operator LHS values that are simultaneously spilled.
+    /// get their own distinct slot. the argument-slot count is
+    /// [`max_call_args`]: the most arguments any single call in the body
+    /// passes. the scratch reservation is derived from a pre-walk:
+    /// [`max_spill_depth`] returns the maximum number of binary-operator LHS
+    /// values that are simultaneously spilled.
     pub(crate) fn plan_frame(decl: &TypedFnDecl) -> FrameLayout {
         let mut slots = HashMap::new();
         // parameter i lives at [fp, 16 + 8*i]: the first param at [fp, 16],
@@ -145,14 +172,22 @@ impl FrameLayout {
             .map(|k| binding_base + SLOT_SIZE * k)
             .collect();
         let named_slot_count = param_count + binding_count;
-        // the scratch spill slots sit immediately past the named + binding slots.
-        let scratch_base = FP_LR_PAIR + SLOT_SIZE * named_slot_count;
+        // the argument scratch slots begin immediately past the binding slots:
+        // `max args.len()` slots, the largest call in the function. every call
+        // site reuses this one run -- a call finishes its `str`s and `bl`
+        // before the next call's `str`s, so the slots never alias live values.
+        let arg_base = FP_LR_PAIR + SLOT_SIZE * named_slot_count;
+        let arg_count = max_call_args(&decl.body);
+        let arg_slots: Vec<i64> = (0..arg_count).map(|k| arg_base + SLOT_SIZE * k).collect();
+        // the expression scratch slots sit immediately past the argument slots.
+        let scratch_base = FP_LR_PAIR + SLOT_SIZE * (named_slot_count + arg_count);
         let scratch_count = max_spill_depth(&decl.body);
-        let locals = SLOT_SIZE * (named_slot_count + scratch_count);
+        let locals = SLOT_SIZE * (named_slot_count + arg_count + scratch_count);
         let alloc = compute_alloc(locals);
         FrameLayout {
             slots,
             binding_slots,
+            arg_slots,
             scratch_count,
             scratch_base,
             scratch_in_use: 0,
@@ -180,6 +215,21 @@ impl FrameLayout {
     /// turns the `None` into a `QalaError` rather than panicking.
     pub(crate) fn binding_slot(&self, index: usize) -> Option<i64> {
         self.binding_slots.get(index).copied()
+    }
+
+    /// the stack slot of argument scratch slot `index` -- where argument
+    /// `index` of a call is `str`-ed before the `bl` load.
+    ///
+    /// the run is sized to the largest call in the function by [`plan_frame`];
+    /// every call site reuses it. an `index` past the run means the Call arm
+    /// asked for more argument slots than `plan_frame` reserved -- a backend
+    /// bug, surfaced as a [`QalaError`] by the caller rather than a panic.
+    ///
+    /// the `TypedExpr::Call` codegen in `expr.rs` is the consumer; the
+    /// inline tests exercise it directly until that arm lands.
+    #[allow(dead_code)]
+    pub(crate) fn arg_slot(&self, index: usize) -> Option<i64> {
+        self.arg_slots.get(index).copied()
     }
 
     /// claim the next scratch spill slot, returning its `[fp, N]` offset.
@@ -296,6 +346,92 @@ fn else_branch_binding_slots(branch: &TypedElseBranch) -> i64 {
     match branch {
         TypedElseBranch::Block(b) => count_binding_slots(b),
         TypedElseBranch::If(stmt) => stmt_binding_slots(stmt),
+    }
+}
+
+/// the most arguments any single call in `block` passes -- the size of the
+/// argument scratch run [`plan_frame`] reserves.
+///
+/// the Call codegen evaluates each argument into a stack slot before the `bl`;
+/// the run must be wide enough for the largest call. every call site reuses
+/// the same run (a call completes its argument `str`s and its `bl` before any
+/// other call begins), so the reservation is the MAXIMUM, not the sum.
+fn max_call_args(block: &TypedBlock) -> i64 {
+    let mut max = 0;
+    for stmt in &block.stmts {
+        max = max.max(stmt_call_args(stmt));
+    }
+    if let Some(value) = &block.value {
+        max = max.max(expr_call_args(value));
+    }
+    max
+}
+
+/// the most arguments any single call within one statement passes (see
+/// [`max_call_args`]).
+fn stmt_call_args(stmt: &TypedStmt) -> i64 {
+    match stmt {
+        TypedStmt::Expr { expr, .. } => expr_call_args(expr),
+        TypedStmt::Return { value, .. } => {
+            value.as_ref().map(expr_call_args).unwrap_or(0)
+        }
+        TypedStmt::Let { init, .. } => expr_call_args(init),
+        TypedStmt::If { cond, then_block, else_branch, .. } => {
+            let mut d = expr_call_args(cond).max(max_call_args(then_block));
+            if let Some(branch) = else_branch {
+                d = d.max(else_branch_call_args(branch));
+            }
+            d
+        }
+        TypedStmt::While { cond, body, .. } => {
+            expr_call_args(cond).max(max_call_args(body))
+        }
+        TypedStmt::For { iter, body, .. } => {
+            expr_call_args(iter).max(max_call_args(body))
+        }
+        TypedStmt::Defer { expr, .. } => expr_call_args(expr),
+        TypedStmt::Break { .. } | TypedStmt::Continue { .. } => 0,
+    }
+}
+
+/// the most arguments any single call within an `else` branch passes.
+fn else_branch_call_args(branch: &TypedElseBranch) -> i64 {
+    match branch {
+        TypedElseBranch::Block(b) => max_call_args(b),
+        TypedElseBranch::If(stmt) => stmt_call_args(stmt),
+    }
+}
+
+/// the most arguments any single call within `expr` passes.
+///
+/// for a `Call` node the count is its own `args.len()` -- but a nested call
+/// inside one of those arguments can pass MORE, so the maximum is taken over
+/// this call's arity and every argument subtree (and the callee subtree). a
+/// `Range`'s bounds are walked because a `for`'s range bound may contain a
+/// call.
+fn expr_call_args(expr: &TypedExpr) -> i64 {
+    match expr {
+        TypedExpr::Call { callee, args, .. } => {
+            let mut max = args.len() as i64;
+            max = max.max(expr_call_args(callee));
+            for arg in args {
+                max = max.max(expr_call_args(arg));
+            }
+            max
+        }
+        TypedExpr::Binary { lhs, rhs, .. } => {
+            expr_call_args(lhs).max(expr_call_args(rhs))
+        }
+        TypedExpr::Unary { operand, .. } => expr_call_args(operand),
+        TypedExpr::Paren { inner, .. } => expr_call_args(inner),
+        TypedExpr::Block { block, .. } => max_call_args(block),
+        TypedExpr::Range { start, end, .. } => {
+            let s = start.as_deref().map(expr_call_args).unwrap_or(0);
+            let e = end.as_deref().map(expr_call_args).unwrap_or(0);
+            s.max(e)
+        }
+        // a leaf or an unsupported construct holds no call.
+        _ => 0,
     }
 }
 
@@ -781,5 +917,113 @@ mod tests {
         assert_eq!(layout.binding_slot(2), Some(32), "the let inside the body");
         // 3 binding slots = 24 bytes -> alloc = -(16 + 24) & -16 = -48.
         assert_eq!(layout.alloc, -48, "for (2 slots) + nested let -> alloc -48");
+    }
+
+    #[test]
+    fn a_function_with_no_calls_reserves_no_argument_slots() {
+        // `fn f(a: i64) -> i64 { a }` makes no call -- arg_slot(0) is None and
+        // the frame holds only the one parameter slot.
+        let decl = fn_from_source("fn f(a: i64) -> i64 { a }");
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.arg_slot(0), None, "no call -> no argument slots");
+        // 1 param + 0 arg + 0 scratch = 8 bytes -> alloc = -(16 + 8) & -16 = -32.
+        assert_eq!(layout.alloc, -32, "1 param, no call -> alloc -32");
+    }
+
+    #[test]
+    fn a_two_param_one_let_function_with_a_three_arg_call_has_concrete_slots() {
+        // the plan-checker hardening case: a function with 2 params, 1 `let`,
+        // and a 3-argument call. binding slots: 2 params at [fp, 16]/[fp, 24],
+        // the `let` at [fp, 32]. argument slots: 3, immediately past the `let`
+        // -- [fp, 40], [fp, 48], [fp, 56]. each call argument is a bare ident
+        // or literal, so the call needs zero expression scratch. locals =
+        // 8 * (3 named + 3 arg + 0 scratch) = 48 -> alloc = -(16 + 48) & -16
+        // = -64. concrete values, independent of any snapshot fixture.
+        let decl = fn_from_source(
+            "fn add3(a: i64, b: i64, c: i64) -> i64 { a }\n\
+             fn caller(x: i64, y: i64) -> i64 { let r = add3(x, y, 1)\nr }",
+        );
+        // fn_from_source returns the FIRST function; re-find `caller`.
+        let src = "fn add3(a: i64, b: i64, c: i64) -> i64 { a }\n\
+                   fn caller(x: i64, y: i64) -> i64 { let r = add3(x, y, 1)\nr }";
+        let tokens = crate::lexer::Lexer::tokenize(src).expect("lex failed");
+        let ast = crate::parser::Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = crate::typechecker::check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        let caller = typed
+            .iter()
+            .find_map(|item| match item {
+                crate::typed_ast::TypedItem::Fn(d) if d.name == "caller" => Some(d.clone()),
+                _ => None,
+            })
+            .expect("no caller function");
+        let _ = decl; // the first-function decl is unused; `caller` is the subject.
+        let layout = FrameLayout::plan_frame(&caller);
+        // 2 params + 1 let = 3 named slots at [fp, 16], [fp, 24], [fp, 32].
+        assert_eq!(layout.slot_of("x"), Some(16), "param x -> [fp, 16]");
+        assert_eq!(layout.slot_of("y"), Some(24), "param y -> [fp, 24]");
+        assert_eq!(layout.binding_slot(0), Some(32), "let r -> [fp, 32]");
+        // 3 argument slots immediately past the named slots.
+        assert_eq!(layout.arg_slot(0), Some(40), "arg slot 0 -> [fp, 40]");
+        assert_eq!(layout.arg_slot(1), Some(48), "arg slot 1 -> [fp, 48]");
+        assert_eq!(layout.arg_slot(2), Some(56), "arg slot 2 -> [fp, 56]");
+        assert_eq!(layout.arg_slot(3), None, "only three argument slots");
+        // 3 named + 3 arg + 0 scratch = 48 bytes -> alloc = -64.
+        assert_eq!(layout.alloc, -64, "2 params + 1 let + 3-arg call -> alloc -64");
+        assert_eq!(layout.prologue()[0], "stp     fp, lr, [sp, -64]!");
+        assert_eq!(layout.epilogue()[0], "ldp     fp, lr, [sp], 64");
+    }
+
+    #[test]
+    fn argument_slots_size_to_the_largest_call_not_the_sum() {
+        // a function with a 1-arg call and a 2-arg call reserves 2 argument
+        // slots -- the MAXIMUM, since the two calls reuse the run, not 1 + 2.
+        let src = "fn one(a: i64) -> i64 { a }\n\
+                   fn two(a: i64, b: i64) -> i64 { a }\n\
+                   fn f() { let p = one(1)\nlet q = two(2, 3) }";
+        let tokens = crate::lexer::Lexer::tokenize(src).expect("lex failed");
+        let ast = crate::parser::Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = crate::typechecker::check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        let f = typed
+            .iter()
+            .find_map(|item| match item {
+                crate::typed_ast::TypedItem::Fn(d) if d.name == "f" => Some(d.clone()),
+                _ => None,
+            })
+            .expect("no f function");
+        let layout = FrameLayout::plan_frame(&f);
+        // 2 binding slots ([fp, 16], [fp, 24]), then 2 argument slots
+        // ([fp, 32], [fp, 40]) -- the 2-arg call is the widest.
+        assert_eq!(layout.arg_slot(0), Some(32), "arg slot 0 past the two lets");
+        assert_eq!(layout.arg_slot(1), Some(40), "arg slot 1");
+        assert_eq!(layout.arg_slot(2), None, "the widest call passes two args");
+        // 2 lets + 2 arg = 32 bytes -> alloc = -(16 + 32) & -16 = -48.
+        assert_eq!(layout.alloc, -48, "two lets + a 2-arg call -> alloc -48");
+    }
+
+    #[test]
+    fn a_nested_call_argument_counts_the_inner_calls_arity() {
+        // `outer(inner(1, 2, 3))`: the outer call passes 1 argument, but the
+        // inner call inside that argument passes 3 -- max_call_args must see
+        // the inner arity through the argument subtree, so 3 slots are
+        // reserved, not 1.
+        let src = "fn inner(a: i64, b: i64, c: i64) -> i64 { a }\n\
+                   fn outer(x: i64) -> i64 { x }\n\
+                   fn f() { let r = outer(inner(1, 2, 3)) }";
+        let tokens = crate::lexer::Lexer::tokenize(src).expect("lex failed");
+        let ast = crate::parser::Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = crate::typechecker::check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        let f = typed
+            .iter()
+            .find_map(|item| match item {
+                crate::typed_ast::TypedItem::Fn(d) if d.name == "f" => Some(d.clone()),
+                _ => None,
+            })
+            .expect("no f function");
+        let layout = FrameLayout::plan_frame(&f);
+        assert_eq!(layout.arg_slot(2), Some(40), "the inner 3-arg call sizes the run");
+        assert_eq!(layout.arg_slot(3), None, "three argument slots, the inner call");
     }
 }
