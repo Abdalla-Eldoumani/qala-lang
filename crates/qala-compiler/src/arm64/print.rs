@@ -651,4 +651,88 @@ mod tests {
             "arm64 printf rejection diagnostic drifted from snapshot"
         );
     }
+
+    /// the `[fp, N]` byte offset referenced by an instruction line, or `None`
+    /// if the line has no `[fp, ...]` operand -- the same parser the `expr.rs`
+    /// frame-containment proof uses.
+    fn fp_offset(line: &str) -> Option<i64> {
+        let start = line.find("[fp, ")? + "[fp, ".len();
+        let rest = &line[start..];
+        let end = rest.find(']')?;
+        rest[..end].trim().parse().ok()
+    }
+
+    #[test]
+    fn a_printf_with_deep_holes_keeps_every_slot_inside_the_frame() {
+        // WR-02 regression. the printf frame-sizing path
+        // (`printf_call_spill_depth` / `emit_printf`) had no isolated
+        // frame-containment proof: the Phase 12 "scratch overflow past the
+        // frame" CRITICAL was caught only by the `expr.rs` containment test,
+        // and a regression dropping the `+ deepest` term -- so a hole that is
+        // a deep arithmetic expression or a multi-arg call under-reserves --
+        // would pass every snapshot-style printf test.
+        //
+        // this mirrors the `expr.rs` proof for the printf path: a `println`
+        // whose interpolation has a deep-arithmetic hole `(a+1)*(a+2)` AND a
+        // three-argument-call hole `three(a, a+1, a+2)` -- the two hole shapes
+        // that exercise the `deepest` term. read `main`'s `dealloc` from its
+        // epilogue `ldp fp, lr, [sp], N` and assert every `[fp, N]` the body
+        // stores or loads satisfies `0 <= N < dealloc` -- inside the frame
+        // `main` owns. fp == sp after `mov fp, sp`, so `[fp, dealloc]` and
+        // beyond is the caller's frame.
+        let asm = compile_ok(
+            "fn three(a: i64, b: i64, c: i64) -> i64 { a + b + c }\n\
+             fn main() is io {\n\
+             \x20   let a = 4\n\
+             \x20   println(\"{(a+1)*(a+2)} and {three(a, a+1, a+2)} and {a}\")\n\
+             }\n",
+        );
+        // the whole `main` function, label through epilogue, so the `ldp`
+        // line (which sits after the epilogue label) is included.
+        let main_fn: Vec<&str> = asm
+            .lines()
+            .skip_while(|l| l.trim() != "main:")
+            .take_while(|l| l.trim() != "ret" && !l.trim().is_empty())
+            .collect();
+        // the epilogue's `ldp fp, lr, [sp], N` carries the frame size N.
+        let dealloc: i64 = main_fn
+            .iter()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("ldp     fp, lr, [sp], ")
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .expect("missing the epilogue `ldp` line with the frame size");
+        // every fp-relative store/load must land strictly inside the frame.
+        for line in &main_fn {
+            if let Some(offset) = fp_offset(line) {
+                assert!(
+                    offset < dealloc,
+                    "`{}` writes [fp, {offset}] -- outside the {dealloc}-byte frame",
+                    line.trim()
+                );
+                assert!(offset >= 0, "`{}` has a negative fp offset", line.trim());
+            }
+        }
+        // the test is only meaningful if the printf body actually spilled the
+        // holes -- a deep arithmetic hole plus a 3-arg-call hole must produce
+        // several distinct spill slots.
+        let spill_slots: std::collections::BTreeSet<i64> = main_fn
+            .iter()
+            .filter(|l| l.contains("str     x0, [fp, "))
+            .filter_map(|l| fp_offset(l))
+            .collect();
+        assert!(
+            spill_slots.len() >= 3,
+            "the deep-hole printf must use several scratch slots: {main_fn:?}"
+        );
+        // the highest argument register the printf body loads must not exceed
+        // the hole count: three holes -> x1, x2, x3 and no higher.
+        for reg in 4..=7 {
+            assert!(
+                !asm.contains(&format!("ldr     x{reg}, [fp, ")),
+                "a three-hole printf must not load x{reg}: {asm}"
+            );
+        }
+    }
 }
