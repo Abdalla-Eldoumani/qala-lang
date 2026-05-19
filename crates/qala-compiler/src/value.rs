@@ -587,17 +587,20 @@ mod tests {
         // a computed NaN never decodes as a tagged value: the five reserved
         // tag prefixes are pairwise distinct and all sit strictly above the
         // canonical-NaN prefix QNAN (0x7FF8).
+        // the canonical NaN's top 16 bits are below the tagged range. this
+        // claim does not depend on the loop variable, so it is a single
+        // compile-time check outside the loop.
+        const _: () = assert!(
+            (QNAN & KIND_MASK) < TAG_FN,
+            "QNAN prefix is inside the tagged range"
+        );
+
         let tags = [TAG_FN, TAG_BOOL, TAG_BYTE, TAG_VOID, TAG_PTR];
         for (i, a) in tags.iter().enumerate() {
             for b in &tags[i + 1..] {
                 assert_ne!(a, b, "two tag prefixes collide");
             }
             assert!(*a > QNAN, "tag prefix {a:#018x} not above QNAN");
-            // the canonical NaN's top 16 bits are below the tagged range.
-            assert!(
-                (QNAN & KIND_MASK) < TAG_FN,
-                "QNAN prefix is inside the tagged range"
-            );
         }
     }
 
