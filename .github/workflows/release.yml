@@ -16,6 +16,12 @@ on:
 permissions:
   contents: write
 
+# opt every javascript action into node 24, ahead of github's forced flip on
+# 2026-06-02. avoids the "Node.js 20 actions are deprecated" warning that
+# actions/checkout@v6 and the Swatinem cache still emit on this runner.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   create-release:
     runs-on: ubuntu-latest
