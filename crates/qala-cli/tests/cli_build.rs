@@ -53,6 +53,37 @@ fn build_target_arm64_writes_an_assembly_file() {
 }
 
 #[test]
+fn build_target_arm64_emits_printf_for_a_printing_program() {
+    // `build --target arm64` on a program that prints -- a `println` of a
+    // string interpolation with an i64 hole -- emits assembly that calls
+    // `printf`: the format string in `.data`, the hole in an argument
+    // register, `bl printf`. the integer `print` / `println` output path.
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("prog.qala");
+    std::fs::write(
+        &src_path,
+        "fn main() is io {\n    let n = 7\n    println(\"n = {n}\")\n}\n",
+    )
+    .unwrap();
+    let out_path = dir.path().join("prog.s");
+
+    Command::cargo_bin("qala")
+        .unwrap()
+        .args(["build"])
+        .arg(&src_path)
+        .args(["--target", "arm64"])
+        .arg("-o")
+        .arg(&out_path)
+        .assert()
+        .success();
+
+    let assembly = std::fs::read_to_string(&out_path).unwrap();
+    assert!(assembly.contains(".data")); // the format string lands in .data
+    assert!(assembly.contains("%lld")); // the i64 hole's conversion
+    assert!(assembly.contains("bl      printf")); // the libc call
+}
+
+#[test]
 fn build_target_arm64_rejects_an_unsupported_construct() {
     // `build --target arm64` on a program using an unsupported construct -- a
     // float -- renders a diagnostic to stderr and exits non-zero. the clean
