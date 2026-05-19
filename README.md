@@ -1,5 +1,7 @@
 # Qala
 
+[![CI](https://github.com/Abdalla-Eldoumani/qala-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdalla-Eldoumani/qala-lang/actions/workflows/ci.yml)
+
 A statically typed programming language where saying is doing.
 
 Qala (قال) is the Arabic word for "he said" or "to say." In Arabic, when you say
