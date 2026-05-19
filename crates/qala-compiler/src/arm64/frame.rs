@@ -2,9 +2,8 @@
 //!
 //! [`FrameLayout`] holds, for one function, the map from a parameter name to
 //! its `[fp, N]` stack slot, an indexed list of slots for the body's `let`
-//! bindings and `for`-loop slots, a run of argument scratch slots for the
-//! body's calls, the count of scratch spill slots the expression codegen
-//! needs, and the derived `alloc` / `dealloc` frame sizes.
+//! bindings and `for`-loop slots, the count of scratch spill slots the
+//! expression codegen needs, and the derived `alloc` / `dealloc` frame sizes.
 //! [`FrameLayout::plan_frame`] builds it from a [`TypedFnDecl`] in one pass
 //! before the prologue is emitted.
 //!
@@ -26,19 +25,21 @@
 //! including a shadowing `let` and a `for`-loop variable, gets its own
 //! distinct slot.
 //!
-//! ## argument scratch slots: max args.len() over all calls in the function
+//! ## call arguments: spilled to claimed scratch slots, never a shared run
 //!
 //! a `TypedExpr::Call` evaluates each argument into `x0` one at a time, then
 //! loads `x0`-`x{n-1}` from somewhere stable for the `bl` -- because every
 //! `compile_expr` lands its result in `x0`, evaluating arg 1 would clobber
-//! arg 0. the stable place is a run of ARGUMENT SCRATCH SLOTS: arg `i` is
-//! `str`-ed to argument slot `i`, and after all args are evaluated the slots
-//! are `ldr`-ed back into `x0`-`x{n-1}`. [`plan_frame`] reserves
-//! `max args.len()` slots -- the argument count of the call WITH THE MOST
-//! ARGUMENTS in the function -- and every call site REUSES that one run (each
-//! call finishes its `str`s and its `bl` before the next call touches the
-//! slots). the slots sit immediately past the body's binding slots;
-//! [`FrameLayout::arg_slot`] indexes them.
+//! arg 0. each evaluated argument is `str`-ed to a freshly CLAIMED scratch
+//! slot -- the same [`claim_scratch`](FrameLayout::claim_scratch) /
+//! [`release_scratch`](FrameLayout::release_scratch) stack the nested-binary
+//! spill discipline uses -- and all of them are released only after the `bl`.
+//! a nested call inside one argument therefore claims slots STRICTLY BEYOND
+//! the outer call's already-claimed argument slots, so no two live argument
+//! values ever alias the same slot. there is no dedicated, shared argument
+//! region: an argument slot is just another scratch slot, and the scratch
+//! reservation in [`plan_frame`] is sized to cover it (see [`max_spill_depth`]
+//! and its [`TypedExpr::Call`] arm).
 //!
 //! ## frame geometry: positive offsets from `fp`
 //!
@@ -51,7 +52,7 @@
 //! `[fp, score1_s]` with `score1_s = 16`. (a negative `[fp, -N]` offset would
 //! address *below* `sp`, outside the frame -- a stack-corruption bug.) the
 //! slot regions in `[fp, N]` order: saved pair, parameters, binding slots,
-//! argument scratch slots, expression scratch slots.
+//! expression scratch slots (which also hold a call's spilled arguments).
 //!
 //! ## the load-bearing detail: 16-byte stack alignment
 //!
@@ -110,20 +111,17 @@ pub(crate) struct FrameLayout {
     /// lockstep and indexes this by occurrence number, which survives a
     /// shadowing `let` that a name-keyed map could not.
     binding_slots: Vec<i64>,
-    /// the argument scratch slots for the body's calls -- `max args.len()`
-    /// slots, the argument count of the largest call in the function. every
-    /// call site reuses this one run: argument `i` of any call is `str`-ed to
-    /// `arg_slots[i]`, then `ldr`-ed back into `x{i}` before the `bl`. the
-    /// slots sit immediately past the binding slots. read by [`arg_slot`].
-    arg_slots: Vec<i64>,
-    /// the number of scratch spill slots reserved for the expression codegen's
-    /// nested-binary-operator spill discipline. their offsets sit immediately
-    /// past the named, binding, and argument slots.
+    /// the number of scratch spill slots reserved for the expression codegen.
+    /// this covers both the nested-binary-operator spill discipline and a
+    /// call's spilled arguments -- a call argument is `str`-ed to a claimed
+    /// scratch slot, so the reservation must account for it (see
+    /// [`max_spill_depth`]). their offsets sit immediately past the named and
+    /// binding slots.
     #[allow(dead_code)]
     scratch_count: i64,
     /// the byte offset of the first scratch spill slot: `[fp, 16]` past the
-    /// saved pair, plus the named, binding, and argument slots, is where the
-    /// scratch stack begins.
+    /// saved pair, plus the named and binding slots, is where the scratch
+    /// stack begins.
     scratch_base: i64,
     /// how many scratch slots are currently claimed. the expression codegen
     /// claims on entering a binary op and releases on leaving; this never
@@ -136,24 +134,22 @@ pub(crate) struct FrameLayout {
 impl FrameLayout {
     /// build the frame layout for one function: assign every parameter a slot,
     /// assign every body `let` binding and `for`-loop slot a distinct slot,
-    /// reserve scratch spill slots for the body's deepest binary-operator
-    /// nesting, and compute `alloc` / `dealloc`.
+    /// reserve scratch spill slots for the body's deepest expression nesting,
+    /// and compute `alloc` / `dealloc`.
     ///
     /// the slot regions, in `[fp, N]` order: the `FP_LR_PAIR` saved-register
     /// pair occupies `[fp, 0]` and `[fp, 8]`; then the parameters at
     /// `[fp, 16 + 8*i]`; then the body's binding slots (every `let` and, per
     /// `for`, the loop variable and a dedicated `end`-bound slot) in walk
-    /// order; then the argument scratch slots (`max args.len()` over the
-    /// body's calls, reused per call site); then the expression scratch slots.
+    /// order; then the expression scratch slots.
     ///
     /// the binding slots are assigned by [`count_binding_slots`], a recursive
     /// walk over `decl.body` that descends into nested `if`/`while`/`for`
     /// blocks. no slot is reused -- a shadowing `let` and every `for` variable
-    /// get their own distinct slot. the argument-slot count is
-    /// [`max_call_args`]: the most arguments any single call in the body
-    /// passes. the scratch reservation is derived from a pre-walk:
-    /// [`max_spill_depth`] returns the maximum number of binary-operator LHS
-    /// values that are simultaneously spilled.
+    /// get their own distinct slot. the scratch reservation is derived from a
+    /// pre-walk: [`max_spill_depth`] returns the peak number of scratch slots
+    /// simultaneously live -- a binary operator's spilled LHS values and a
+    /// call's spilled arguments together.
     pub(crate) fn plan_frame(decl: &TypedFnDecl) -> FrameLayout {
         let mut slots = HashMap::new();
         // parameter i lives at [fp, 16 + 8*i]: the first param at [fp, 16],
@@ -172,22 +168,16 @@ impl FrameLayout {
             .map(|k| binding_base + SLOT_SIZE * k)
             .collect();
         let named_slot_count = param_count + binding_count;
-        // the argument scratch slots begin immediately past the binding slots:
-        // `max args.len()` slots, the largest call in the function. every call
-        // site reuses this one run -- a call finishes its `str`s and `bl`
-        // before the next call's `str`s, so the slots never alias live values.
-        let arg_base = FP_LR_PAIR + SLOT_SIZE * named_slot_count;
-        let arg_count = max_call_args(&decl.body);
-        let arg_slots: Vec<i64> = (0..arg_count).map(|k| arg_base + SLOT_SIZE * k).collect();
-        // the expression scratch slots sit immediately past the argument slots.
-        let scratch_base = FP_LR_PAIR + SLOT_SIZE * (named_slot_count + arg_count);
+        // the expression scratch slots sit immediately past the binding slots.
+        // they hold both a binary operator's spilled LHS and a call's spilled
+        // arguments -- `max_spill_depth` accounts for both.
+        let scratch_base = FP_LR_PAIR + SLOT_SIZE * named_slot_count;
         let scratch_count = max_spill_depth(&decl.body);
-        let locals = SLOT_SIZE * (named_slot_count + arg_count + scratch_count);
+        let locals = SLOT_SIZE * (named_slot_count + scratch_count);
         let alloc = compute_alloc(locals);
         FrameLayout {
             slots,
             binding_slots,
-            arg_slots,
             scratch_count,
             scratch_base,
             scratch_in_use: 0,
@@ -217,27 +207,16 @@ impl FrameLayout {
         self.binding_slots.get(index).copied()
     }
 
-    /// the stack slot of argument scratch slot `index` -- where argument
-    /// `index` of a call is `str`-ed before the `bl` load.
-    ///
-    /// the run is sized to the largest call in the function by [`plan_frame`];
-    /// every call site reuses it. an `index` past the run means the Call arm
-    /// asked for more argument slots than `plan_frame` reserved -- a backend
-    /// bug, surfaced as a [`QalaError`] by the caller rather than a panic.
-    ///
-    /// the `TypedExpr::Call` codegen in `expr.rs` is the consumer; the
-    /// inline tests exercise it directly until that arm lands.
-    #[allow(dead_code)]
-    pub(crate) fn arg_slot(&self, index: usize) -> Option<i64> {
-        self.arg_slots.get(index).copied()
-    }
-
     /// claim the next scratch spill slot, returning its `[fp, N]` offset.
     ///
     /// the expression codegen calls this on entering a binary operator (to hold
-    /// the evaluated LHS while the RHS subtree runs) and [`release_scratch`] on
-    /// leaving. claims stack: nested binary ops each get a distinct slot. the
-    /// reservation from [`plan_frame`] guarantees a slot is always available.
+    /// the evaluated LHS while the RHS subtree runs), and once per argument of
+    /// a call (to hold each evaluated argument until the `bl`); the matching
+    /// [`release_scratch`] returns the slot. claims stack: nested binary ops
+    /// and a nested call each get distinct slots strictly beyond the slots
+    /// already claimed, so no two simultaneously-live values ever alias. the
+    /// reservation from [`plan_frame`] -- via [`max_spill_depth`], which counts
+    /// a call's argument spills -- guarantees a slot is always available.
     pub(crate) fn claim_scratch(&mut self) -> i64 {
         // the slot offset: past the named slots, indexed by how many scratch
         // slots are already in use.
@@ -349,102 +328,25 @@ fn else_branch_binding_slots(branch: &TypedElseBranch) -> i64 {
     }
 }
 
-/// the most arguments any single call in `block` passes -- the size of the
-/// argument scratch run [`plan_frame`] reserves.
+/// the peak number of scratch slots simultaneously live while evaluating
+/// `block`.
 ///
-/// the Call codegen evaluates each argument into a stack slot before the `bl`;
-/// the run must be wide enough for the largest call. every call site reuses
-/// the same run (a call completes its argument `str`s and its `bl` before any
-/// other call begins), so the reservation is the MAXIMUM, not the sum.
-fn max_call_args(block: &TypedBlock) -> i64 {
-    let mut max = 0;
-    for stmt in &block.stmts {
-        max = max.max(stmt_call_args(stmt));
-    }
-    if let Some(value) = &block.value {
-        max = max.max(expr_call_args(value));
-    }
-    max
-}
-
-/// the most arguments any single call within one statement passes (see
-/// [`max_call_args`]).
-fn stmt_call_args(stmt: &TypedStmt) -> i64 {
-    match stmt {
-        TypedStmt::Expr { expr, .. } => expr_call_args(expr),
-        TypedStmt::Return { value, .. } => {
-            value.as_ref().map(expr_call_args).unwrap_or(0)
-        }
-        TypedStmt::Let { init, .. } => expr_call_args(init),
-        TypedStmt::If { cond, then_block, else_branch, .. } => {
-            let mut d = expr_call_args(cond).max(max_call_args(then_block));
-            if let Some(branch) = else_branch {
-                d = d.max(else_branch_call_args(branch));
-            }
-            d
-        }
-        TypedStmt::While { cond, body, .. } => {
-            expr_call_args(cond).max(max_call_args(body))
-        }
-        TypedStmt::For { iter, body, .. } => {
-            expr_call_args(iter).max(max_call_args(body))
-        }
-        TypedStmt::Defer { expr, .. } => expr_call_args(expr),
-        TypedStmt::Break { .. } | TypedStmt::Continue { .. } => 0,
-    }
-}
-
-/// the most arguments any single call within an `else` branch passes.
-fn else_branch_call_args(branch: &TypedElseBranch) -> i64 {
-    match branch {
-        TypedElseBranch::Block(b) => max_call_args(b),
-        TypedElseBranch::If(stmt) => stmt_call_args(stmt),
-    }
-}
-
-/// the most arguments any single call within `expr` passes.
+/// a scratch slot is claimed in two situations, and this pre-walk counts both
+/// so [`plan_frame`] reserves enough for the deepest case:
 ///
-/// for a `Call` node the count is its own `args.len()` -- but a nested call
-/// inside one of those arguments can pass MORE, so the maximum is taken over
-/// this call's arity and every argument subtree (and the callee subtree). a
-/// `Range`'s bounds are walked because a `for`'s range bound may contain a
-/// call.
-fn expr_call_args(expr: &TypedExpr) -> i64 {
-    match expr {
-        TypedExpr::Call { callee, args, .. } => {
-            let mut max = args.len() as i64;
-            max = max.max(expr_call_args(callee));
-            for arg in args {
-                max = max.max(expr_call_args(arg));
-            }
-            max
-        }
-        TypedExpr::Binary { lhs, rhs, .. } => {
-            expr_call_args(lhs).max(expr_call_args(rhs))
-        }
-        TypedExpr::Unary { operand, .. } => expr_call_args(operand),
-        TypedExpr::Paren { inner, .. } => expr_call_args(inner),
-        TypedExpr::Block { block, .. } => max_call_args(block),
-        TypedExpr::Range { start, end, .. } => {
-            let s = start.as_deref().map(expr_call_args).unwrap_or(0);
-            let e = end.as_deref().map(expr_call_args).unwrap_or(0);
-            s.max(e)
-        }
-        // a leaf or an unsupported construct holds no call.
-        _ => 0,
-    }
-}
-
-/// the maximum number of binary-operator LHS values that are spilled at once
-/// while evaluating `block`.
+/// - an arithmetic or comparison `Binary` node spills its evaluated LHS to a
+///   scratch slot while it evaluates the RHS subtree. a nested operator spills
+///   again, so a chain accumulates. short-circuit `&&` / `||` do NOT spill --
+///   they branch on `x0` directly and reload no LHS.
+/// - a `Call` spills each evaluated argument to a claimed scratch slot and
+///   holds every one of them until the `bl`. its `n` arguments therefore
+///   occupy `n` simultaneously-live slots, and evaluating any one argument can
+///   itself need scratch slots on top.
 ///
-/// the expression codegen, on an arithmetic or comparison `Binary` node, spills
-/// the evaluated LHS to a scratch slot while it evaluates the RHS subtree. a
-/// nested RHS spills again, so the live-spill count is the deepest
-/// left-leaning-through-right chain of those operators. this pre-walk returns
-/// that maximum so [`plan_frame`] can reserve exactly that many scratch slots.
-/// short-circuit `&&` / `||` do NOT spill -- they branch on `x0` directly and
-/// reload no LHS -- so they add no scratch slot of their own.
+/// the contract with the expression codegen: every slot the codegen claims is
+/// counted here. a single shared argument run would NOT be safe (a nested call
+/// would alias the outer call's saved arguments), which is why a call argument
+/// is a claimed scratch slot like any other.
 fn max_spill_depth(block: &TypedBlock) -> i64 {
     let mut max = 0;
     for stmt in &block.stmts {
@@ -456,11 +358,12 @@ fn max_spill_depth(block: &TypedBlock) -> i64 {
     max
 }
 
-/// the maximum simultaneously-live spill count within one statement.
+/// the peak simultaneously-live scratch-slot count within one statement.
 ///
-/// THIS PLAN's `compile_stmt` handles only `Expr` and `Return`; the other
-/// variants still contribute their sub-expressions' depth so the count is
-/// correct once plan 12-02 wires the remaining statement codegen.
+/// every statement variant contributes the depth of its sub-expressions, so
+/// the count covers a call or a binary operator wherever one appears -- a
+/// `let` initializer, an `if` condition, a `for` range bound, a `return`
+/// value, a bare expression statement.
 fn stmt_spill_depth(stmt: &TypedStmt) -> i64 {
     match stmt {
         TypedStmt::Expr { expr, .. } => expr_spill_depth(expr),
@@ -494,16 +397,26 @@ fn else_branch_spill_depth(branch: &TypedElseBranch) -> i64 {
     }
 }
 
-/// the maximum number of scratch spill slots that are simultaneously live
-/// while evaluating `expr`.
+/// the peak number of scratch spill slots simultaneously live while
+/// evaluating `expr`.
 ///
 /// an arithmetic or comparison `Binary` node claims one scratch slot and holds
 /// it for the *entire* evaluation of both operands -- the codegen claims before
 /// the LHS runs and releases only after the RHS reload -- so its peak live-slot
 /// count is `1 + max(spill_depth(lhs), spill_depth(rhs))`. a short-circuit
 /// `&&` / `||` claims no slot of its own (it branches on `x0` and reloads no
-/// LHS), so its peak is `max(spill_depth(lhs), spill_depth(rhs))`. non-binary
-/// nodes recurse into their children with no added slot.
+/// LHS), so its peak is `max(spill_depth(lhs), spill_depth(rhs))`.
+///
+/// a `Call` with `n` arguments spills each evaluated argument to a claimed
+/// scratch slot and holds all `n` until the `bl` -- so `n` slots are live at
+/// once -- and evaluating any single argument can claim further slots on top.
+/// the codegen evaluates an argument fully before claiming its slot, so while
+/// argument `k` runs at most `k` sibling slots are already held; the peak is
+/// therefore bounded by `n + max(depth of each argument subtree)`. that bound
+/// (the callee subtree is included for completeness, though a supported callee
+/// is always a bare identifier of depth 0) is what this arm returns, matching
+/// the review's `args.len() + max(arg subtree depth)` model. non-call,
+/// non-binary nodes recurse into their children with no added slot.
 fn expr_spill_depth(expr: &TypedExpr) -> i64 {
     use crate::ast::BinOp;
     match expr {
@@ -516,9 +429,27 @@ fn expr_spill_depth(expr: &TypedExpr) -> i64 {
                 _ => 1 + operands,
             }
         }
+        // a call holds one scratch slot per argument simultaneously (the
+        // spilled argument values, live until the `bl`), plus the deepest
+        // single argument's own scratch need on top. the callee subtree is
+        // folded into the same max -- harmless, since a supported callee is a
+        // bare identifier. a single shared argument run is NOT used: it would
+        // let a nested call clobber the outer call's saved arguments.
+        TypedExpr::Call { callee, args, .. } => {
+            let mut deepest = expr_spill_depth(callee);
+            for arg in args {
+                deepest = deepest.max(expr_spill_depth(arg));
+            }
+            args.len() as i64 + deepest
+        }
         TypedExpr::Unary { operand, .. } => expr_spill_depth(operand),
         TypedExpr::Paren { inner, .. } => expr_spill_depth(inner),
         TypedExpr::Block { block, .. } => max_spill_depth(block),
+        TypedExpr::Range { start, end, .. } => {
+            let s = start.as_deref().map(expr_spill_depth).unwrap_or(0);
+            let e = end.as_deref().map(expr_spill_depth).unwrap_or(0);
+            s.max(e)
+        }
         // a leaf or an unsupported construct contributes no spill.
         _ => 0,
     }
@@ -920,30 +851,26 @@ mod tests {
     }
 
     #[test]
-    fn a_function_with_no_calls_reserves_no_argument_slots() {
-        // `fn f(a: i64) -> i64 { a }` makes no call -- arg_slot(0) is None and
-        // the frame holds only the one parameter slot.
+    fn a_function_with_no_calls_reserves_no_scratch() {
+        // `fn f(a: i64) -> i64 { a }` makes no call and has no binary op -- its
+        // trailing value is a bare ident, so the scratch reservation is zero
+        // and the frame holds only the one parameter slot.
         let decl = fn_from_source("fn f(a: i64) -> i64 { a }");
         let layout = FrameLayout::plan_frame(&decl);
-        assert_eq!(layout.arg_slot(0), None, "no call -> no argument slots");
-        // 1 param + 0 arg + 0 scratch = 8 bytes -> alloc = -(16 + 8) & -16 = -32.
+        assert_eq!(layout.scratch_count(), 0, "a bare ident needs no scratch");
+        // 1 param + 0 scratch = 8 bytes -> alloc = -(16 + 8) & -16 = -32.
         assert_eq!(layout.alloc, -32, "1 param, no call -> alloc -32");
     }
 
     #[test]
     fn a_two_param_one_let_function_with_a_three_arg_call_has_concrete_slots() {
-        // the plan-checker hardening case: a function with 2 params, 1 `let`,
-        // and a 3-argument call. binding slots: 2 params at [fp, 16]/[fp, 24],
-        // the `let` at [fp, 32]. argument slots: 3, immediately past the `let`
-        // -- [fp, 40], [fp, 48], [fp, 56]. each call argument is a bare ident
-        // or literal, so the call needs zero expression scratch. locals =
-        // 8 * (3 named + 3 arg + 0 scratch) = 48 -> alloc = -(16 + 48) & -16
-        // = -64. concrete values, independent of any snapshot fixture.
-        let decl = fn_from_source(
-            "fn add3(a: i64, b: i64, c: i64) -> i64 { a }\n\
-             fn caller(x: i64, y: i64) -> i64 { let r = add3(x, y, 1)\nr }",
-        );
-        // fn_from_source returns the FIRST function; re-find `caller`.
+        // a function with 2 params, 1 `let`, and a 3-argument call. named
+        // slots: 2 params at [fp, 16]/[fp, 24], the `let` at [fp, 32]. the
+        // call spills its three arguments to three claimed scratch slots,
+        // immediately past the named slots -- [fp, 40], [fp, 48], [fp, 56].
+        // each call argument is a bare ident or literal (depth 0), so the
+        // call's scratch need is exactly args.len() = 3. locals =
+        // 8 * (3 named + 3 scratch) = 48 -> alloc = -(16 + 48) & -16 = -64.
         let src = "fn add3(a: i64, b: i64, c: i64) -> i64 { a }\n\
                    fn caller(x: i64, y: i64) -> i64 { let r = add3(x, y, 1)\nr }";
         let tokens = crate::lexer::Lexer::tokenize(src).expect("lex failed");
@@ -957,27 +884,25 @@ mod tests {
                 _ => None,
             })
             .expect("no caller function");
-        let _ = decl; // the first-function decl is unused; `caller` is the subject.
         let layout = FrameLayout::plan_frame(&caller);
         // 2 params + 1 let = 3 named slots at [fp, 16], [fp, 24], [fp, 32].
         assert_eq!(layout.slot_of("x"), Some(16), "param x -> [fp, 16]");
         assert_eq!(layout.slot_of("y"), Some(24), "param y -> [fp, 24]");
         assert_eq!(layout.binding_slot(0), Some(32), "let r -> [fp, 32]");
-        // 3 argument slots immediately past the named slots.
-        assert_eq!(layout.arg_slot(0), Some(40), "arg slot 0 -> [fp, 40]");
-        assert_eq!(layout.arg_slot(1), Some(48), "arg slot 1 -> [fp, 48]");
-        assert_eq!(layout.arg_slot(2), Some(56), "arg slot 2 -> [fp, 56]");
-        assert_eq!(layout.arg_slot(3), None, "only three argument slots");
-        // 3 named + 3 arg + 0 scratch = 48 bytes -> alloc = -64.
+        // the 3-arg call needs three scratch slots, past the named slots.
+        assert_eq!(layout.scratch_count(), 3, "a 3-arg call -> three scratch slots");
+        // 3 named + 3 scratch = 48 bytes -> alloc = -64.
         assert_eq!(layout.alloc, -64, "2 params + 1 let + 3-arg call -> alloc -64");
         assert_eq!(layout.prologue()[0], "stp     fp, lr, [sp, -64]!");
         assert_eq!(layout.epilogue()[0], "ldp     fp, lr, [sp], 64");
     }
 
     #[test]
-    fn argument_slots_size_to_the_largest_call_not_the_sum() {
-        // a function with a 1-arg call and a 2-arg call reserves 2 argument
-        // slots -- the MAXIMUM, since the two calls reuse the run, not 1 + 2.
+    fn sibling_calls_in_separate_statements_size_to_the_widest_not_the_sum() {
+        // a function with a 1-arg call and a 2-arg call in SEPARATE statements
+        // reserves 2 scratch slots -- the widest single call, not 1 + 2. each
+        // call claims its argument slots and releases them at its `bl`, so the
+        // two calls' slots never overlap and the peak is the larger call.
         let src = "fn one(a: i64) -> i64 { a }\n\
                    fn two(a: i64, b: i64) -> i64 { a }\n\
                    fn f() { let p = one(1)\nlet q = two(2, 3) }";
@@ -993,21 +918,20 @@ mod tests {
             })
             .expect("no f function");
         let layout = FrameLayout::plan_frame(&f);
-        // 2 binding slots ([fp, 16], [fp, 24]), then 2 argument slots
-        // ([fp, 32], [fp, 40]) -- the 2-arg call is the widest.
-        assert_eq!(layout.arg_slot(0), Some(32), "arg slot 0 past the two lets");
-        assert_eq!(layout.arg_slot(1), Some(40), "arg slot 1");
-        assert_eq!(layout.arg_slot(2), None, "the widest call passes two args");
-        // 2 lets + 2 arg = 32 bytes -> alloc = -(16 + 32) & -16 = -48.
+        // the 2-arg call is the widest -> two scratch slots, past the two lets.
+        assert_eq!(layout.scratch_count(), 2, "the widest call passes two args");
+        // 2 lets + 2 scratch = 32 bytes -> alloc = -(16 + 32) & -16 = -48.
         assert_eq!(layout.alloc, -48, "two lets + a 2-arg call -> alloc -48");
     }
 
     #[test]
-    fn a_nested_call_argument_counts_the_inner_calls_arity() {
-        // `outer(inner(1, 2, 3))`: the outer call passes 1 argument, but the
-        // inner call inside that argument passes 3 -- max_call_args must see
-        // the inner arity through the argument subtree, so 3 slots are
-        // reserved, not 1.
+    fn a_nested_call_argument_adds_the_inner_calls_depth_to_the_outer_arity() {
+        // `outer(inner(1, 2, 3))`: the outer call passes 1 argument, and that
+        // argument is itself a 3-arg call. the outer call's single argument
+        // slot is live WHILE `inner(1, 2, 3)` evaluates -- and inner needs
+        // three slots of its own -- so the peak is 1 + 3 = 4, NOT 3. the old
+        // max-args planner under-counted this at 3; the spill-depth model must
+        // see the inner depth stacked on the outer arity.
         let src = "fn inner(a: i64, b: i64, c: i64) -> i64 { a }\n\
                    fn outer(x: i64) -> i64 { x }\n\
                    fn f() { let r = outer(inner(1, 2, 3)) }";
@@ -1023,7 +947,12 @@ mod tests {
             })
             .expect("no f function");
         let layout = FrameLayout::plan_frame(&f);
-        assert_eq!(layout.arg_slot(2), Some(40), "the inner 3-arg call sizes the run");
-        assert_eq!(layout.arg_slot(3), None, "three argument slots, the inner call");
+        assert_eq!(
+            layout.scratch_count(),
+            4,
+            "outer arity (1) + inner call depth (3) = 4 scratch slots"
+        );
+        // 1 let + 4 scratch = 40 bytes -> alloc = -(16 + 40) & -16 = -64.
+        assert_eq!(layout.alloc, -64, "1 let + a nested 3-arg call -> alloc -64");
     }
 }
