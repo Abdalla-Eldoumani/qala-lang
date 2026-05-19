@@ -2,7 +2,11 @@ name: Release
 
 # builds the qala command-line binary for Linux, macOS, and Windows and
 # attaches each to the GitHub Release when a version tag (v*) is pushed.
-# each runner builds its own native target, so no cross toolchain is needed.
+# the create-release job creates the release once; the upload-assets matrix
+# then builds the native binary on each runner and attaches it. without
+# the create step, taiki-e/upload-rust-binary-action would loop on
+# "release not found" because pushing a tag does not, on its own, create
+# a github release.
 
 on:
   push:
@@ -13,7 +17,19 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out the repository
+        uses: actions/checkout@v6
+
+      - name: create the github release
+        uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
