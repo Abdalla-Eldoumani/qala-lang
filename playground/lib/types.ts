@@ -54,6 +54,13 @@ export interface CompileResult {
   diagnostics: MonacoDiagnostic[]; // warnings on success, errors on failure
 }
 
+// wasm.rs Arm64Result -- the ARM64 backend's ok-flagged output.
+export interface Arm64Result {
+  ok: boolean; // true when the ARM64 backend produced assembly
+  assembly?: string; // the AArch64 assembly text; absent on error
+  diagnostics: MonacoDiagnostic[]; // unsupported-construct or front-end errors
+}
+
 // wasm.rs RunResult.
 export interface RunResult {
   ok: boolean; // true when the program ran to Halt
