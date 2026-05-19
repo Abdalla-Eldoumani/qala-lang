@@ -59,7 +59,9 @@ function EditorHeader({
           loadedExample={loadedExample}
           loadExample={onLoadExample}
         />
-        {/* the tablet bytecode toggle: visible only at the tablet width */}
+        {/* the tablet output toggle: visible only at the tablet width.
+            it reveals the compiler-output panel, which hosts the
+            Bytecode and ARM64 tabs -- so the toggle is labelled Output. */}
         <button
           type="button"
           onClick={onToggleBytecode}
@@ -70,7 +72,7 @@ function EditorHeader({
               : "border-border text-text-secondary hover:border-text-secondary"
           }`}
         >
-          Bytecode
+          Output
         </button>
       </div>
     </header>
@@ -172,6 +174,7 @@ export default function Page() {
     lastCompile,
     lastRun,
     lastState,
+    lastArm64,
   } = useQala();
 
   // local UI state -- not execution state. the bytecode panel collapse
@@ -285,11 +288,11 @@ export default function Page() {
           <button
             type="button"
             onClick={() => setBytecodeCollapsed(false)}
-            aria-label="show the bytecode panel"
+            aria-label="show the output panel"
             className="hidden w-[var(--space-6)] items-center justify-center rounded-[var(--radius-panel)] border border-border bg-surface text-[12px] font-medium leading-[1.4] text-text-secondary transition-colors duration-150 ease-out hover:border-text-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent min-[1200px]:flex"
           >
             <span className="[writing-mode:vertical-rl] uppercase tracking-wide">
-              Bytecode
+              Output
             </span>
           </button>
         ) : (
@@ -300,7 +303,7 @@ export default function Page() {
             <button
               type="button"
               onClick={() => setBytecodeCollapsed(true)}
-              aria-label="collapse the bytecode panel"
+              aria-label="collapse the output panel"
               className="absolute right-[var(--space-3)] top-[var(--space-2)] z-10 rounded-[var(--radius-button)] border border-border bg-surface px-[var(--space-2)] py-[var(--space-1)] text-[12px] font-medium leading-[1.4] text-text-secondary transition-colors duration-150 ease-out hover:border-text-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
             >
               collapse
@@ -309,6 +312,7 @@ export default function Page() {
               className="min-h-0 flex-1"
               compile={lastCompile}
               state={lastState}
+              arm64={lastArm64}
               dirty={dirty}
             />
           </div>
