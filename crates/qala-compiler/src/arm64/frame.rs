@@ -66,7 +66,9 @@
 //! correctness reduces entirely to this one formula. [`compute_alloc`] is the
 //! single implementation; its unit test asserts the four hand-computed values.
 
-use crate::typed_ast::{TypedBlock, TypedElseBranch, TypedExpr, TypedFnDecl, TypedStmt};
+use crate::typed_ast::{
+    TypedBlock, TypedElseBranch, TypedExpr, TypedFnDecl, TypedInterpPart, TypedStmt,
+};
 use std::collections::HashMap;
 
 /// the byte size of one stack slot. an `i64` and a `bool` both occupy a full
@@ -429,6 +431,14 @@ fn expr_spill_depth(expr: &TypedExpr) -> i64 {
                 _ => 1 + operands,
             }
         }
+        // a `print` / `println` call lowers to a `printf` call, not a normal
+        // `bl`: its scratch need is one slot per i64 interpolation hole, not
+        // one per argument -- the single `str` argument is itself walked into
+        // the holes. `printf_call_spill_depth` computes that; a non-printf
+        // call falls through to the general arity-plus-depth rule below.
+        TypedExpr::Call { callee, args, .. } if is_print_callee(callee) => {
+            printf_call_spill_depth(args)
+        }
         // a call holds one scratch slot per argument simultaneously (the
         // spilled argument values, live until the `bl`), plus the deepest
         // single argument's own scratch need on top. the callee subtree is
@@ -453,6 +463,48 @@ fn expr_spill_depth(expr: &TypedExpr) -> i64 {
         // a leaf or an unsupported construct contributes no spill.
         _ => 0,
     }
+}
+
+/// whether a call's callee is the `print` or `println` output built-in.
+///
+/// the `print` / `println` lowering ([`super::print`]) spills one scratch
+/// slot per `i64` interpolation hole rather than one per call argument, so the
+/// frame planner counts a printf call differently from a user call. a callee
+/// is a printf callee when it is a bare identifier named `print` or `println`
+/// -- the only callee shape the emitter routes to the printf lowering.
+fn is_print_callee(callee: &TypedExpr) -> bool {
+    matches!(
+        callee,
+        TypedExpr::Ident { name, .. } if name == "print" || name == "println"
+    )
+}
+
+/// the peak scratch-slot count a `print` / `println` call needs.
+///
+/// the call lowers to a `printf`: each `i64` interpolation hole is evaluated
+/// into `x0` and spilled to a claimed scratch slot, and every spilled hole is
+/// held until `bl printf`. so `n` holes occupy `n` simultaneously-live slots,
+/// and evaluating any single hole can claim further slots on top -- the same
+/// `args.len() + max(arg depth)` bound the general `Call` arm uses, but
+/// counted over the interpolation's holes instead of the call's arguments. a
+/// string-literal argument has no holes and needs no scratch; a non-literal,
+/// non-interpolation argument is rejected by the emitter, so a `0` here is
+/// safe -- the frame for a program the backend rejects is never emitted.
+fn printf_call_spill_depth(args: &[TypedExpr]) -> i64 {
+    // a well-typed print / println has exactly one str argument; walk it for
+    // the interpolation holes. anything else contributes no scratch.
+    let Some(TypedExpr::Interpolation { parts, .. }) = args.first() else {
+        return 0;
+    };
+    let mut hole_count = 0;
+    let mut deepest = 0;
+    for part in parts {
+        if let TypedInterpPart::Expr(expr) = part {
+            hole_count += 1;
+            deepest = deepest.max(expr_spill_depth(expr));
+        }
+    }
+    hole_count + deepest
 }
 
 #[cfg(test)]
