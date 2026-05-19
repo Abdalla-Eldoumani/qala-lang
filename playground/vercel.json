@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
-  "buildCommand": "npm run build",
-  "installCommand": "npm install"
+  "installCommand": "npm install && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable -t wasm32-unknown-unknown",
+  "buildCommand": "export PATH=$HOME/.cargo/bin:$PATH && cd .. && npx --yes wasm-pack@latest build crates/qala-compiler --target web --out-dir ../../playground/lib/wasm && cd playground && npm run build"
 }
