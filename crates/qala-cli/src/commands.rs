@@ -3,8 +3,7 @@
 //! each handler returns a [`std::process::ExitCode`]: `SUCCESS` (0) when the
 //! command did its job, `from(1)` on any qala-level failure. every error path
 //! renders a diagnostic to stderr -- never a bare panic, never an unfinished
-//! placeholder. program output goes to stdout; diagnostics and the arm64 stub
-//! go to stderr.
+//! placeholder. program output goes to stdout; diagnostics go to stderr.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -93,21 +92,49 @@ pub fn check(file: &Path) -> ExitCode {
 /// compile a qala program and write its output artifact.
 ///
 /// `--target bytecode` (the default) writes the optimized bytecode disassembly
-/// to a `.qbc` file. `--target arm64` is recognized but its code generator is
-/// not yet available -- it renders a clear diagnostic to stderr and exits
-/// non-zero before any compilation.
+/// to a `.qbc` file. `--target arm64` compiles the program through the ARM64
+/// backend and writes the emitted AArch64 assembly text to a `.s` file. either
+/// way, `-o` / `--output` overrides the artifact path; an unsupported
+/// construct or a compile error renders a diagnostic to stderr and exits
+/// non-zero.
 pub fn build(file: &Path, target: Target, output: Option<PathBuf>) -> ExitCode {
-    // check the target first: arm64 routes to the not-yet-available stub
-    // before reading or compiling anything.
+    // arm64 has its own flow: read the file, typecheck, run the ARM64 backend,
+    // write the .s assembly artifact.
     if target == Target::Arm64 {
-        eprintln!("error: the arm64 backend is not yet available");
-        eprintln!(
-            "  = note: `--target arm64` is a recognized target but its code generator ships in a later release"
-        );
-        eprintln!(
-            "  = hint: use the default `--target bytecode`, or omit --target, to compile this program now"
-        );
-        return ExitCode::from(1);
+        let src = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {e}", file.display());
+                return ExitCode::from(1);
+            }
+        };
+        let typed = match pipeline::typecheck_source(&src) {
+            Ok(t) => t,
+            Err(errors) => {
+                eprint!("{}", render_errors(&errors, &src));
+                return ExitCode::from(1);
+            }
+        };
+        let assembly = match qala_compiler::arm64::compile_arm64(&typed, &src) {
+            Ok(asm) => asm,
+            Err(errors) => {
+                eprint!("{}", render_errors(&errors, &src));
+                return ExitCode::from(1);
+            }
+        };
+        // the artifact path: the -o override, else the source path with a .s
+        // extension. `.s` is the universally recognized assembly-source suffix.
+        let out_path = match output {
+            Some(p) => p,
+            None => file.with_extension("s"),
+        };
+        if let Err(e) = std::fs::write(&out_path, assembly) {
+            eprintln!("error: cannot write '{}': {e}", out_path.display());
+            return ExitCode::from(1);
+        }
+        // a confirmation line -- not an error, so it goes to stdout.
+        println!("wrote {}", out_path.display());
+        return ExitCode::SUCCESS;
     }
 
     let src = match std::fs::read_to_string(file) {
