@@ -1,0 +1,43 @@
+name: Release
+
+# builds the qala command-line binary for Linux, macOS, and Windows and
+# attaches each to the GitHub Release when a version tag (v*) is pushed.
+# each runner builds its own native target, so no cross toolchain is needed.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: check out the repository
+        uses: actions/checkout@v6
+
+      - name: install the rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: build and upload the qala binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: qala
+          target: ${{ matrix.target }}
+          archive: qala-$tag-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
