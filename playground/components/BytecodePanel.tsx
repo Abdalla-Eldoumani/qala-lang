@@ -2,21 +2,21 @@
 // produced from the current source. tab 1 (Bytecode) renders the
 // bytecode disassembly as monospace instruction rows and highlights the
 // row the vm is about to execute. tab 2 (ARM64) renders the AArch64
-// assembly the ARM64 backend emits, read-only, or -- when the program is
-// outside the backend's integer core -- the honest unsupported-construct
+// assembly the ARM64 backend emits, read-only, or, when the program is
+// outside the backend's integer core, the honest unsupported-construct
 // diagnostic. the panel frame and the header tab strip are constant
 // across every state so the chrome never shifts.
 //
-// the bytecode highlight keys on VmState.ip -- a byte offset into a
+// the bytecode highlight keys on VmState.ip, a byte offset into a
 // chunk. the ARM64 tab has no highlight at all: the backend has no
 // playground runtime, so there is no current line to track. the two
-// tabs do not share a highlight abstraction -- they are deliberately
+// tabs do not share a highlight abstraction; they are deliberately
 // distinct.
 
 import { useEffect, useRef, useState } from "react";
 import type { Arm64Result, CompileResult, VmState } from "@/lib/types";
 
-// the active compiler-output tab. component-local UI state -- it is not
+// the active compiler-output tab. component-local UI state: it is not
 // execution state and does not belong in useQala.
 type OutputTab = "bytecode" | "arm64";
 
@@ -45,8 +45,8 @@ const LINE_NOTE = " ; line ";
 // the opcode and operand are fixed-width columns of the instruction body
 // (the part before the ` ; line ` note). the offset is 4 chars then two
 // spaces, so the opcode starts at index 6 and runs to 15; the operand
-// starts at index 16. slicing the fixed columns -- rather than splitting
-// on whitespace -- is required because an operand can carry an internal
+// starts at index 16. slicing the fixed columns, rather than splitting
+// on whitespace, is required because an operand can carry an internal
 // space (e.g. `#0 42`), which a whitespace split would tear apart.
 const OPCODE_START = 6;
 const OPCODE_END = 15;
@@ -54,7 +54,7 @@ const OPERAND_START = 16;
 
 // the parsed rows plus, per row, the fn_id of the chunk that owns it.
 // the owning fn_id is the most recent header's fn_id; -1 before any
-// header. precomputing it here keeps the render a pure read -- no
+// header. precomputing it here keeps the render a pure read: no
 // mutable cursor reassigned inside the JSX map.
 interface ParsedDisassembly {
   rows: BytecodeRow[];
@@ -91,7 +91,7 @@ function parseDisassembly(disassembly: string): ParsedDisassembly {
 
     // parseInt reads the leading integer and ignores the right-aligned
     // column's leading spaces. a line whose leading token is not a
-    // number is not an instruction row -- skip it defensively.
+    // number is not an instruction row, so skip it defensively.
     const offset = Number.parseInt(body, 10);
     if (Number.isNaN(offset)) continue;
 
@@ -117,7 +117,7 @@ function InstructionRow({
 }) {
   // the current row scrolls itself into view when it is off-screen. a
   // ref on every instruction row keeps this simple; only the current
-  // one acts on it. block: "nearest" is an instant adjust -- a fast run
+  // one acts on it. block: "nearest" is an instant adjust: a fast run
   // loop must not lag behind a smooth scroll.
   const rowRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -127,9 +127,9 @@ function InstructionRow({
   return (
     <div
       ref={rowRef}
-      // the highlight is the --accent-soft band alone -- the current
+      // the highlight is the --accent-soft band alone: the current
       // instruction is identifiable by the soft background, no stripe.
-      // weight stays 400 -- a monospace column must not shift glyph width
+      // weight stays 400 so a monospace column never shifts glyph width
       // on highlight. the 100ms fade eases the move.
       className={`flex items-baseline gap-[var(--space-3)] py-[var(--space-1)] pl-[var(--space-3)] pr-[var(--space-3)] font-mono text-[13px] font-normal leading-[1.6] transition-colors duration-100 ease-out ${
         current ? "bg-accent-soft" : ""
@@ -151,7 +151,7 @@ function InstructionRow({
   );
 }
 
-// tab 1: the bytecode disassembly view. three states -- stale (a dirty
+// tab 1: the bytecode disassembly view. three states: stale (a dirty
 // edit since the last compile), empty (no program compiled), and the
 // instruction listing. the stale check comes before the empty check so
 // an edit before the first compile shows stale, not empty.
@@ -170,14 +170,14 @@ function BytecodeTab({
     return <Message text="bytecode is out of date, compile to refresh" />;
   }
 
-  // compile.disassembly is absent (undefined, never null -- a rust None)
+  // compile.disassembly is absent (undefined, never null, a rust None)
   // when no program compiled or the compile failed. truthiness covers
   // both the null compile result and the absent disassembly string.
   if (!compile?.disassembly) {
     return <Message text="compile a program to see its bytecode" />;
   }
 
-  // rowFnIds[i] is the fn_id of the chunk that owns rows[i] -- computed
+  // rowFnIds[i] is the fn_id of the chunk that owns rows[i], computed
   // in the pure parse pass. the current instruction is the row whose
   // owning fn_id equals VmState.chunk_index and whose offset equals
   // VmState.ip. scoping to the chunk matters: every chunk has an
@@ -212,13 +212,13 @@ function BytecodeTab({
   );
 }
 
-// tab 2: the ARM64 assembly view. four states -- stale, empty, assembly,
+// tab 2: the ARM64 assembly view. four states: stale, empty, assembly,
 // and unsupported. the stale check comes before the empty check so an
 // edit before the first compile shows stale, matching the bytecode tab.
 //
 // the unsupported state is calm by design: an ARM64-unsupported
-// construct is not an error -- the program is correct, it simply targets
-// a backend slice that does not cover it yet -- so it renders in
+// construct is not an error. the program is correct, it simply targets
+// a backend slice that does not cover it yet, so it renders in
 // --text-secondary / --text-primary, never --error red.
 function Arm64Tab({
   arm64,
@@ -240,7 +240,7 @@ function Arm64Tab({
 
   // a dirty edit since the last compile means the assembly is stale.
   // checked before the empty state so an edit before the first compile
-  // reads as stale, not empty -- the same rule the bytecode tab follows.
+  // reads as stale, not empty, the same rule the bytecode tab follows.
   if (dirty) {
     return <Message text="assembly is out of date, compile to refresh" />;
   }
@@ -276,9 +276,9 @@ function Arm64Tab({
         </div>
         {/* the assembly body: the backend's own indentation and column
             alignment are meaningful, so whitespace-pre preserves them
-            verbatim -- no re-tokenizing, no re-indenting, no highlight,
+            verbatim: no re-tokenizing, no re-indenting, no highlight,
             no line numbers. it is a plain scroll container, not
-            virtualized -- integer-core programs are short. */}
+            virtualized, because integer-core programs are short. */}
         <pre className="min-h-0 flex-1 overflow-auto whitespace-pre px-[var(--space-3)] py-[var(--space-1)] font-mono text-[13px] font-normal leading-[1.6] text-text-primary">
           {assembly}
         </pre>
@@ -288,7 +288,7 @@ function Arm64Tab({
 
   // the unsupported state: the program compiled for the VM but uses a
   // construct outside the ARM64 integer core. show the first diagnostic
-  // -- the earliest offending construct -- framed as information, not a
+  // (the earliest offending construct) framed as information, not a
   // failure. the disabled copy button keeps the chrome stable.
   const detail = arm64?.diagnostics[0]?.message;
   if (detail) {
@@ -319,9 +319,11 @@ function Arm64Tab({
 }
 
 // the body-role copy shown by the empty and stale states of either tab.
+// the extra top padding seats the message deliberately rather than flush
+// to the panel corner.
 function Message({ text }: { text: string }) {
   return (
-    <div className="p-[var(--space-4)] text-[14px] font-normal leading-[1.5] text-text-secondary">
+    <div className="px-[var(--space-4)] pt-[var(--space-6)] pb-[var(--space-4)] text-[14px] font-normal leading-[1.5] text-text-secondary">
       {text}
     </div>
   );
@@ -345,7 +347,7 @@ export default function BytecodePanel({
   arm64?: Arm64Result | null;
   dirty?: boolean;
 }) {
-  // the active tab is component-local UI state, default "bytecode" -- it
+  // the active tab is component-local UI state, default "bytecode": it
   // is not execution state, so it does not live in useQala.
   const [activeTab, setActiveTab] = useState<OutputTab>("bytecode");
 
@@ -371,8 +373,10 @@ export default function BytecodePanel({
       className={`flex flex-col overflow-hidden rounded-[var(--radius-panel)] border border-border bg-surface ${className ?? ""}`}
     >
       {/* the header hosts the tab strip; the page's collapse control is
-          positioned over it. the tabs reuse the mobile tab vocabulary. */}
-      <header className="border-b border-border p-[var(--space-3)]">
+          positioned over it. the tabs reuse the mobile tab vocabulary. the
+          header bar is tighter vertically than horizontally so it reads as
+          a crisp band, not a square block. */}
+      <header className="border-b border-border px-[var(--space-3)] py-[var(--space-2)]">
         <div role="tablist" className="flex gap-[var(--space-2)]">
           {tabs.map((tab) => (
             <button
@@ -394,8 +398,8 @@ export default function BytecodePanel({
           ))}
         </div>
       </header>
-      {/* the body is the active tab's content. it is a single tabpanel
-          -- the inactive tab is unmounted, so the bytecode tab's
+      {/* the body is the active tab's content. it is a single tabpanel:
+          the inactive tab is unmounted, so the bytecode tab's
           scroll-into-view never fires for an off-screen panel. */}
       <div role="tabpanel" className="flex min-h-0 flex-1 flex-col">
         {activeTab === "bytecode" ? (
