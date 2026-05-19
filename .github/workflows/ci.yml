@@ -6,6 +6,12 @@ name: CI
 
 on: [push, pull_request]
 
+# opt every javascript action into node 24, ahead of github's forced flip on
+# 2026-06-02. avoids the "Node.js 20 actions are deprecated" warning that
+# actions/setup-node@v4 and friends still emit on this runner.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   verify:
     runs-on: ubuntu-latest
