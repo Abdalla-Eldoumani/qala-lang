@@ -107,8 +107,7 @@ impl Arm64Backend {
             });
         }
 
-        self.emit_printf(&format, &holes);
-        Ok(())
+        self.emit_printf(&format, &holes)
     }
 
     /// walk a `print` / `println` argument into a `printf` format string and a
@@ -191,7 +190,18 @@ impl Arm64Backend {
     /// slots are loaded into `x1`, `x2`, ..., the format-string pointer is
     /// loaded into `x0` with `ldr x0, =<label>`, and `bl printf` is emitted.
     /// the claimed slots are released after the call.
-    fn emit_printf(&mut self, format: &str, holes: &[&TypedExpr]) {
+    ///
+    /// returns a [`QalaError`] -- never a panic -- if a hole's evaluation
+    /// fails. `build_format` proved every hole `i64`-typed, but an `i64`-typed
+    /// hole may still be a construct the integer core does not lower (a hole
+    /// that is an `i64`-returning stdlib call, say), and `compile_expr`
+    /// rejects that. the error propagates with `?` here and on through
+    /// `compile_print_call`, the same shape `compile_call` uses for a user
+    /// call -- the two halves of the lowering flow errors the same way. on the
+    /// error path the hole-slot release loop is skipped: the compile is
+    /// already failing and the frame is discarded, so the unbalanced claim is
+    /// inert.
+    fn emit_printf(&mut self, format: &str, holes: &[&TypedExpr]) -> Result<(), QalaError> {
         let label = self.asm.intern_format(format);
 
         // evaluate each hole into x0, then spill it to a claimed scratch slot.
@@ -200,13 +210,10 @@ impl Arm64Backend {
         // slot is taken -- the same discipline `compile_call` documents.
         let mut hole_slots = Vec::with_capacity(holes.len());
         for (i, hole) in holes.iter().enumerate() {
-            // a hole reaching here is i64-typed; compile_expr cannot fail on an
-            // integer-core expression, but a defensive `?` keeps a deeper
-            // unsupported sub-construct a clean error rather than a panic.
-            if let Err(e) = self.compile_expr(hole) {
-                self.errors.push(e);
-                return;
-            }
+            // a hole is i64-typed, but an i64-typed construct can still be
+            // unsupported (an i64-returning stdlib call) -- `?` makes that a
+            // clean error, propagated like `compile_call`'s, never a panic.
+            self.compile_expr(hole)?;
             let slot = self.frame_mut().claim_scratch();
             self.asm.emit_insn_commented(
                 &format!("str     x0, [fp, {slot}]"),
@@ -228,6 +235,7 @@ impl Arm64Backend {
         for _ in &hole_slots {
             self.frame_mut().release_scratch();
         }
+        Ok(())
     }
 }
 
@@ -432,6 +440,22 @@ mod tests {
         assert!(
             msg.contains("bool") && msg.contains("interpolation"),
             "the rejection must name the bool hole: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_i64_typed_but_unsupported_hole_is_rejected_cleanly() {
+        // a hole that IS i64-typed -- so it passes `build_format`'s hole-type
+        // check -- but is still a construct the integer core does not lower:
+        // `abs` is an i64-returning stdlib call, and `compile_expr` rejects a
+        // stdlib call. this is the reachable error path `emit_printf`'s `?`
+        // exists for: the error propagates out as a clean `QalaError` naming
+        // `abs`, never a panic, never swallowed. it proves `emit_printf` flows
+        // a hole-evaluation error the same way `compile_call` does.
+        let msg = compile_err("fn main() is io { let a = -3\nprintln(\"{abs(a)}\") }");
+        assert!(
+            msg.contains("abs"),
+            "an i64-typed unsupported hole must be rejected naming `abs`: {msg}"
         );
     }
 
