@@ -54,7 +54,12 @@ use super::Arm64Backend;
 /// `printf`'s format-string pointer takes `x0`, so seven holes (`x1`-`x7`)
 /// remain. an interpolation with more holes would need a stack-passed
 /// argument, which the integer core does not emit.
-const MAX_PRINTF_HOLES: usize = 7;
+///
+/// derived from [`expr::MAX_CALL_ARGS`](super::expr) (the eight `x0`-`x7`
+/// registers) minus the one `x0` the format-string pointer takes -- the two
+/// constants encode the same AArch64 fact, so deriving one keeps them in
+/// lockstep.
+const MAX_PRINTF_HOLES: usize = super::expr::MAX_CALL_ARGS - 1;
 
 impl Arm64Backend {
     /// lower a `print` / `println` call to a `printf` call, leaving `printf`'s
