@@ -32,6 +32,9 @@ cargo install qala-cli
 qala --help
 ```
 
+Or download a prebuilt `qala` binary for Linux, macOS, or Windows from the
+[releases page](https://github.com/Abdalla-Eldoumani/qala-lang/releases/latest).
+
 ## build from source
 
 Run from the workspace root.
