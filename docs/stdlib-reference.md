@@ -6,7 +6,7 @@ everywhere.
 
 Each entry below gives the function's signature, its effect, what it does, and
 a short example you can run. The signatures and effects here are copied from
-`stdlib_signatures()` in `compiler/src/typechecker.rs`, which is the source of
+`stdlib_signatures()` in `crates/qala-compiler/src/typechecker.rs`, which is the source of
 truth. If a doc and the compiler ever disagree, the compiler is right.
 
 ## a note on effects
