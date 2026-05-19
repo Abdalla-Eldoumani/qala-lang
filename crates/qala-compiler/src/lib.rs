@@ -23,6 +23,8 @@ pub mod opcode;
 pub mod chunk;
 // typed AST -> bytecode; constant folding, DCE, defer compilation, comptime.
 pub mod codegen;
+// typed AST -> AArch64 assembly text; the CPSC 355 hosted-Linux dialect.
+pub mod arm64;
 // peephole optimizer -- single-pass bytecode rewrites.
 pub mod optimizer;
 // stack-based bytecode interpreter -- call frames, heap, single-step.
