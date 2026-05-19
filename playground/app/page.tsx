@@ -1,12 +1,12 @@
 "use client";
 
 // the playground shell: a thin orchestrator. it calls useQala once and
-// renders the responsive grid -- the editor, the four real panels, the
+// renders the responsive grid: the editor, the four real panels, the
 // editor header with the example loader, and the controls bar. it holds
 // two pieces of local UI state (the desktop bytecode-collapsed flag and
 // the mobile active tab); execution state lives in rust, owned by the
 // hook. the page passes the hook's one VmState snapshot to every panel,
-// so the panels update together on each step -- no panel calls the
+// so the panels update together on each step; no panel calls the
 // bridge itself.
 //
 // the editor is imported through next/dynamic with ssr false: monaco
@@ -27,8 +27,8 @@ const Editor = dynamic(() => import("@/components/Editor"), { ssr: false });
 
 type MobileTab = "stack" | "variables" | "console";
 
-// the editor header: the wordmark at the leading edge, then -- at the
-// trailing edge -- the example loader and the tablet bytecode toggle.
+// the editor header: the wordmark at the leading edge, then, at the
+// trailing edge, the example loader and the tablet bytecode toggle.
 // the example loader sits before the toggle in source order.
 function EditorHeader({
   bytecodeShown,
@@ -61,7 +61,7 @@ function EditorHeader({
         />
         {/* the tablet output toggle: visible only at the tablet width.
             it reveals the compiler-output panel, which hosts the
-            Bytecode and ARM64 tabs -- so the toggle is labelled Output. */}
+            Bytecode and ARM64 tabs, so the toggle is labelled Output. */}
         <button
           type="button"
           onClick={onToggleBytecode}
@@ -93,10 +93,10 @@ function LoadingSurface() {
   );
 }
 
-// the load-failure surface. it renders fixed plain-language copy -- never
+// the load-failure surface. it renders fixed plain-language copy, never
 // the caught error. no stack trace, no error code, no exception text. the
 // centered layout carries the surface; there is no border, and no side
-// stripe -- a colored left border on a block is an anti-pattern.
+// stripe, since a colored left border on a block is an anti-pattern.
 function ErrorSurface() {
   return (
     <div className="flex h-full flex-col items-center justify-center bg-bg p-[var(--space-6)]">
@@ -139,7 +139,11 @@ function MobileTabs({
           role="tab"
           aria-selected={active === tab.id}
           onClick={() => onSelect(tab.id)}
-          className={`rounded-[var(--radius-button)] border px-[var(--space-3)] py-[var(--space-1)] text-[12px] font-medium uppercase tracking-wide leading-[1.4] transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent ${
+          // a 44px minimum hit area on mobile, where the tabs are
+          // touch-driven; the tab strip is mobile-only, so the
+          // min-[768px] reset is defensive parity with the other
+          // controls rather than a width this strip ever reaches.
+          className={`inline-flex min-h-[44px] items-center justify-center rounded-[var(--radius-button)] border px-[var(--space-3)] py-[var(--space-1)] text-[12px] font-medium uppercase tracking-wide leading-[1.4] transition-colors duration-150 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent min-[768px]:min-h-0 ${
             active === tab.id
               ? "border-accent text-accent"
               : "border-border text-text-secondary hover:border-text-secondary"
@@ -179,7 +183,7 @@ export default function Page() {
     lastArm64,
   } = useQala();
 
-  // local UI state -- not execution state. the bytecode panel collapse
+  // local UI state, not execution state. the bytecode panel collapse
   // (desktop) and the visible mobile tab live here, in the page.
   const [bytecodeCollapsed, setBytecodeCollapsed] = useState(false);
   const [bytecodeShown, setBytecodeShown] = useState(false);
@@ -188,24 +192,24 @@ export default function Page() {
   // a program is compiled when the last compile succeeded and produced a
   // disassembly. this one derived signal drives the console mode (program
   // vs repl) and the Controls disabled matrix. it stays true after an
-  // edit -- the separate dirty flag is the stale signal -- so the panels
+  // edit (the separate dirty flag is the stale signal) so the panels
   // and the controls reflect "a program exists, but it is stale".
   //
   // the disassembly check relies on the bridge invariant that a
   // CompileResult carries a disassembly string exactly when ok is true,
   // and leaves it undefined (never a placeholder string) on a failed
   // compile. disassemble_core does return a truthy "no program" string
-  // elsewhere, but that string never reaches a CompileResult -- so the
+  // elsewhere, but that string never reaches a CompileResult, so the
   // check is sound. if compile_core ever changes its disassembly field,
   // revisit this gate.
   const programCompiled = Boolean(lastCompile?.ok && lastCompile.disassembly);
 
   // the Run handler. when the source is dirty, Run compiles first, then
-  // starts the animated loop -- the compile-then-run affordance. this is
+  // starts the animated loop, the compile-then-run affordance. this is
   // wiring, not business logic: it only sequences two hook calls so the
   // page stays a thin orchestrator. compile is synchronous (it calls the
   // bridge and updates the snapshot in the same tick), so play() runs the
-  // freshly compiled program. a failed compile returns false -- the
+  // freshly compiled program. a failed compile returns false: the
   // editor squiggles surface the errors and the loop does not start.
   const handleRun = useCallback(() => {
     if (dirty && !compile()) return;
@@ -231,7 +235,7 @@ export default function Page() {
       />
     );
 
-  // the controls bar -- rendered in two places (in the editor column from
+  // the controls bar, rendered in two places (in the editor column from
   // tablet up, pinned to the viewport bottom on mobile). both copies wire
   // the same hook methods, so this builds the element once.
   const controlsBar = (
@@ -254,7 +258,7 @@ export default function Page() {
   // track shrinks to auto (the slim re-expand rail) and the editor and
   // state columns take the freed width. every breakpoint in this file
   // uses the arbitrary min-[..px] variant family so tailwind sorts them
-  // purely by min-width -- mixing a named md variant with an arbitrary
+  // purely by min-width; mixing a named md variant with an arbitrary
   // min-[1200px] variant sorts them into separate groups and the wrong
   // rule wins at desktop widths.
   const desktopColumns = bytecodeCollapsed
