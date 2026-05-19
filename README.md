@@ -34,6 +34,23 @@ qala --help
 
 Or download a prebuilt `qala` binary for Linux, macOS, or Windows from the
 [releases page](https://github.com/Abdalla-Eldoumani/qala-lang/releases/latest).
+Extract the archive and add the directory to your `PATH`, or invoke `qala`
+by its full path.
+
+`qala` is a command-line tool, not a desktop application. Run it from a
+terminal:
+
+```bash
+qala --help        # list every subcommand
+qala repl          # open the interactive shell
+qala run f.qala    # compile and run a program
+qala check f.qala  # type-check without running
+```
+
+On Windows, double-clicking `qala.exe` opens a console that closes
+immediately, because the binary expects a subcommand and prints its help
+to a terminal that disappears. Open Command Prompt or PowerShell first
+and run `qala` from there.
 
 ## build from source
 
