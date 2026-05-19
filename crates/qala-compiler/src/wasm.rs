@@ -36,6 +36,23 @@ pub struct CompileResult {
     pub diagnostics: Vec<crate::diagnostics::MonacoDiagnostic>,
 }
 
+/// the result of `compile_arm64`. read by the playground's assembly view.
+///
+/// the same flat ok-flag shape as `CompileResult`: the playground branches
+/// on `ok`. derives `serde::Serialize` so the WASM bridge hands it straight
+/// to JS via `serde-wasm-bindgen`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Arm64Result {
+    /// true when the ARM64 backend produced assembly, false on any error
+    /// (a front-end error, or an unsupported-construct rejection).
+    pub ok: bool,
+    /// the AArch64 assembly text; `Some` on success, `None` on error.
+    pub assembly: Option<String>,
+    /// the diagnostics on failure -- an unsupported-construct rejection or a
+    /// front-end error -- empty on success.
+    pub diagnostics: Vec<crate::diagnostics::MonacoDiagnostic>,
+}
+
 /// the result of `run`. read by the playground's stack, variables, and
 /// console panels (the `state`) and its editor (the runtime-error underline).
 ///
@@ -142,6 +159,24 @@ fn compile_failed(errors: Vec<crate::errors::QalaError>, src: &str) -> CompileRe
     }
 }
 
+/// build the failed `Arm64Result` from a list of errors -- a front-end
+/// error or the backend's unsupported-construct rejection.
+///
+/// each `QalaError` converts to a `MonacoDiagnostic` through the same
+/// diagnostics path `compile_failed` uses: `Diagnostic::from(err)` then
+/// `.to_monaco(src)`. the source string translates the error's byte span
+/// into a 1-based line and column.
+fn arm64_failed(errors: Vec<crate::errors::QalaError>, src: &str) -> Arm64Result {
+    Arm64Result {
+        ok: false,
+        assembly: None,
+        diagnostics: errors
+            .into_iter()
+            .map(|e| crate::diagnostics::Diagnostic::from(e).to_monaco(src))
+            .collect(),
+    }
+}
+
 /// serialize a result struct to a `JsValue`.
 ///
 /// on the practically unreachable serialization failure -- the result structs
@@ -238,6 +273,44 @@ impl Qala {
                 .iter()
                 .map(|w| crate::diagnostics::Diagnostic::from(w).to_monaco(source))
                 .collect(),
+        }
+    }
+
+    /// compile the given source through the ARM64 backend and return an
+    /// `Arm64Result`.
+    ///
+    /// runs lex, parse, and typecheck -- the same front end `compile_core`
+    /// runs -- then `crate::arm64::compile_arm64` on the typed AST. on a
+    /// front-end error returns `ok: false` with the front-end diagnostics; on
+    /// an unsupported-construct rejection returns `ok: false` with the
+    /// backend's diagnostics; on success returns `ok: true` with the assembly.
+    /// the source is an argument rather than `self.last_src` -- `last_src` is
+    /// set only on a successful `compile_core`, so reusing it would silently
+    /// compile stale source after a failed compile. never panics, never throws.
+    fn compile_arm64_core(&mut self, source: &str) -> Arm64Result {
+        // stage 1: lex. a single QalaError on failure.
+        let tokens = match crate::lexer::Lexer::tokenize(source) {
+            Ok(t) => t,
+            Err(e) => return arm64_failed(vec![e], source),
+        };
+        // stage 2: parse. a single QalaError on failure.
+        let ast = match crate::parser::Parser::parse(&tokens) {
+            Ok(a) => a,
+            Err(e) => return arm64_failed(vec![e], source),
+        };
+        // stage 3: typecheck. errors block; warnings never block.
+        let (typed, errors, _warnings) = crate::typechecker::check_program(&ast, source);
+        if !errors.is_empty() {
+            return arm64_failed(errors, source);
+        }
+        // stage 4: the ARM64 backend. an unsupported construct is Err(Vec<QalaError>).
+        match crate::arm64::compile_arm64(&typed, source) {
+            Ok(assembly) => Arm64Result {
+                ok: true,
+                assembly: Some(assembly),
+                diagnostics: Vec::new(),
+            },
+            Err(errs) => arm64_failed(errs, source),
         }
     }
 
@@ -416,6 +489,15 @@ impl Qala {
         to_js(&self.compile_core(source))
     }
 
+    /// compile the source through the ARM64 backend and return an
+    /// `Arm64Result` as a `JsValue`.
+    ///
+    /// never throws -- a front-end error or an unsupported construct is
+    /// `ok: false` data in the value.
+    pub fn compile_arm64(&mut self, source: &str) -> JsValue {
+        to_js(&self.compile_arm64_core(source))
+    }
+
     /// run the compiled program and return a `RunResult` as a `JsValue`.
     ///
     /// never throws -- a runtime error or misuse is `ok: false` data in the
@@ -548,6 +630,47 @@ mod tests {
             "the unused-variable warning should be in the diagnostics: {:?}",
             result.diagnostics,
         );
+    }
+
+    // ---- compile_arm64_core -----------------------------------------------
+
+    #[test]
+    fn compile_arm64_core_on_an_integer_program_returns_ok_with_assembly() {
+        let mut qala = Qala::new();
+        // an integer-core program: a `let` and an i64-holed interpolation, both
+        // inside the ARM64 backend's shipped integer core.
+        let src = "fn main() is io {\n  let x = 1 + 2\n  println(\"{x}\")\n}";
+        let result = qala.compile_arm64_core(src);
+        assert!(result.ok, "expected ARM64 success: {:?}", result.diagnostics);
+        let assembly = result.assembly.expect("a success carries assembly");
+        assert!(!assembly.is_empty(), "the assembly text should not be empty");
+        assert!(result.diagnostics.is_empty(), "a success carries no diagnostics");
+    }
+
+    #[test]
+    fn compile_arm64_core_on_a_float_program_returns_the_backend_rejection() {
+        let mut qala = Qala::new();
+        // a float is outside the integer core -- the typechecker accepts it,
+        // the ARM64 backend rejects it with a clean diagnostic.
+        let result = qala.compile_arm64_core("fn main() is io {\n  let x = 1.5\n}");
+        assert!(!result.ok, "a float program must fail the ARM64 backend");
+        assert!(result.assembly.is_none(), "a rejected program has no assembly");
+        assert!(!result.diagnostics.is_empty(), "the rejection must surface a diagnostic");
+        let message = &result.diagnostics[0].message;
+        assert!(
+            message.contains("f64") || message.contains("floats"),
+            "the diagnostic should name the unsupported float construct: {message:?}",
+        );
+    }
+
+    #[test]
+    fn compile_arm64_core_on_a_broken_program_returns_not_ok() {
+        let mut qala = Qala::new();
+        // a syntactically broken program fails the front end before the backend.
+        let result = qala.compile_arm64_core("fn main( {");
+        assert!(!result.ok, "a broken program must fail the compile");
+        assert!(result.assembly.is_none(), "a failed compile has no assembly");
+        assert!(!result.diagnostics.is_empty(), "the syntax error must surface a diagnostic");
     }
 
     // ---- the WASM-05 end-to-end test --------------------------------------
@@ -705,6 +828,11 @@ mod tests {
             value: None,
             console: Vec::new(),
             error: None,
+        });
+        assert_serialize(&Arm64Result {
+            ok: true,
+            assembly: None,
+            diagnostics: Vec::new(),
         });
     }
 }
