@@ -221,28 +221,136 @@ impl Arm64Backend {
         Ok(())
     }
 
-    /// compile a `while` loop.
+    /// compile a `while` loop, test-at-bottom.
     ///
-    /// Task 3 replaces this placeholder with the real test-at-bottom codegen.
+    /// the shape is `b test`, the body label, the body, the test label, the
+    /// condition, `cbnz` back to the body, the end label. testing at the
+    /// bottom -- one unconditional branch in, one conditional branch per
+    /// iteration -- is one fewer branch per iteration than a test-at-top loop.
+    /// `break` branches to the end label, `continue` to the test label, so the
+    /// loop-label record's `continue` target is the test label.
     fn compile_while(
         &mut self,
-        _cond: &TypedExpr,
+        cond: &TypedExpr,
         body: &TypedBlock,
     ) -> Result<(), QalaError> {
-        Err(self.unsupported_stmt(body.span, "while loops"))
+        let body_label = self.labels.fresh("while_body");
+        let test_label = self.labels.fresh("while_test");
+        let end_label = self.labels.fresh("while_end");
+        // jump straight to the test: the body runs only if the test passes.
+        self.asm.emit_insn(&format!("b       {test_label}"));
+        self.asm.emit_label(&body_label);
+        // the loop is active for the body walk -- break/continue resolve here.
+        self.loops.push(LoopLabels {
+            continue_target: test_label.clone(),
+            end: end_label.clone(),
+        });
+        let body_result = self.compile_block(body);
+        // pop the record whether or not the body compiled, so the stack stays
+        // balanced when the caller accumulates the error.
+        self.loops.pop();
+        body_result?;
+        // the test: re-evaluate the condition, branch back if still true.
+        self.asm.emit_label(&test_label);
+        self.compile_expr(cond)?;
+        self.asm.emit_insn(&format!("cbnz    x0, {body_label}"));
+        self.asm.emit_label(&end_label);
+        Ok(())
     }
 
-    /// compile a `for` loop over a range.
+    /// compile a `for` loop over a range: `for var in start..end` or
+    /// `start..=end`.
     ///
-    /// Task 3 replaces this placeholder with the real counter-based codegen.
+    /// the integer core iterates a range only -- a `for` over any other
+    /// iterable, or a range with a missing bound, is an unsupported construct
+    /// and returns a [`QalaError`]. the lowered shape: store `start` into the
+    /// loop variable's slot and `end` into a dedicated slot (evaluated once,
+    /// not per iteration), `b test`, the body label, the body, the increment
+    /// label, the increment, the test label, the `var < end` (or `<=`) check,
+    /// `b.lt`/`b.le` back to the body, the end label.
+    ///
+    /// `continue` branches to the increment label -- so a `continue` runs the
+    /// increment before the test -- which is why the increment has its own
+    /// label and the loop-label record's `continue` target is that label.
     fn compile_for(
         &mut self,
-        _var: &str,
-        _iter: &TypedExpr,
-        _body: &TypedBlock,
+        var: &str,
+        iter: &TypedExpr,
+        body: &TypedBlock,
         span: Span,
     ) -> Result<(), QalaError> {
-        Err(self.unsupported_stmt(span, "for loops"))
+        // the integer core supports a range iterable only.
+        let (start, end, inclusive) = match iter {
+            TypedExpr::Range { start, end, inclusive, .. } => (start, end, *inclusive),
+            _ => {
+                return Err(
+                    self.unsupported_stmt(span, "for over a non-range iterable")
+                );
+            }
+        };
+        // a `for` range must have both bounds -- `for i in ..n` is unsupported.
+        let start = start.as_ref().ok_or_else(|| {
+            self.unsupported_stmt(span, "a for range with no start bound")
+        })?;
+        let end = end.as_ref().ok_or_else(|| {
+            self.unsupported_stmt(span, "a for range with no end bound")
+        })?;
+
+        // plan_frame reserved two slots for this `for`: the loop variable
+        // first, then the `end` bound. claim them in that order.
+        let var_slot = self.next_binding_slot(span)?;
+        let end_slot = self.next_binding_slot(span)?;
+
+        // counter init: start -> the var slot.
+        self.compile_expr(start)?;
+        self.asm
+            .emit_insn_commented(&format!("str     x0, [fp, {var_slot}]"), var);
+        // the end bound, evaluated ONCE into its dedicated slot.
+        self.compile_expr(end)?;
+        self.asm
+            .emit_insn_commented(&format!("str     x0, [fp, {end_slot}]"), "for end");
+
+        let body_label = self.labels.fresh("for_body");
+        let incr_label = self.labels.fresh("for_incr");
+        let test_label = self.labels.fresh("for_test");
+        let end_label = self.labels.fresh("for_end");
+
+        // the loop variable is in scope for the body -- record it so an Ident
+        // reference to it resolves to var_slot.
+        self.bind_name(var, var_slot);
+
+        self.asm.emit_insn(&format!("b       {test_label}"));
+        self.asm.emit_label(&body_label);
+        // `continue` branches to the increment label, not the test, so the
+        // increment always runs before the next test.
+        self.loops.push(LoopLabels {
+            continue_target: incr_label.clone(),
+            end: end_label.clone(),
+        });
+        let body_result = self.compile_block(body);
+        self.loops.pop();
+        body_result?;
+
+        // the increment: var = var + 1. the body falls through to here.
+        self.asm.emit_label(&incr_label);
+        self.asm
+            .emit_insn(&format!("ldr     x0, [fp, {var_slot}]"));
+        self.asm.emit_insn("add     x0, x0, 1");
+        self.asm
+            .emit_insn(&format!("str     x0, [fp, {var_slot}]"));
+
+        // the test: load var and end, compare, branch back into the body. an
+        // inclusive `..=` range uses `b.le`, an exclusive `..` uses `b.lt`.
+        self.asm.emit_label(&test_label);
+        self.asm
+            .emit_insn(&format!("ldr     x0, [fp, {var_slot}]"));
+        self.asm
+            .emit_insn(&format!("ldr     x9, [fp, {end_slot}]"));
+        self.asm.emit_insn("cmp     x0, x9");
+        let branch = if inclusive { "b.le" } else { "b.lt" };
+        self.asm.emit_insn(&format!("{branch}    {body_label}"));
+        self.asm.emit_label(&end_label);
+        Ok(())
     }
 
     /// the stack slot of the next body binding occurrence, advancing the cursor.
@@ -469,6 +577,186 @@ mod tests {
         match err {
             QalaError::Type { message, .. } => {
                 assert!(message.contains("break"), "message: {message}");
+            }
+            other => panic!("expected QalaError::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_while_emits_the_test_at_bottom_shape() {
+        // the test-at-bottom shape: `b while_test`, the body label, the test
+        // label, a `cbnz` back to the body.
+        let out = compile_ok("fn f(c: bool) { while c { } }");
+        assert!(out.contains("b       .Lwhile_test_"), "missing jump to test: {out}");
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with(".Lwhile_body_")),
+            "missing body label: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with(".Lwhile_test_")),
+            "missing test label: {out}"
+        );
+        assert!(out.contains("cbnz    x0, .Lwhile_body_"), "missing cbnz: {out}");
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with(".Lwhile_end_")),
+            "missing end label: {out}"
+        );
+    }
+
+    #[test]
+    fn a_while_break_branches_to_the_end_label() {
+        // a `break` inside a while branches to that loop's end label.
+        let out = compile_ok("fn f(c: bool) { while c { break } }");
+        // there is exactly one while; its end label is .Lwhile_end_N and the
+        // break is `b .Lwhile_end_N`.
+        let end_target = out
+            .lines()
+            .find_map(|l| {
+                let t = l.trim();
+                t.strip_prefix(".Lwhile_end_").map(|n| {
+                    format!(".Lwhile_end_{}", n.trim_end_matches(':'))
+                })
+            })
+            .expect("no while end label");
+        assert!(
+            out.contains(&format!("b       {end_target}")),
+            "break must branch to {end_target}: {out}"
+        );
+    }
+
+    #[test]
+    fn a_while_continue_branches_to_the_test_label() {
+        // a `continue` inside a while branches to that loop's TEST label, so
+        // the condition is re-checked.
+        let out = compile_ok("fn f(c: bool) { while c { continue } }");
+        let test_target = out
+            .lines()
+            .find_map(|l| {
+                let t = l.trim();
+                t.strip_prefix(".Lwhile_test_").map(|n| {
+                    format!(".Lwhile_test_{}", n.trim_end_matches(':'))
+                })
+            })
+            .expect("no while test label");
+        // the `continue` is one `b` to the test label; the loop entry is the
+        // other. two branches to the test label total.
+        let branches = out
+            .lines()
+            .filter(|l| l.contains(&format!("b       {test_target}")))
+            .count();
+        assert_eq!(branches, 2, "loop entry + continue both branch to the test: {out}");
+    }
+
+    #[test]
+    fn a_for_over_an_exclusive_range_emits_b_lt() {
+        // `for i in 0..n` -- an exclusive range -- tests with `b.lt`.
+        let out = compile_ok("fn f(n: i64) { for i in 0..n { } }");
+        assert!(out.contains("b       .Lfor_test_"), "missing jump to test: {out}");
+        assert!(
+            out.lines().any(|l| l.trim_start().starts_with(".Lfor_incr_")),
+            "missing increment label: {out}"
+        );
+        assert!(out.contains("add     x0, x0, 1"), "missing the increment: {out}");
+        assert!(out.contains("cmp     x0, x9"), "missing the compare: {out}");
+        assert!(out.contains("b.lt    .Lfor_body_"), "exclusive range -> b.lt: {out}");
+        assert!(!out.contains("b.le"), "an exclusive range must not use b.le: {out}");
+    }
+
+    #[test]
+    fn a_for_over_an_inclusive_range_emits_b_le() {
+        // `for i in 0..=n` -- an inclusive range -- tests with `b.le`.
+        let out = compile_ok("fn f(n: i64) { for i in 0..=n { } }");
+        assert!(out.contains("b.le    .Lfor_body_"), "inclusive range -> b.le: {out}");
+        assert!(!out.contains("b.lt"), "an inclusive range must not use b.lt: {out}");
+    }
+
+    #[test]
+    fn a_for_continue_branches_to_the_increment_label() {
+        // a `continue` inside a for branches to the INCREMENT label, so the
+        // loop variable still advances before the next test.
+        let out = compile_ok("fn f(n: i64) { for i in 0..n { continue } }");
+        let incr_target = out
+            .lines()
+            .find_map(|l| {
+                let t = l.trim();
+                t.strip_prefix(".Lfor_incr_").map(|n| {
+                    format!(".Lfor_incr_{}", n.trim_end_matches(':'))
+                })
+            })
+            .expect("no for increment label");
+        assert!(
+            out.contains(&format!("b       {incr_target}")),
+            "continue must branch to {incr_target}: {out}"
+        );
+    }
+
+    #[test]
+    fn a_for_evaluates_its_end_bound_once_into_a_slot() {
+        // the `end` bound is stored once, before the loop, with a `// for end`
+        // comment -- not re-evaluated each iteration.
+        let out = compile_ok("fn f(n: i64) { for i in 0..n { } }");
+        let end_stores = out
+            .lines()
+            .filter(|l| l.contains("str     x0, [fp,") && l.contains("// for end"))
+            .count();
+        assert_eq!(end_stores, 1, "the for end bound is stored exactly once: {out}");
+    }
+
+    #[test]
+    fn a_for_over_a_non_range_iterable_is_rejected_cleanly() {
+        // `for x in arr` -- an array iterable -- is outside the integer core.
+        // a clean QalaError, never a panic.
+        let typed = typecheck("fn f() { let arr = [1, 2, 3]\nfor x in arr { } }");
+        let err = super::super::compile_arm64(&typed, "")
+            .expect_err("a non-range for must be rejected");
+        match &err[0] {
+            QalaError::Type { message, .. } => {
+                assert!(
+                    message.contains("non-range") || message.contains("array"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected QalaError::Type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_for_range_with_a_missing_bound_is_rejected_cleanly() {
+        // a range with no end bound reaches the For arm as a None -- the
+        // backend rejects it with a clean error, never a panic. build the
+        // typed AST directly: an unbounded range is not valid `for` surface
+        // syntax, so it cannot come from a parsed source.
+        use crate::types::QalaType;
+        let stmt = TypedStmt::For {
+            var: "i".to_string(),
+            var_ty: QalaType::I64,
+            iter: TypedExpr::Range {
+                start: Some(Box::new(TypedExpr::Int {
+                    value: 0,
+                    ty: QalaType::I64,
+                    span: Span::new(0, 1),
+                })),
+                end: None,
+                inclusive: false,
+                ty: QalaType::Array(Box::new(QalaType::I64), None),
+                span: Span::new(0, 4),
+            },
+            body: TypedBlock {
+                stmts: vec![],
+                value: None,
+                ty: QalaType::Void,
+                span: Span::new(5, 6),
+            },
+            span: Span::new(0, 7),
+        };
+        let mut backend = Arm64Backend::new("");
+        // a frame so binding_slot resolves -- a one-`for` frame has two slots.
+        let err = backend
+            .compile_stmt(&stmt)
+            .expect_err("a for with a missing bound must be rejected");
+        match err {
+            QalaError::Type { message, .. } => {
+                assert!(message.contains("bound"), "message: {message}");
             }
             other => panic!("expected QalaError::Type, got {other:?}"),
         }
