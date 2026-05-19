@@ -841,4 +841,139 @@ mod tests {
             other => panic!("expected QalaError::Type, got {other:?}"),
         }
     }
+
+    /// the instruction lines of `name`'s emitted function body -- the lines
+    /// from the `name:` label to its `.L<name>_epilogue:` label. a generalised
+    /// [`caller_body`] for tests that inspect a function other than `caller`.
+    fn fn_body(asm: &str, name: &str) -> Vec<String> {
+        let label = format!("{name}:");
+        let epilogue = format!(".L{name}_epilogue");
+        asm.lines()
+            .skip_while(|l| l.trim() != label)
+            .take_while(|l| !l.trim_start().starts_with(&epilogue))
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// the `[fp, N]` byte offset referenced by an instruction line, or `None`
+    /// if the line has no `[fp, ...]` operand.
+    fn fp_offset(line: &str) -> Option<i64> {
+        let start = line.find("[fp, ")? + "[fp, ".len();
+        let rest = &line[start..];
+        let end = rest.find(']')?;
+        rest[..end].trim().parse().ok()
+    }
+
+    #[test]
+    fn a_nested_call_in_a_later_argument_does_not_clobber_an_earlier_argument() {
+        // CR-01 regression. `h(100, id(7))` where `h` returns its FIRST
+        // parameter: `f` must compute h(100, _) and so return 100. the bug was
+        // a single shared argument run -- the nested `id(7)` reused argument
+        // slot 0 and overwrote the outer call's stored 100 with 7, so `f`
+        // returned 7. the fix gives each argument a distinct CLAIMED scratch
+        // slot, so the nested call cannot alias the outer call's slot 0.
+        //
+        // the distinct-value proof: find the slot the outer `h` call stores
+        // its first argument (100) into, then assert that slot is NEVER
+        // written again before `bl h` consumes it. if it is provably still
+        // 100 at the call, the nested call did not clobber it.
+        let asm = compile_program_ok(
+            "fn id(x: i64) -> i64 { x }\n\
+             fn h(a: i64, b: i64) -> i64 { a }\n\
+             fn f() -> i64 { h(100, id(7)) }",
+        );
+        let body = fn_body(&asm, "f");
+        // the line that loads the constant 100 into x0.
+        let mov_100 = body
+            .iter()
+            .position(|l| l.trim() == "mov     x0, 100")
+            .expect("missing `mov x0, 100` for the outer call's first argument");
+        // the very next line spills x0 -- the outer call's argument 0.
+        let spill_line = &body[mov_100 + 1];
+        assert!(
+            spill_line.contains("str     x0, [fp, ") && spill_line.contains("// arg 0"),
+            "the 100 must be spilled as argument 0 right after the mov: {body:?}"
+        );
+        let arg0_slot = fp_offset(spill_line).expect("argument 0 spill has no [fp, N]");
+        // the `bl h` that consumes the loaded arguments.
+        let bl_h = body
+            .iter()
+            .position(|l| l.trim() == "bl      h")
+            .expect("missing `bl h`");
+        // between spilling 100 and `bl h`, the argument-0 slot must not be
+        // written again -- not by the nested `id(7)` call, not by anything.
+        let clobber = body[mov_100 + 2..bl_h]
+            .iter()
+            .find(|l| l.contains("str ") && fp_offset(l) == Some(arg0_slot));
+        assert!(
+            clobber.is_none(),
+            "argument 0 (100) at [fp, {arg0_slot}] was overwritten before `bl h`: \
+             {clobber:?} in {body:?}"
+        );
+        // and the inner call genuinely runs in between -- the test would be
+        // vacuous if `id(7)` were folded away.
+        assert!(
+            body[mov_100 + 2..bl_h].iter().any(|l| l.trim() == "bl      id"),
+            "the nested `id(7)` call must run between the two outer arguments: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_deep_arithmetic_call_argument_keeps_every_slot_inside_the_frame() {
+        // CR-02 regression. `id(((a+1)*(a+2)) - ((a+3)*(a+4)))` -- a call whose
+        // single argument is a deeply-nested arithmetic expression. the bug
+        // was that the frame planner's spill-depth pre-walk had no `Call` arm,
+        // so the call contributed zero scratch depth even though its argument
+        // expression claims scratch slots; the emitter then stored past the
+        // end of the frame -- stack corruption. the fix descends into call
+        // arguments, so the frame reserves enough scratch.
+        //
+        // the proof: read the function's own frame size from its epilogue
+        // (`ldp fp, lr, [sp], dealloc`) and assert every `[fp, N]` the body
+        // touches satisfies N < dealloc -- inside the frame the function owns.
+        let asm = compile_program_ok(
+            "fn id(x: i64) -> i64 { x }\n\
+             fn f(a: i64) -> i64 { id(((a+1)*(a+2)) - ((a+3)*(a+4))) }",
+        );
+        // the whole `f` function, label through epilogue, so the `ldp` line
+        // (which sits after the epilogue label) is included.
+        let f_fn: Vec<&str> = asm
+            .lines()
+            .skip_while(|l| l.trim() != "f:")
+            .take_while(|l| l.trim() != "ret" && !l.trim().is_empty())
+            .collect();
+        // the epilogue's `ldp fp, lr, [sp], N` carries the frame size N.
+        let dealloc: i64 = f_fn
+            .iter()
+            .find_map(|l| {
+                let t = l.trim();
+                t.strip_prefix("ldp     fp, lr, [sp], ")
+                    .and_then(|n| n.trim().parse().ok())
+            })
+            .expect("missing the epilogue `ldp` line with the frame size");
+        // every fp-relative store/load must land strictly inside [fp, 0]..
+        // [fp, dealloc-1]: fp == sp after `mov fp, sp`, so [fp, dealloc] and
+        // beyond is the caller's frame.
+        for line in &f_fn {
+            if let Some(offset) = fp_offset(line) {
+                assert!(
+                    offset < dealloc,
+                    "`{}` writes [fp, {offset}] -- outside the {dealloc}-byte frame",
+                    line.trim()
+                );
+                assert!(offset >= 0, "`{}` has a negative fp offset", line.trim());
+            }
+        }
+        // the test is only meaningful if the body actually spilled to scratch
+        // -- a deep expression must produce several distinct spill slots.
+        let spill_slots: std::collections::BTreeSet<i64> = f_fn
+            .iter()
+            .filter(|l| l.contains("str     x0, [fp, "))
+            .filter_map(|l| fp_offset(l))
+            .collect();
+        assert!(
+            spill_slots.len() >= 3,
+            "a deep arithmetic argument must use several scratch slots: {f_fn:?}"
+        );
+    }
 }
