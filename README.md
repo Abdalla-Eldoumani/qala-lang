@@ -1,6 +1,8 @@
 # Qala
 
 [![CI](https://github.com/Abdalla-Eldoumani/qala-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdalla-Eldoumani/qala-lang/actions/workflows/ci.yml)
+[![crates.io: qala-cli](https://img.shields.io/crates/v/qala-cli?label=qala-cli)](https://crates.io/crates/qala-cli)
+[![crates.io: qala-compiler](https://img.shields.io/crates/v/qala-compiler?label=qala-compiler)](https://crates.io/crates/qala-compiler)
 
 A statically typed programming language where saying is doing.
 
@@ -128,10 +130,18 @@ mistakes without blocking compilation.
 
 ## documentation
 
-- `docs/language-guide.md` teaches Qala from scratch.
-- `docs/stdlib-reference.md` lists every built-in function.
-- `docs/language-spec.md` is the full feature reference with design rationale.
-- `docs/design-philosophy.md` is a short piece on the idea behind the language.
+The Qala language:
+
+- [docs/language-guide.md](docs/language-guide.md) teaches the language from scratch.
+- [docs/stdlib-reference.md](docs/stdlib-reference.md) lists every built-in function.
+- [docs/language-spec.md](docs/language-spec.md) is the full feature reference with design rationale.
+- [docs/design-philosophy.md](docs/design-philosophy.md) is a short piece on the idea behind it.
+
+The project:
+
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) covers how to build, test, and contribute.
+- [docs/CHANGELOG.md](docs/CHANGELOG.md) is the release history.
+- [docs/SECURITY.md](docs/SECURITY.md) is the security policy and disclosure channel.
 
 ## how it works
 
