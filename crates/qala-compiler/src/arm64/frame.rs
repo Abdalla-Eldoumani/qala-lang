@@ -69,7 +69,7 @@
 use crate::typed_ast::{
     TypedBlock, TypedElseBranch, TypedExpr, TypedFnDecl, TypedInterpPart, TypedStmt,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// the byte size of one stack slot. an `i64` and a `bool` both occupy a full
 /// 8-byte slot -- the integer core does not pack.
@@ -152,7 +152,12 @@ impl FrameLayout {
     /// pre-walk: [`max_spill_depth`] returns the peak number of scratch slots
     /// simultaneously live -- a binary operator's spilled LHS values and a
     /// call's spilled arguments together.
-    pub(crate) fn plan_frame(decl: &TypedFnDecl) -> FrameLayout {
+    ///
+    /// `fn_names` is the set of user-declared function names: a call to a
+    /// `print` / `println` name that the user has shadowed with their own
+    /// function is sized as an ordinary user call, not as a `printf` lowering,
+    /// so the spill pre-walk needs that set to match the emitter's routing.
+    pub(crate) fn plan_frame(decl: &TypedFnDecl, fn_names: &HashSet<String>) -> FrameLayout {
         let mut slots = HashMap::new();
         // parameter i lives at [fp, 16 + 8*i]: the first param at [fp, 16],
         // the second at [fp, 24], and so on -- just above the saved fp/lr pair.
@@ -174,7 +179,7 @@ impl FrameLayout {
         // they hold both a binary operator's spilled LHS and a call's spilled
         // arguments -- `max_spill_depth` accounts for both.
         let scratch_base = FP_LR_PAIR + SLOT_SIZE * named_slot_count;
-        let scratch_count = max_spill_depth(&decl.body);
+        let scratch_count = max_spill_depth(&decl.body, fn_names);
         let locals = SLOT_SIZE * (named_slot_count + scratch_count);
         let alloc = compute_alloc(locals);
         FrameLayout {
@@ -349,13 +354,13 @@ fn else_branch_binding_slots(branch: &TypedElseBranch) -> i64 {
 /// counted here. a single shared argument run would NOT be safe (a nested call
 /// would alias the outer call's saved arguments), which is why a call argument
 /// is a claimed scratch slot like any other.
-fn max_spill_depth(block: &TypedBlock) -> i64 {
+fn max_spill_depth(block: &TypedBlock, fn_names: &HashSet<String>) -> i64 {
     let mut max = 0;
     for stmt in &block.stmts {
-        max = max.max(stmt_spill_depth(stmt));
+        max = max.max(stmt_spill_depth(stmt, fn_names));
     }
     if let Some(value) = &block.value {
-        max = max.max(expr_spill_depth(value));
+        max = max.max(expr_spill_depth(value, fn_names));
     }
     max
 }
@@ -366,36 +371,37 @@ fn max_spill_depth(block: &TypedBlock) -> i64 {
 /// the count covers a call or a binary operator wherever one appears -- a
 /// `let` initializer, an `if` condition, a `for` range bound, a `return`
 /// value, a bare expression statement.
-fn stmt_spill_depth(stmt: &TypedStmt) -> i64 {
+fn stmt_spill_depth(stmt: &TypedStmt, fn_names: &HashSet<String>) -> i64 {
     match stmt {
-        TypedStmt::Expr { expr, .. } => expr_spill_depth(expr),
+        TypedStmt::Expr { expr, .. } => expr_spill_depth(expr, fn_names),
         TypedStmt::Return { value, .. } => {
-            value.as_ref().map(expr_spill_depth).unwrap_or(0)
+            value.as_ref().map(|v| expr_spill_depth(v, fn_names)).unwrap_or(0)
         }
-        TypedStmt::Let { init, .. } => expr_spill_depth(init),
+        TypedStmt::Let { init, .. } => expr_spill_depth(init, fn_names),
         TypedStmt::If { cond, then_block, else_branch, .. } => {
-            let mut d = expr_spill_depth(cond).max(max_spill_depth(then_block));
+            let mut d = expr_spill_depth(cond, fn_names)
+                .max(max_spill_depth(then_block, fn_names));
             if let Some(branch) = else_branch {
-                d = d.max(else_branch_spill_depth(branch));
+                d = d.max(else_branch_spill_depth(branch, fn_names));
             }
             d
         }
         TypedStmt::While { cond, body, .. } => {
-            expr_spill_depth(cond).max(max_spill_depth(body))
+            expr_spill_depth(cond, fn_names).max(max_spill_depth(body, fn_names))
         }
         TypedStmt::For { iter, body, .. } => {
-            expr_spill_depth(iter).max(max_spill_depth(body))
+            expr_spill_depth(iter, fn_names).max(max_spill_depth(body, fn_names))
         }
-        TypedStmt::Defer { expr, .. } => expr_spill_depth(expr),
+        TypedStmt::Defer { expr, .. } => expr_spill_depth(expr, fn_names),
         TypedStmt::Break { .. } | TypedStmt::Continue { .. } => 0,
     }
 }
 
 /// the maximum spill count within an `else` branch (a block or an `else if`).
-fn else_branch_spill_depth(branch: &TypedElseBranch) -> i64 {
+fn else_branch_spill_depth(branch: &TypedElseBranch, fn_names: &HashSet<String>) -> i64 {
     match branch {
-        TypedElseBranch::Block(b) => max_spill_depth(b),
-        TypedElseBranch::If(stmt) => stmt_spill_depth(stmt),
+        TypedElseBranch::Block(b) => max_spill_depth(b, fn_names),
+        TypedElseBranch::If(stmt) => stmt_spill_depth(stmt, fn_names),
     }
 }
 
@@ -419,11 +425,12 @@ fn else_branch_spill_depth(branch: &TypedElseBranch) -> i64 {
 /// is always a bare identifier of depth 0) is what this arm returns, matching
 /// the review's `args.len() + max(arg subtree depth)` model. non-call,
 /// non-binary nodes recurse into their children with no added slot.
-fn expr_spill_depth(expr: &TypedExpr) -> i64 {
+fn expr_spill_depth(expr: &TypedExpr, fn_names: &HashSet<String>) -> i64 {
     use crate::ast::BinOp;
     match expr {
         TypedExpr::Binary { op, lhs, rhs, .. } => {
-            let operands = expr_spill_depth(lhs).max(expr_spill_depth(rhs));
+            let operands = expr_spill_depth(lhs, fn_names)
+                .max(expr_spill_depth(rhs, fn_names));
             match op {
                 // && and || branch on x0 -- no LHS reload, no scratch slot.
                 BinOp::And | BinOp::Or => operands,
@@ -436,8 +443,8 @@ fn expr_spill_depth(expr: &TypedExpr) -> i64 {
         // one per argument -- the single `str` argument is itself walked into
         // the holes. `printf_call_spill_depth` computes that; a non-printf
         // call falls through to the general arity-plus-depth rule below.
-        TypedExpr::Call { callee, args, .. } if is_print_callee(callee) => {
-            printf_call_spill_depth(args)
+        TypedExpr::Call { callee, args, .. } if is_print_callee(callee, fn_names) => {
+            printf_call_spill_depth(args, fn_names)
         }
         // a call holds one scratch slot per argument simultaneously (the
         // spilled argument values, live until the `bl`), plus the deepest
@@ -446,18 +453,18 @@ fn expr_spill_depth(expr: &TypedExpr) -> i64 {
         // bare identifier. a single shared argument run is NOT used: it would
         // let a nested call clobber the outer call's saved arguments.
         TypedExpr::Call { callee, args, .. } => {
-            let mut deepest = expr_spill_depth(callee);
+            let mut deepest = expr_spill_depth(callee, fn_names);
             for arg in args {
-                deepest = deepest.max(expr_spill_depth(arg));
+                deepest = deepest.max(expr_spill_depth(arg, fn_names));
             }
             args.len() as i64 + deepest
         }
-        TypedExpr::Unary { operand, .. } => expr_spill_depth(operand),
-        TypedExpr::Paren { inner, .. } => expr_spill_depth(inner),
-        TypedExpr::Block { block, .. } => max_spill_depth(block),
+        TypedExpr::Unary { operand, .. } => expr_spill_depth(operand, fn_names),
+        TypedExpr::Paren { inner, .. } => expr_spill_depth(inner, fn_names),
+        TypedExpr::Block { block, .. } => max_spill_depth(block, fn_names),
         TypedExpr::Range { start, end, .. } => {
-            let s = start.as_deref().map(expr_spill_depth).unwrap_or(0);
-            let e = end.as_deref().map(expr_spill_depth).unwrap_or(0);
+            let s = start.as_deref().map(|e| expr_spill_depth(e, fn_names)).unwrap_or(0);
+            let e = end.as_deref().map(|e| expr_spill_depth(e, fn_names)).unwrap_or(0);
             s.max(e)
         }
         // a leaf or an unsupported construct contributes no spill.
@@ -471,11 +478,15 @@ fn expr_spill_depth(expr: &TypedExpr) -> i64 {
 /// slot per `i64` interpolation hole rather than one per call argument, so the
 /// frame planner counts a printf call differently from a user call. a callee
 /// is a printf callee when it is a bare identifier named `print` or `println`
-/// -- the only callee shape the emitter routes to the printf lowering.
-fn is_print_callee(callee: &TypedExpr) -> bool {
+/// AND that name is not a user-declared function -- a program may declare its
+/// own `fn println`, which shadows the built-in and is sized as an ordinary
+/// user call. this matches the routing in `expr.rs::compile_call`: the two
+/// must agree, or the planned frame would not fit the emitted body.
+fn is_print_callee(callee: &TypedExpr, fn_names: &HashSet<String>) -> bool {
     matches!(
         callee,
-        TypedExpr::Ident { name, .. } if name == "print" || name == "println"
+        TypedExpr::Ident { name, .. }
+            if (name == "print" || name == "println") && !fn_names.contains(name)
     )
 }
 
@@ -490,7 +501,7 @@ fn is_print_callee(callee: &TypedExpr) -> bool {
 /// string-literal argument has no holes and needs no scratch; a non-literal,
 /// non-interpolation argument is rejected by the emitter, so a `0` here is
 /// safe -- the frame for a program the backend rejects is never emitted.
-fn printf_call_spill_depth(args: &[TypedExpr]) -> i64 {
+fn printf_call_spill_depth(args: &[TypedExpr], fn_names: &HashSet<String>) -> i64 {
     // a well-typed print / println has exactly one str argument; walk it for
     // the interpolation holes. anything else contributes no scratch.
     let Some(TypedExpr::Interpolation { parts, .. }) = args.first() else {
@@ -501,7 +512,7 @@ fn printf_call_spill_depth(args: &[TypedExpr]) -> i64 {
     for part in parts {
         if let TypedInterpPart::Expr(expr) = part {
             hole_count += 1;
-            deepest = deepest.max(expr_spill_depth(expr));
+            deepest = deepest.max(expr_spill_depth(expr, fn_names));
         }
     }
     hole_count + deepest
@@ -545,6 +556,26 @@ mod tests {
         }
     }
 
+    /// an empty user-function-name set: the synthetic-decl tests make no
+    /// calls, so no `print` / `println` shadowing can apply.
+    fn no_fns() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// the set of every user-declared function name in `typed` -- what
+    /// `Arm64Backend::scan_fn_names` builds, reproduced for the source-based
+    /// frame tests so `plan_frame` sees the same shadowing context the
+    /// compiler does.
+    fn fn_names_of(typed: &crate::typed_ast::TypedAst) -> HashSet<String> {
+        typed
+            .iter()
+            .filter_map(|item| match item {
+                crate::typed_ast::TypedItem::Fn(d) => Some(d.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn empty_body() -> crate::typed_ast::TypedBlock {
         crate::typed_ast::TypedBlock {
             stmts: vec![],
@@ -580,7 +611,7 @@ mod tests {
         // a 0-parameter function with an empty body: no named slots, no
         // scratch, locals = 0 -> alloc = -16, dealloc = 16. the concrete
         // prologue/epilogue text is asserted verbatim.
-        let layout = FrameLayout::plan_frame(&fn_decl(0, empty_body()));
+        let layout = FrameLayout::plan_frame(&fn_decl(0, empty_body()), &no_fns());
         assert_eq!(layout.alloc, -16);
         assert_eq!(layout.prologue()[0], "stp     fp, lr, [sp, -16]!");
         assert_eq!(layout.prologue()[1], "mov     fp, sp");
@@ -603,7 +634,7 @@ mod tests {
             ty: QalaType::I64,
             span: span(0),
         };
-        let layout = FrameLayout::plan_frame(&fn_decl(3, body));
+        let layout = FrameLayout::plan_frame(&fn_decl(3, body), &no_fns());
         assert_eq!(layout.scratch_count(), 0, "a bare ident needs no scratch");
         assert_eq!(layout.alloc, -48, "3 params (24 bytes) -> alloc -48");
     }
@@ -612,7 +643,7 @@ mod tests {
     fn parameter_slots_start_at_sixteen_above_the_saved_pair() {
         // parameter 0 -> [fp, 16], parameter 1 -> [fp, 24], parameter 2 ->
         // [fp, 32]: positive offsets just past the saved fp/lr pair.
-        let layout = FrameLayout::plan_frame(&fn_decl(3, empty_body()));
+        let layout = FrameLayout::plan_frame(&fn_decl(3, empty_body()), &no_fns());
         assert_eq!(layout.slot_of("p0"), Some(16));
         assert_eq!(layout.slot_of("p1"), Some(24));
         assert_eq!(layout.slot_of("p2"), Some(32));
@@ -628,7 +659,7 @@ mod tests {
             ty: QalaType::I64,
             span: span(0),
         };
-        assert_eq!(max_spill_depth(&body), 0);
+        assert_eq!(max_spill_depth(&body, &no_fns()), 0);
     }
 
     #[test]
@@ -647,7 +678,7 @@ mod tests {
             ty: QalaType::I64,
             span: span(0),
         };
-        assert_eq!(max_spill_depth(&body), 1);
+        assert_eq!(max_spill_depth(&body, &no_fns()), 1);
     }
 
     #[test]
@@ -681,7 +712,7 @@ mod tests {
             ty: QalaType::I64,
             span: span(0),
         };
-        assert_eq!(max_spill_depth(&body), 3);
+        assert_eq!(max_spill_depth(&body, &no_fns()), 3);
     }
 
     #[test]
@@ -717,13 +748,13 @@ mod tests {
             ty: QalaType::I64,
             span: span(0),
         };
-        assert_eq!(max_spill_depth(&body), 3);
+        assert_eq!(max_spill_depth(&body, &no_fns()), 3);
     }
 
     #[test]
     fn claim_and_release_scratch_balance() {
         // claim hands out distinct slots past the named slots; release unwinds.
-        let mut layout = FrameLayout::plan_frame(&fn_decl(2, empty_body()));
+        let mut layout = FrameLayout::plan_frame(&fn_decl(2, empty_body()), &no_fns());
         // 2 params -> scratch_base = 16 + 8*2 = 32; the scratch slots run
         // [fp, 32], [fp, 40], ...
         let first = layout.claim_scratch();
@@ -754,7 +785,7 @@ mod tests {
             ty: QalaType::I64,
             span: span(0),
         };
-        let layout = FrameLayout::plan_frame(&fn_decl(1, body));
+        let layout = FrameLayout::plan_frame(&fn_decl(1, body), &no_fns());
         assert_eq!(layout.scratch_count(), 1);
         // 1 param + 1 scratch = 2 slots = 16 bytes locals -> -(16+16)&-16 = -32.
         assert_eq!(layout.alloc, -32);
@@ -785,7 +816,7 @@ mod tests {
         // value is asserted independently of the snapshot fixture: a wrong
         // spill-depth count fails here regardless of what the fixture holds.
         let decl = fn_from_source("fn arith(a: i64, b: i64) -> i64 { (a + b) * (a - b) / 2 % 7 }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.scratch_count(), 4, "the left spine is 4 operators deep");
         assert_eq!(layout.alloc, -64, "2 params + 4 scratch = 48 bytes -> alloc -64");
         assert_eq!(layout.prologue()[0], "stp     fp, lr, [sp, -64]!");
@@ -798,7 +829,7 @@ mod tests {
         // one scratch slot. 2 params + 1 scratch = 3 slots = 24 bytes -> alloc
         // = -(16 + 24) & -16 = -48. a concrete value, not an inequality.
         let decl = fn_from_source("fn cmp(a: i64, b: i64) -> bool { a == b }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.scratch_count(), 1, "one comparison -> one scratch slot");
         assert_eq!(layout.alloc, -48, "2 params + 1 scratch = 24 bytes -> alloc -48");
     }
@@ -810,7 +841,7 @@ mod tests {
         // so the function reserves zero scratch slots. 2 params + 0 scratch = 2
         // slots = 16 bytes -> alloc = -(16 + 16) & -16 = -32.
         let decl = fn_from_source("fn andor(a: bool, b: bool) -> bool { a && b || !a }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.scratch_count(), 0, "short-circuit ops claim no scratch");
         assert_eq!(layout.alloc, -32, "2 params + 0 scratch = 16 bytes -> alloc -32");
     }
@@ -821,7 +852,7 @@ mod tests {
         // binding occurrence 0 (`x`) is at [fp, 16], occurrence 1 (`y`) at
         // [fp, 24] -- distinct, consecutive, just above the saved pair.
         let decl = fn_from_source("fn f() { let x = 1\nlet y = 2 }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.binding_slot(0), Some(16), "first let -> [fp, 16]");
         assert_eq!(layout.binding_slot(1), Some(24), "second let -> [fp, 24]");
         assert_eq!(layout.binding_slot(2), None, "only two bindings exist");
@@ -836,7 +867,7 @@ mod tests {
         // parameter takes [fp, 16]; the `let` binding slot starts past it at
         // [fp, 24]. 1 param + 1 let = 2 slots = 16 bytes -> alloc = -32.
         let decl = fn_from_source("fn f(a: i64) { let x = 1 }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.slot_of("a"), Some(16), "param a -> [fp, 16]");
         assert_eq!(layout.binding_slot(0), Some(24), "the let -> [fp, 24]");
         assert_eq!(layout.alloc, -32, "1 param + 1 let = 16 bytes -> alloc -32");
@@ -848,7 +879,7 @@ mod tests {
         // name-keyed map would collide; the positional binding list gives each
         // its own slot. occurrence 0 -> [fp, 16], occurrence 1 -> [fp, 24].
         let decl = fn_from_source("fn f() -> i64 { let x = 1\nlet x = 2\nx }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.binding_slot(0), Some(16), "outer x -> [fp, 16]");
         assert_eq!(layout.binding_slot(1), Some(24), "shadowing x -> [fp, 24]");
         assert_ne!(
@@ -866,7 +897,7 @@ mod tests {
         let decl = fn_from_source(
             "fn f(c: bool) { let a = 1\nif c { let b = 2 } else { let d = 3 } }",
         );
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.binding_slot(0), Some(24), "outer let a, past param c");
         assert_eq!(layout.binding_slot(1), Some(32), "let b in the then-block");
         assert_eq!(layout.binding_slot(2), Some(40), "let d in the else-block");
@@ -880,7 +911,7 @@ mod tests {
         // -- the loop variable `i` and a dedicated `end`-bound slot. they are
         // occurrences 0 and 1 at [fp, 16] and [fp, 24].
         let decl = fn_from_source("fn f() { for i in 0..10 { } }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.binding_slot(0), Some(16), "for-variable slot");
         assert_eq!(layout.binding_slot(1), Some(24), "for-end-bound slot");
         assert_eq!(layout.binding_slot(2), None, "a bare for is exactly two slots");
@@ -894,7 +925,7 @@ mod tests {
         // is `for i in 0..3 { let s = i }`: occurrences 0 (`i`), 1 (`end`),
         // 2 (`s`) at [fp, 16], [fp, 24], [fp, 32].
         let decl = fn_from_source("fn f() { for i in 0..3 { let s = i } }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.binding_slot(0), Some(16), "for-variable i");
         assert_eq!(layout.binding_slot(1), Some(24), "for-end bound");
         assert_eq!(layout.binding_slot(2), Some(32), "the let inside the body");
@@ -908,7 +939,7 @@ mod tests {
         // trailing value is a bare ident, so the scratch reservation is zero
         // and the frame holds only the one parameter slot.
         let decl = fn_from_source("fn f(a: i64) -> i64 { a }");
-        let layout = FrameLayout::plan_frame(&decl);
+        let layout = FrameLayout::plan_frame(&decl, &no_fns());
         assert_eq!(layout.scratch_count(), 0, "a bare ident needs no scratch");
         // 1 param + 0 scratch = 8 bytes -> alloc = -(16 + 8) & -16 = -32.
         assert_eq!(layout.alloc, -32, "1 param, no call -> alloc -32");
@@ -936,7 +967,7 @@ mod tests {
                 _ => None,
             })
             .expect("no caller function");
-        let layout = FrameLayout::plan_frame(&caller);
+        let layout = FrameLayout::plan_frame(&caller, &fn_names_of(&typed));
         // 2 params + 1 let = 3 named slots at [fp, 16], [fp, 24], [fp, 32].
         assert_eq!(layout.slot_of("x"), Some(16), "param x -> [fp, 16]");
         assert_eq!(layout.slot_of("y"), Some(24), "param y -> [fp, 24]");
@@ -969,7 +1000,7 @@ mod tests {
                 _ => None,
             })
             .expect("no f function");
-        let layout = FrameLayout::plan_frame(&f);
+        let layout = FrameLayout::plan_frame(&f, &fn_names_of(&typed));
         // the 2-arg call is the widest -> two scratch slots, past the two lets.
         assert_eq!(layout.scratch_count(), 2, "the widest call passes two args");
         // 2 lets + 2 scratch = 32 bytes -> alloc = -(16 + 32) & -16 = -48.
@@ -998,7 +1029,7 @@ mod tests {
                 _ => None,
             })
             .expect("no f function");
-        let layout = FrameLayout::plan_frame(&f);
+        let layout = FrameLayout::plan_frame(&f, &fn_names_of(&typed));
         assert_eq!(
             layout.scratch_count(),
             4,
