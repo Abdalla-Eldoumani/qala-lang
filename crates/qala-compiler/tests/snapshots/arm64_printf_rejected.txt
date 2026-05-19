@@ -1,0 +1,6 @@
+error: the arm64 backend does not yet support bool values in interpolation
+  --> 3:23
+   |
+3  |       println("flag is {b}")
+   |                         ^
+   |
