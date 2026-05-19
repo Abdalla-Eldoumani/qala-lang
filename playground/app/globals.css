@@ -1,10 +1,10 @@
 @import "tailwindcss";
 
 :root {
-  /* codex palette -- the in-code source of truth for the design system.
+  /* codex palette: the in-code source of truth for the design system.
      written in oklch: predictable lightness, correct chroma falloff at the
      extremes. the values are computed to match the prior hex exactly, so
-     the rendered colors are identical -- this is a notation change, not a
+     the rendered colors are identical. this is a notation change, not a
      re-coloring. the neutrals carry a slight tint (no pure black or white):
      the surfaces sit on a cool blue-violet ink hue, the ink and accent on
      a warm hue. */
@@ -21,10 +21,10 @@
   --type-number: oklch(0.726 0.118 67 / 0.20);
   --type-string: oklch(0.567 0.072 162 / 0.20);
   --type-bool: oklch(0.55 0.13 270 / 0.20);
-  /* the neutral stack tint -- arrays, tuples, structs, enums, void */
+  /* the neutral stack tint: arrays, tuples, structs, enums, void */
   --type-other: oklch(0.604 0.009 305 / 0.12);
 
-  /* codex spacing scale -- sparse by design, no --space-5 / --space-7 */
+  /* codex spacing scale, sparse by design, no --space-5 / --space-7 */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -76,7 +76,7 @@ body {
 }
 
 /*
-  the playground animation layer. pure css -- the pinned package.json
+  the playground animation layer. pure css: the pinned package.json
   carries no motion library. every duration and easing is verbatim from
   the codex animation contract: motion is a translate-plus-fade, never a
   glow or a gradient. the panel components attach these classes; the
@@ -119,7 +119,7 @@ body {
 }
 
 /* variablespanel flash: a changed variable row washes amber and fades
-   back. 3000ms total -- 300ms in, a 1700ms hold, 1000ms out -- the codex
+   back. 3000ms total (300ms in, a 1700ms hold, 1000ms out), the codex
    changed-variable timing. re-applied on a re-change. */
 @keyframes var-flash {
   0% {
@@ -141,7 +141,7 @@ body {
 }
 
 /* the run-loop running indicator: the pause button's accent outline
-   pulses while the loop is live -- the "alive" signal. */
+   pulses while the loop is live, the "alive" signal. */
 @keyframes running-pulse {
   0%,
   100% {
