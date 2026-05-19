@@ -30,14 +30,16 @@
 //! ## module layout
 //!
 //! `emit.rs` builds the assembly text; `frame.rs` plans each function's stack
-//! frame; `labels.rs` generates unique branch labels; `expr.rs` and `stmt.rs`
-//! are further `impl Arm64Backend` blocks holding the expression codegen and
-//! the statement / control-flow codegen.
+//! frame; `labels.rs` generates unique branch labels; `expr.rs`, `stmt.rs`,
+//! and `print.rs` are further `impl Arm64Backend` blocks holding the
+//! expression codegen, the statement / control-flow codegen, and the
+//! `print` / `println` to `printf` lowering.
 
 mod emit;
 mod expr;
 mod frame;
 mod labels;
+mod print;
 mod stmt;
 
 use crate::errors::QalaError;
