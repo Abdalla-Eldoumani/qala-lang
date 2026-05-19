@@ -136,13 +136,13 @@ has no assignment statement: a binding is never reassigned, and there is no
 index or field assignment. `let mut` is reserved syntax that parses but has no
 operative effect in v1. To compute a new value, bind a new name.
 
-## 10. ARM64 compilation target (v2)
+## 10. ARM64 compilation target
 
-Today Qala compiles to bytecode that runs on the VM in the playground. v2 adds an ARM64 backend that emits real machine code. The emitted code is meant to be pasted directly into the AArch64 playground at `aarch64-playground.vercel.app` for visual instruction-by-instruction execution.
+Qala has two codegen targets that share the same typed AST: a bytecode VM the playground runs, and a second backend that emits AArch64 assembly text in the CPSC 355 hosted-Linux dialect. The CLI picks between them with `qala build --target {bytecode,arm64}`.
 
-The bytecode VM and the ARM64 backend will share the same typed AST. The codegen module dispatches to either target based on a flag.
+The ARM64 backend's integer core is shipped: `i64` and `bool` arithmetic, comparisons and boolean logic, `if`/`while`/`for` control flow, `let` bindings in stack slots, AAPCS64 functions with calls and recursion, and integer `print`/`println` output lowered to `printf`. The emitted assembly is verified end to end: it assembles with `m4` and an AArch64 toolchain and runs correctly under QEMU. Floats, string values, and aggregates are still ahead; the compiler rejects them with a clear "the ARM64 backend does not yet support X" diagnostic rather than miscompile.
 
-See `.agent/TIES_TO_PRIOR_WORK.md` for how this connects to the AArch64 playground, your aeos kernel, and the qemu-mcp-server.
+The emitted assembly is meant to be pasted directly into the [AArch64 playground](https://aarch64-playground.vercel.app) for visual instruction-by-instruction execution.
 
 ## Compiler quality features
 
