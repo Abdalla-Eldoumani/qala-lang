@@ -299,18 +299,23 @@ impl Arm64Backend {
         Ok(())
     }
 
-    /// emit a call expression: the `print` / `println` output built-ins lower
-    /// to a `printf` call, a user function lowers to AAPCS64 argument passing
-    /// and a `bl`. either way the (possibly discarded) result is left in `x0`.
+    /// emit a call expression: a user function lowers to AAPCS64 argument
+    /// passing and a `bl`, and an unshadowed `print` / `println` built-in
+    /// lowers to a `printf` call. either way the (possibly discarded) result
+    /// is left in `x0`.
+    ///
+    /// a user function declared as `print` or `println` shadows the built-in
+    /// -- the typechecker does not reserve those names -- so it routes as an
+    /// ordinary user call, matching the bytecode backend; only an unshadowed
+    /// `print` / `println` reaches the printf lowering.
     ///
     /// rejects, with a clean [`QalaError`], a call the integer core does not
     /// support: a computed callee (one that is not a plain identifier), a
-    /// callee that resolves to a stdlib function other than `print` /
-    /// `println` (the higher-order stdlib is deferred beyond v2), and a call
-    /// with more than eight arguments (a stack-passed argument is out of
-    /// scope -- a well-typed program cannot reach this since the callee has at
-    /// most eight parameters, but the guard is defensive so a `bl` is never
-    /// emitted with a wrong argument count).
+    /// callee that resolves to a stdlib function (the higher-order stdlib is
+    /// deferred beyond v2), and a call with more than eight arguments (a
+    /// stack-passed argument is out of scope -- a well-typed program cannot
+    /// reach this since the callee has at most eight parameters, but the guard
+    /// is defensive so a `bl` is never emitted with a wrong argument count).
     fn compile_call(
         &mut self,
         callee: &TypedExpr,
@@ -330,16 +335,22 @@ impl Arm64Backend {
                 });
             }
         };
-        // `print` / `println` are the output built-ins: route them to the
-        // interpolation-to-printf lowering rather than treating them as a
-        // user-function `bl`.
-        if name == "print" || name == "println" {
-            return self.compile_print_call(name, args, span);
-        }
-        // every other name that is not a user-declared function resolves to a
-        // higher-order stdlib built-in (`map`, `filter`, `reduce`, `sqrt`,
-        // ...) -- all deferred beyond v2's integer slice, so reject it cleanly.
+        // a user-declared function of this name shadows the stdlib built-in:
+        // the typechecker does not reserve `print` / `println`, so a program
+        // may declare its own `fn println` and the bytecode backend runs it.
+        // such a name routes through the ordinary user-call path below, never
+        // the printf lowering. only a genuine, unshadowed `print` / `println`
+        // builtin reaches the printf path.
         if !self.fn_names.contains(name) {
+            // `print` / `println` are the output built-ins: route them to the
+            // interpolation-to-printf lowering. `frame.rs::is_print_callee`
+            // gates the spill pre-walk on the identical condition.
+            if name == "print" || name == "println" {
+                return self.compile_print_call(name, args, span);
+            }
+            // every other non-user name resolves to a higher-order stdlib
+            // built-in (`map`, `filter`, `reduce`, `sqrt`, ...) -- all deferred
+            // beyond v2's integer slice, so reject it cleanly.
             return Err(QalaError::Type {
                 span,
                 message: format!(
@@ -875,6 +886,38 @@ mod tests {
             err[0].message().contains("abs"),
             "message: {:?}",
             err[0].message()
+        );
+    }
+
+    #[test]
+    fn a_user_function_named_println_routes_as_a_user_call_not_the_printf_path() {
+        // WR-01 regression. the typechecker does not reserve `print` /
+        // `println`: a program may declare its own `fn println(n: i64) -> i64`,
+        // and the bytecode backend runs that user function. the arm64 backend
+        // must agree -- a call to the shadowing user `println` lowers to an
+        // ordinary `bl println`, NOT the interpolation-to-printf lowering
+        // (which would emit `bl printf` and reject the i64 argument as a
+        // "string expression"). the printf path is reachable only by an
+        // UNSHADOWED `print` / `println` builtin.
+        let asm = compile_program_ok(
+            "fn println(n: i64) -> i64 { n }\n\
+             fn main() -> i64 { println(5) }",
+        );
+        let body = fn_body(&asm, "main");
+        // the shadowing call is an ordinary user `bl println`.
+        assert!(
+            body.iter().any(|l| l.trim() == "bl      println"),
+            "the shadowed `println` must lower to a `bl println` user call: {body:?}"
+        );
+        // and the printf path was NOT taken: no `bl printf` anywhere, and the
+        // argument 5 is spilled as a normal user-call argument.
+        assert!(
+            !asm.contains("bl      printf"),
+            "a shadowed `println` must not route to the printf lowering: {asm}"
+        );
+        assert!(
+            body.iter().any(|l| l.contains("// arg 0")),
+            "the i64 argument must spill as a user-call argument: {body:?}"
         );
     }
 
