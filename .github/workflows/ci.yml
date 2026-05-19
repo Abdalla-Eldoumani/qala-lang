@@ -36,7 +36,9 @@ jobs:
           tool: wasm-pack
 
       - name: build the wasm module
-        run: wasm-pack build crates/qala-compiler --target web --out-dir playground/lib/wasm
+        # wasm-pack's --out-dir is relative to the crate, not the working
+        # directory, so the path climbs two levels back to the workspace root.
+        run: wasm-pack build crates/qala-compiler --target web --out-dir ../../playground/lib/wasm
 
       - name: install node
         uses: actions/setup-node@v4
