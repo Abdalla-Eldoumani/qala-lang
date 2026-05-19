@@ -212,7 +212,9 @@ impl Arm64Backend {
         self.validate_fn(decl)?;
 
         // plan the frame; it stays the current frame for the whole body walk.
-        self.frame = Some(FrameLayout::plan_frame(decl));
+        // `fn_names` lets the spill pre-walk size a shadowed `print` / `println`
+        // call as the ordinary user call the emitter will route it as.
+        self.frame = Some(FrameLayout::plan_frame(decl, &self.fn_names));
         self.current_fn = Some(decl.name.clone());
         // reset the per-function statement-walk state: the binding cursor
         // counts from 0 for each function, and the scope / loop stacks start
@@ -369,8 +371,12 @@ impl Arm64Backend {
     /// plan a function's frame and set it as current, without emitting any
     /// directives or prologue -- a test hook so the expression codegen can be
     /// exercised in isolation against a real frame.
+    ///
+    /// the frame is planned against the backend's current `fn_names`, so a
+    /// test that scans names first sees the same shadowing context the full
+    /// compile does.
     fn begin_function(&mut self, decl: &TypedFnDecl) {
-        self.frame = Some(FrameLayout::plan_frame(decl));
+        self.frame = Some(FrameLayout::plan_frame(decl, &self.fn_names));
         self.current_fn = Some(decl.name.clone());
     }
 
