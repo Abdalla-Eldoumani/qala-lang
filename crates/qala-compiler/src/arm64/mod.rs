@@ -629,4 +629,58 @@ mod tests {
             "arm64 unsupported-construct rejection drifted from snapshot"
         );
     }
+
+    #[test]
+    fn every_unsupported_construct_is_rejected_with_a_specific_named_diagnostic() {
+        // the ARM-05 contract, exercised across the spread of constructs the
+        // integer core does not support. each program is well-typed -- the
+        // rejection is the BACKEND's, not the typechecker's -- and must yield
+        // a `QalaError` (never a panic, never bad assembly) whose message
+        // names the construct and uses the lowercase house spelling `arm64`.
+        let cases: [(&str, &str); 11] = [
+            // a float value.
+            ("fn f() -> i64 { let x = 1.5\n0 }", "floats"),
+            // a string value bound to a let.
+            ("fn f() -> i64 { let s = \"hi\"\n0 }", "strings"),
+            // a byte value.
+            ("fn f() -> i64 { let b = b'a'\n0 }", "byte values"),
+            // an array value.
+            ("fn f() -> i64 { let a = [1, 2, 3]\n0 }", "arrays"),
+            // a tuple value.
+            ("fn f() -> i64 { let t = (1, 2)\n0 }", "tuples"),
+            // a struct literal.
+            (
+                "struct P { x: i64 }\nfn f() -> i64 { let p = P { x: 1 }\n0 }",
+                "struct literals",
+            ),
+            // a match expression.
+            ("fn f(n: i64) -> i64 { match n { _ => 0 } }", "match expressions"),
+            // a comptime block.
+            ("fn f() -> i64 { comptime { 1 + 1 } }", "comptime blocks"),
+            // a defer statement.
+            ("fn f() { let x = 1\ndefer x }", "defer"),
+            // a float function parameter.
+            ("fn f(x: f64) -> f64 { x }", "f64 parameters"),
+            // a method definition.
+            (
+                "struct P { x: i64 }\nfn P.get(self) -> i64 { self.x }",
+                "method",
+            ),
+        ];
+        for (src, needle) in cases {
+            let typed = typecheck(src);
+            let errors = compile_arm64(&typed, src)
+                .expect_err("the program must be rejected by the backend");
+            let message = errors[0].message();
+            assert!(
+                message.contains(needle),
+                "the rejection of `{src}` must name `{needle}`: got {message:?}"
+            );
+            assert!(
+                message.contains("arm64"),
+                "the rejection of `{src}` must use the lowercase `arm64` spelling: \
+                 got {message:?}"
+            );
+        }
+    }
 }
