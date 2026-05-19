@@ -5,6 +5,22 @@ All notable changes to Qala are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2026-05-19
+
+The first public release. The `qala-compiler` and `qala-cli` crates are
+published on crates.io and the `qala` binary is attached to this release on
+GitHub for Linux, macOS, and Windows. The crate-version line starts at 0.1.0;
+the language itself is at the v2.0 milestone documented below, atop the
+original v1.0 language.
+
+### Added
+
+- Cross-platform `qala` binaries (Linux x86_64, macOS arm64, Windows x86_64)
+  attached to the GitHub release, built by the release workflow.
+- Both crates published on crates.io: `cargo install qala-cli` installs the
+  `qala` binary, and `qala-compiler` is available as a library and a
+  WebAssembly module.
+
 ## [2.0.0] - 2026-05-19
 
 The production and ARM64 release. The v1.0 language is unchanged; this release
@@ -71,5 +87,4 @@ playground.
   value-stack view, step-through execution, an interactive REPL, and a set of
   bundled example programs.
 
-[2.0.0]: https://github.com/Abdalla-Eldoumani/qala-lang/releases/tag/v2.0.0
-[1.0.0]: https://github.com/Abdalla-Eldoumani/qala-lang/releases/tag/v1.0.0
+[0.1.0]: https://github.com/Abdalla-Eldoumani/qala-lang/releases/tag/v0.1.0
