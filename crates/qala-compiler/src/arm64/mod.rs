@@ -339,7 +339,11 @@ fn is_integer_core_type(ty: &QalaType) -> bool {
 }
 
 /// a plain human name for a type, for an unsupported-construct message.
-fn type_name(ty: &QalaType) -> &'static str {
+///
+/// crate-visible so the expression codegen (`expr.rs`) can name the type of a
+/// rejected `print` / `println` argument, the same way `validate_fn` names a
+/// rejected parameter or return type here.
+pub(crate) fn type_name(ty: &QalaType) -> &'static str {
     match ty {
         QalaType::I64 => "i64",
         QalaType::F64 => "f64",
