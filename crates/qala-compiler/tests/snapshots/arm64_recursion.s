@@ -11,9 +11,9 @@ factorial:
         mov     fp, sp
         str     x0, [fp, 16]  // n
         ldr     x0, [fp, 16]  // n
-        str     x0, [fp, 32]  // spill lhs
+        str     x0, [fp, 24]  // spill lhs
         mov     x0, 1
-        ldr     x9, [fp, 32]  // reload lhs
+        ldr     x9, [fp, 24]  // reload lhs
         cmp     x9, x0
         cset    x0, le
         cbz     x0, .Lif_end_0
@@ -21,16 +21,16 @@ factorial:
         b       .Lfactorial_epilogue
 .Lif_end_0:
         ldr     x0, [fp, 16]  // n
-        str     x0, [fp, 32]  // spill lhs
+        str     x0, [fp, 24]  // spill lhs
         ldr     x0, [fp, 16]  // n
-        str     x0, [fp, 40]  // spill lhs
+        str     x0, [fp, 32]  // spill lhs
         mov     x0, 1
-        ldr     x9, [fp, 40]  // reload lhs
-        sub     x0, x9, x0
-        str     x0, [fp, 24]  // arg 0
-        ldr     x0, [fp, 24]
-        bl      factorial
         ldr     x9, [fp, 32]  // reload lhs
+        sub     x0, x9, x0
+        str     x0, [fp, 32]  // arg 0
+        ldr     x0, [fp, 32]
+        bl      factorial
+        ldr     x9, [fp, 24]  // reload lhs
         mul     x0, x9, x0
 .Lfactorial_epilogue:
         ldp     fp, lr, [sp], 48
