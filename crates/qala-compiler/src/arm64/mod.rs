@@ -159,21 +159,31 @@ impl Arm64Backend {
 
     /// the frame layout of the function currently being compiled.
     ///
-    /// panics only via a debug assertion if called between functions -- the
-    /// per-function flow always sets the frame before walking the body, so a
-    /// live call path never hits a `None`.
+    /// panics *unconditionally* -- not via a `debug_assert!` -- if called
+    /// between functions. that branch is unreachable on every live path: the
+    /// per-function flow in [`compile_fn`](Arm64Backend::compile_fn) sets the
+    /// frame before any body walk and clears it after, and every caller runs
+    /// inside that window. the `.expect` is an invariant guard, the same
+    /// category as an `unreachable!` carrying a proof.
     fn frame(&self) -> &FrameLayout {
+        // invariant: set by compile_fn before any body walk, cleared after.
+        // unreachable with frame == None on every live path.
         self.frame
             .as_ref()
-            .expect("frame() called with no function in progress")
+            .expect("arm64: frame accessed with no function in progress")
     }
 
     /// the frame layout of the current function, mutably -- for the expression
     /// codegen's scratch-slot claim / release.
+    ///
+    /// panics unconditionally if called between functions -- the same
+    /// unreachable invariant guard as [`frame`](Arm64Backend::frame).
     fn frame_mut(&mut self) -> &mut FrameLayout {
+        // invariant: set by compile_fn before any body walk, cleared after.
+        // unreachable with frame == None on every live path.
         self.frame
             .as_mut()
-            .expect("frame_mut() called with no function in progress")
+            .expect("arm64: frame accessed with no function in progress")
     }
 
     /// compile one top-level item.
