@@ -29,14 +29,21 @@
 //! a [`TypedExpr::Call`] to a user function lowers to AAPCS64 argument passing
 //! and a `bl`. because every `compile_expr` lands its result in `x0`,
 //! evaluating argument 1 into `x0` would clobber argument 0 -- so each
-//! argument is evaluated and immediately `str`-ed to an argument scratch slot
-//! (reserved by [`FrameLayout::plan_frame`](super::frame::FrameLayout)), and
+//! argument is evaluated, then a fresh scratch slot is CLAIMED (the same
+//! [`claim_scratch`](super::frame::FrameLayout::claim_scratch) stack the
+//! nested-binary spill discipline uses) and the result `str`-ed into it.
 //! after all arguments are evaluated a run of `ldr x0`, `ldr x1`, ... loads
-//! the slots into the AAPCS64 argument registers. then `bl <name>`; the
-//! result is in `x0`. this ordering is correct for a NESTED call: an argument
-//! that is itself a call runs to completion -- its own argument `str`s, its
-//! own `bl`, its result in `x0` -- before the outer call's `str` for that
-//! argument captures it.
+//! the slots into the AAPCS64 argument registers; then `bl <name>`, the
+//! result in `x0`; then every claimed slot is released.
+//!
+//! claiming -- rather than using one fixed shared run -- is what makes a
+//! NESTED call correct. an argument that is itself a call runs to completion
+//! while the outer call's already-evaluated arguments sit in claimed slots;
+//! the nested call claims its own argument slots STRICTLY BEYOND those, so it
+//! cannot overwrite the outer call's saved arguments. the argument is
+//! evaluated BEFORE its slot is claimed, so the argument's own transient
+//! scratch claims (a binary operator inside it) release before the
+//! persistent argument slot is taken.
 
 use crate::ast::{BinOp, UnaryOp};
 use crate::errors::QalaError;
@@ -337,21 +344,26 @@ impl Arm64Backend {
             });
         }
 
-        // approach (a): evaluate every argument into x0 and immediately spill
-        // it to its argument scratch slot, BEFORE loading any argument
-        // register. evaluating argument i+1 into x0 would clobber argument i,
-        // so the load into x0..x{n-1} happens only after every argument is
-        // safely in a slot. this is also what makes a nested call correct: a
-        // call argument that is itself a call runs fully -- its own spills,
-        // its own bl, its result in x0 -- and only then is that x0 spilled.
+        // evaluate every argument into x0 and spill it to a freshly CLAIMED
+        // scratch slot, BEFORE loading any argument register. evaluating
+        // argument i+1 into x0 would clobber argument i, so the load into
+        // x0..x{n-1} happens only after every argument is safely in a slot.
+        //
+        // each argument is evaluated FIRST, then its slot is claimed: the
+        // argument's own transient scratch claims (a binary operator, or a
+        // nested call's argument slots) are all released by the time
+        // `compile_expr` returns, so the slot claimed here sits beyond them
+        // and beyond every earlier argument's slot. a nested call therefore
+        // cannot alias the outer call's saved arguments -- the bug a single
+        // shared argument run would have. the claimed slots are released only
+        // after the `bl`, so they stay reserved across the whole call.
         let mut arg_offsets = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
-            let slot = self.frame().arg_slot(i).ok_or_else(|| QalaError::Type {
-                span,
-                message: format!("arm64 backend: call argument {i} has no scratch slot"),
-            })?;
-            // arg -> x0 (a nested call completes entirely here), then spill.
+            // arg -> x0; a nested call completes entirely here, claiming and
+            // releasing its own argument slots within this evaluation.
             self.compile_expr(arg)?;
+            // now claim this argument's persistent slot and spill x0 into it.
+            let slot = self.frame_mut().claim_scratch();
             self.asm.emit_insn_commented(
                 &format!("str     x0, [fp, {slot}]"),
                 &format!("arg {i}"),
@@ -365,6 +377,11 @@ impl Arm64Backend {
         // the call. the result, by AAPCS64, is in x0 -- which is the result
         // convention compile_expr upholds.
         self.asm.emit_insn(&format!("bl      {name}"));
+        // release the argument slots -- one per argument, balancing the claims
+        // above so the scratch stack returns to where the call found it.
+        for _ in &arg_offsets {
+            self.frame_mut().release_scratch();
+        }
         Ok(())
     }
 }
