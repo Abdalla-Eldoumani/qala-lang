@@ -1736,6 +1736,22 @@ impl Vm {
         "f64".to_string()
     }
 
+    /// render a runtime [`Value`] to its `(display string, type name)` pair.
+    ///
+    /// the public counterpart of the in-crate [`Vm::value_to_string`] and
+    /// [`Vm::runtime_type_name`] helpers, for an external consumer that holds a
+    /// [`Value`] -- specifically the `qala` CLI's REPL, which evaluates a line
+    /// against this VM and must display the result. the WASM bridge does not use
+    /// this method (it is in-crate and reaches the two helpers directly, building
+    /// a `StateValue`); this exists so the separate `qala-cli` crate has the same
+    /// rendering without the two helpers leaving `pub(crate)`.
+    ///
+    /// purely additive: it calls the two existing helpers and changes no v1
+    /// behavior. never panics -- the helpers are total over every `Value`.
+    pub fn render_value(&self, v: Value) -> (String, String) {
+        (self.value_to_string(v), self.runtime_type_name(v))
+    }
+
     /// execute [`Opcode::ToStr`]: pop one value, push its string form as a
     /// heap [`HeapObject::Str`].
     ///
@@ -4306,6 +4322,24 @@ fn main() -> i64 is pure {
         let mut vm = Vm::new_repl();
         let r = vm.repl_eval("2 * 21").expect("a bare expression evaluates");
         assert_eq!(repl_result_i64(&vm, r), 42);
+    }
+
+    #[test]
+    fn render_value_renders_an_i64_result_to_its_display_and_type_pair() {
+        // the public render_value method an external consumer (the qala CLI's
+        // REPL) uses to display a result Value: it must return the same
+        // (display, type) pair the in-crate value_to_string / runtime_type_name
+        // helpers produce. evaluate `let x = 5` then `x + 1` -- the result is
+        // the i64 6, which renders as ("6", "i64").
+        let mut vm = Vm::new_repl();
+        vm.repl_eval ("let x = 5")
+            .expect("the let binding compiles and runs");
+        let result = vm
+            .repl_eval ("x + 1")
+            .expect("the expression sees the prior binding");
+        let (display, type_name) = vm.render_value(result);
+        assert_eq!(display, "6", "x (5) + 1 displays as 6");
+        assert_eq!(type_name, "i64", "the result is an i64");
     }
 
     #[test]
