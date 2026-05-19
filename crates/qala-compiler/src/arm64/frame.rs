@@ -1,14 +1,29 @@
 //! the per-function stack-frame layout for the ARM64 backend.
 //!
-//! [`FrameLayout`] holds, for one function, the map from a name (a parameter
-//! or -- in plan 12-02 -- a `let` binding) to its `[fp, N]` stack slot, the
-//! count of scratch spill slots the expression codegen needs, and the derived
-//! `alloc` / `dealloc` frame sizes. [`FrameLayout::plan_frame`] builds it from
-//! a [`TypedFnDecl`] in one pass before the prologue is emitted.
+//! [`FrameLayout`] holds, for one function, the map from a parameter name to
+//! its `[fp, N]` stack slot, an indexed list of slots for the body's `let`
+//! bindings and `for`-loop slots, the count of scratch spill slots the
+//! expression codegen needs, and the derived `alloc` / `dealloc` frame sizes.
+//! [`FrameLayout::plan_frame`] builds it from a [`TypedFnDecl`] in one pass
+//! before the prologue is emitted.
 //!
 //! the slot model is deliberately simple -- correctness over density. every
 //! parameter, every `let`, and every scratch spill slot occupies a full 8-byte
 //! slot (an `i64` and a `bool` both take 8 bytes; no packing).
+//!
+//! ## binding slots: indexed by walk order, not by name
+//!
+//! a `let` may shadow an outer `let` of the same name, so a name-keyed map
+//! cannot hold every binding's slot -- two `let x` would collide. instead
+//! [`plan_frame`] walks the body in a fixed source order and assigns binding
+//! occurrence `0, 1, 2, ...` the next slot, recording them in a `Vec` indexed
+//! by that occurrence number. `stmt.rs` walks the body in the identical order,
+//! keeping its own occurrence counter, and reads
+//! [`FrameLayout::binding_slot`] by index. the deterministic walk order is the
+//! shared contract between the two files: a parameter slot is named, a `let`
+//! or `for` slot is positional. NO SLOT REUSE -- every binding occurrence,
+//! including a shadowing `let` and a `for`-loop variable, gets its own
+//! distinct slot.
 //!
 //! ## frame geometry: positive offsets from `fp`
 //!
@@ -33,7 +48,7 @@
 //! correctness reduces entirely to this one formula. [`compute_alloc`] is the
 //! single implementation; its unit test asserts the four hand-computed values.
 
-use crate::typed_ast::{TypedExpr, TypedFnDecl, TypedStmt};
+use crate::typed_ast::{TypedBlock, TypedElseBranch, TypedExpr, TypedFnDecl, TypedStmt};
 use std::collections::HashMap;
 
 /// the byte size of one stack slot. an `i64` and a `bool` both occupy a full
@@ -60,18 +75,27 @@ fn compute_alloc(locals: i64) -> i64 {
     -(FP_LR_PAIR + locals) & -16
 }
 
-/// the stack-frame layout of one function: the name-to-slot map, the scratch
-/// spill-slot reservation, and the derived `alloc` / `dealloc` sizes.
+/// the stack-frame layout of one function: the parameter name-to-slot map,
+/// the body's binding slots, the scratch spill-slot reservation, and the
+/// derived `alloc` / `dealloc` sizes.
 ///
 /// crate-private: the layout is an internal detail of the `arm64` module.
 pub(crate) struct FrameLayout {
-    /// map from a parameter (or, from plan 12-02, a `let`) name to its stack
-    /// slot -- the positive byte offset `N` in `[fp, N]`.
+    /// map from a parameter name to its stack slot -- the positive byte offset
+    /// `N` in `[fp, N]`. parameters are name-keyed because a parameter name is
+    /// unique within a signature; body `let`/`for` slots are positional (see
+    /// [`binding_slots`](FrameLayout::binding_slots)).
     slots: HashMap<String, i64>,
+    /// the stack slots for the body's `let` bindings and `for`-loop slots, in
+    /// the deterministic walk order [`plan_frame`] visits them. binding
+    /// occurrence `k` -- the `k`-th `let`, `for`-variable, or `for`-end slot
+    /// the walk reaches -- is at `binding_slots[k]`. `stmt.rs` re-walks in
+    /// lockstep and indexes this by occurrence number, which survives a
+    /// shadowing `let` that a name-keyed map could not.
+    binding_slots: Vec<i64>,
     /// the number of scratch spill slots reserved for the expression codegen's
     /// nested-binary-operator spill discipline. their offsets sit immediately
-    /// past the named slots. read by [`FrameLayout::scratch_count`], which
-    /// plan 12-02 consults when extending the frame with `let`-binding slots.
+    /// past the named and binding slots.
     #[allow(dead_code)]
     scratch_count: i64,
     /// the byte offset of the first scratch spill slot: `[fp, 16]` past the
@@ -87,15 +111,22 @@ pub(crate) struct FrameLayout {
 
 impl FrameLayout {
     /// build the frame layout for one function: assign every parameter a slot,
+    /// assign every body `let` binding and `for`-loop slot a distinct slot,
     /// reserve scratch spill slots for the body's deepest binary-operator
     /// nesting, and compute `alloc` / `dealloc`.
     ///
-    /// THIS PLAN walks `decl.params` only -- there are no `let` bindings yet
-    /// (plan 12-02 adds the body-`let` walk into this same function). the
-    /// scratch reservation is derived from a pre-walk of `decl.body`:
-    /// [`max_spill_depth`] returns the maximum number of binary-operator LHS
-    /// values that are simultaneously spilled. plan 12-02 extends this with the
-    /// `let`-slot assignment alongside the existing parameter assignment.
+    /// the slot regions, in `[fp, N]` order: the `FP_LR_PAIR` saved-register
+    /// pair occupies `[fp, 0]` and `[fp, 8]`; then the parameters at
+    /// `[fp, 16 + 8*i]`; then the body's binding slots (every `let` and, per
+    /// `for`, the loop variable and a dedicated `end`-bound slot) in walk
+    /// order; then the scratch spill slots.
+    ///
+    /// the binding slots are assigned by [`collect_binding_slots`], a recursive
+    /// walk over `decl.body` that descends into nested `if`/`while`/`for`
+    /// blocks. no slot is reused -- a shadowing `let` and every `for` variable
+    /// get their own distinct slot. the scratch reservation is derived from a
+    /// pre-walk: [`max_spill_depth`] returns the maximum number of
+    /// binary-operator LHS values that are simultaneously spilled.
     pub(crate) fn plan_frame(decl: &TypedFnDecl) -> FrameLayout {
         let mut slots = HashMap::new();
         // parameter i lives at [fp, 16 + 8*i]: the first param at [fp, 16],
@@ -104,14 +135,24 @@ impl FrameLayout {
             let slot = FP_LR_PAIR + SLOT_SIZE * i as i64;
             slots.insert(param.name.clone(), slot);
         }
-        let named_slot_count = decl.params.len() as i64;
-        // the scratch spill slots sit immediately past the named slots.
+        let param_count = decl.params.len() as i64;
+        // the body's binding slots begin immediately past the parameter slots:
+        // a `let` and, per `for`, two slots (the loop variable plus a dedicated
+        // `end`-bound slot the For arm evaluates `end` into once).
+        let binding_base = FP_LR_PAIR + SLOT_SIZE * param_count;
+        let binding_count = count_binding_slots(&decl.body);
+        let binding_slots: Vec<i64> = (0..binding_count)
+            .map(|k| binding_base + SLOT_SIZE * k)
+            .collect();
+        let named_slot_count = param_count + binding_count;
+        // the scratch spill slots sit immediately past the named + binding slots.
         let scratch_base = FP_LR_PAIR + SLOT_SIZE * named_slot_count;
         let scratch_count = max_spill_depth(&decl.body);
         let locals = SLOT_SIZE * (named_slot_count + scratch_count);
         let alloc = compute_alloc(locals);
         FrameLayout {
             slots,
+            binding_slots,
             scratch_count,
             scratch_base,
             scratch_in_use: 0,
@@ -119,13 +160,26 @@ impl FrameLayout {
         }
     }
 
-    /// the stack slot of a named binding, or `None` if the name is unknown.
+    /// the stack slot of a named parameter, or `None` if the name is unknown.
     ///
     /// the returned value is the positive offset `N` for `[fp, N]`. an unknown
     /// name is a backend bug -- the caller turns a `None` into a `QalaError`
-    /// rather than panicking.
+    /// rather than panicking. `let` and `for` bindings are NOT resolved here --
+    /// they are positional; see [`binding_slot`](FrameLayout::binding_slot).
     pub(crate) fn slot_of(&self, name: &str) -> Option<i64> {
         self.slots.get(name).copied()
+    }
+
+    /// the stack slot of body binding occurrence `index` -- the `index`-th
+    /// `let`, `for`-variable, or `for`-end slot in [`plan_frame`]'s walk order.
+    ///
+    /// `stmt.rs` walks the body in the same order [`plan_frame`] used, keeping
+    /// its own occurrence counter, and calls this with the next index when it
+    /// reaches a `let` or `for`. an out-of-range index is a backend bug -- a
+    /// walk-order mismatch between `plan_frame` and `stmt.rs` -- and the caller
+    /// turns the `None` into a `QalaError` rather than panicking.
+    pub(crate) fn binding_slot(&self, index: usize) -> Option<i64> {
+        self.binding_slots.get(index).copied()
     }
 
     /// claim the next scratch spill slot, returning its `[fp, N]` offset.
@@ -187,6 +241,64 @@ impl FrameLayout {
     }
 }
 
+/// the count of body binding slots a function needs: one slot per `let`
+/// binding, two slots per `for` loop (the loop variable and a dedicated
+/// `end`-bound slot the For arm evaluates `end` into once).
+///
+/// THE WALK ORDER is the contract between this function and `stmt.rs`. both
+/// descend `TypedBlock.stmts` in source order, into `If.then_block` then the
+/// `else` branch, into `While.body`, and into `For.body`. a `for` reserves its
+/// variable slot first, then its `end` slot, then descends into the body --
+/// `stmt.rs` claims the slots in that same order. as long as the two walks
+/// match, occurrence `k` here is occurrence `k` there. the `for`-variable slot
+/// is registered into the body's scope by `stmt.rs`, so an `Ident` reference
+/// to the loop variable resolves to it.
+fn count_binding_slots(block: &TypedBlock) -> i64 {
+    let mut count = 0;
+    for stmt in &block.stmts {
+        count += stmt_binding_slots(stmt);
+    }
+    count
+}
+
+/// the binding-slot count contributed by one statement (see
+/// [`count_binding_slots`] for the walk-order contract).
+fn stmt_binding_slots(stmt: &TypedStmt) -> i64 {
+    match stmt {
+        // a `let` is one slot; its initializer holds no further bindings of
+        // its own (an initializer is an expression, and expressions carry no
+        // `let`/`for` -- a block expression's statements would, but the integer
+        // core's `Block` expression is reached only as a trailing value, which
+        // this walk already covers via the body it belongs to).
+        TypedStmt::Let { .. } => 1,
+        TypedStmt::If { then_block, else_branch, .. } => {
+            let mut c = count_binding_slots(then_block);
+            if let Some(branch) = else_branch {
+                c += else_branch_binding_slots(branch);
+            }
+            c
+        }
+        TypedStmt::While { body, .. } => count_binding_slots(body),
+        // a `for` is two slots -- the loop variable and the `end` bound --
+        // counted BEFORE descending into the body, matching `stmt.rs`.
+        TypedStmt::For { body, .. } => 2 + count_binding_slots(body),
+        // these statements introduce no binding slot.
+        TypedStmt::Return { .. }
+        | TypedStmt::Break { .. }
+        | TypedStmt::Continue { .. }
+        | TypedStmt::Defer { .. }
+        | TypedStmt::Expr { .. } => 0,
+    }
+}
+
+/// the binding-slot count within an `else` branch (a block or an `else if`).
+fn else_branch_binding_slots(branch: &TypedElseBranch) -> i64 {
+    match branch {
+        TypedElseBranch::Block(b) => count_binding_slots(b),
+        TypedElseBranch::If(stmt) => stmt_binding_slots(stmt),
+    }
+}
+
 /// the maximum number of binary-operator LHS values that are spilled at once
 /// while evaluating `block`.
 ///
@@ -197,7 +309,7 @@ impl FrameLayout {
 /// that maximum so [`plan_frame`] can reserve exactly that many scratch slots.
 /// short-circuit `&&` / `||` do NOT spill -- they branch on `x0` directly and
 /// reload no LHS -- so they add no scratch slot of their own.
-fn max_spill_depth(block: &crate::typed_ast::TypedBlock) -> i64 {
+fn max_spill_depth(block: &TypedBlock) -> i64 {
     let mut max = 0;
     for stmt in &block.stmts {
         max = max.max(stmt_spill_depth(stmt));
@@ -239,8 +351,7 @@ fn stmt_spill_depth(stmt: &TypedStmt) -> i64 {
 }
 
 /// the maximum spill count within an `else` branch (a block or an `else if`).
-fn else_branch_spill_depth(branch: &crate::typed_ast::TypedElseBranch) -> i64 {
-    use crate::typed_ast::TypedElseBranch;
+fn else_branch_spill_depth(branch: &TypedElseBranch) -> i64 {
     match branch {
         TypedElseBranch::Block(b) => max_spill_depth(b),
         TypedElseBranch::If(stmt) => stmt_spill_depth(stmt),
@@ -583,5 +694,92 @@ mod tests {
         let layout = FrameLayout::plan_frame(&decl);
         assert_eq!(layout.scratch_count(), 0, "short-circuit ops claim no scratch");
         assert_eq!(layout.alloc, -32, "2 params + 0 scratch = 16 bytes -> alloc -32");
+    }
+
+    #[test]
+    fn a_function_with_two_lets_assigns_them_concrete_distinct_slots() {
+        // `fn f() { let x = 1 let y = 2 }`: no params, two `let` bindings.
+        // binding occurrence 0 (`x`) is at [fp, 16], occurrence 1 (`y`) at
+        // [fp, 24] -- distinct, consecutive, just above the saved pair.
+        let decl = fn_from_source("fn f() { let x = 1\nlet y = 2 }");
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.binding_slot(0), Some(16), "first let -> [fp, 16]");
+        assert_eq!(layout.binding_slot(1), Some(24), "second let -> [fp, 24]");
+        assert_eq!(layout.binding_slot(2), None, "only two bindings exist");
+        // 2 binding slots = 16 bytes locals, no params, no scratch ->
+        // alloc = -(16 + 16) & -16 = -32. a concrete value, not an inequality.
+        assert_eq!(layout.alloc, -32, "2 lets (16 bytes) -> alloc -32");
+    }
+
+    #[test]
+    fn let_bindings_are_counted_after_the_parameters() {
+        // `fn f(a: i64) { let x = 1 }`: one parameter then one `let`. the
+        // parameter takes [fp, 16]; the `let` binding slot starts past it at
+        // [fp, 24]. 1 param + 1 let = 2 slots = 16 bytes -> alloc = -32.
+        let decl = fn_from_source("fn f(a: i64) { let x = 1 }");
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.slot_of("a"), Some(16), "param a -> [fp, 16]");
+        assert_eq!(layout.binding_slot(0), Some(24), "the let -> [fp, 24]");
+        assert_eq!(layout.alloc, -32, "1 param + 1 let = 16 bytes -> alloc -32");
+    }
+
+    #[test]
+    fn a_shadowing_let_gets_its_own_distinct_slot() {
+        // two `let x` in the same body -- the inner shadows the outer. a
+        // name-keyed map would collide; the positional binding list gives each
+        // its own slot. occurrence 0 -> [fp, 16], occurrence 1 -> [fp, 24].
+        let decl = fn_from_source("fn f() -> i64 { let x = 1\nlet x = 2\nx }");
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.binding_slot(0), Some(16), "outer x -> [fp, 16]");
+        assert_eq!(layout.binding_slot(1), Some(24), "shadowing x -> [fp, 24]");
+        assert_ne!(
+            layout.binding_slot(0),
+            layout.binding_slot(1),
+            "a shadowing let must not reuse the outer slot"
+        );
+    }
+
+    #[test]
+    fn lets_nested_inside_an_if_are_counted_into_the_frame() {
+        // a `let` inside an `if` block still needs a distinct slot. the body
+        // has one outer `let` then an `if` with a `let` in each arm: three
+        // `let`s total. binding occurrences 0/1/2 at [fp, 16]/[fp, 24]/[fp, 32].
+        let decl = fn_from_source(
+            "fn f(c: bool) { let a = 1\nif c { let b = 2 } else { let d = 3 } }",
+        );
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.binding_slot(0), Some(24), "outer let a, past param c");
+        assert_eq!(layout.binding_slot(1), Some(32), "let b in the then-block");
+        assert_eq!(layout.binding_slot(2), Some(40), "let d in the else-block");
+        // 1 param + 3 lets = 4 slots = 32 bytes -> alloc = -(16 + 32) & -16 = -48.
+        assert_eq!(layout.alloc, -48, "1 param + 3 nested lets -> alloc -48");
+    }
+
+    #[test]
+    fn a_for_loop_reserves_two_slots_a_variable_and_an_end_bound() {
+        // `fn f() { for i in 0..10 { } }`: a `for` reserves two binding slots
+        // -- the loop variable `i` and a dedicated `end`-bound slot. they are
+        // occurrences 0 and 1 at [fp, 16] and [fp, 24].
+        let decl = fn_from_source("fn f() { for i in 0..10 { } }");
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.binding_slot(0), Some(16), "for-variable slot");
+        assert_eq!(layout.binding_slot(1), Some(24), "for-end-bound slot");
+        assert_eq!(layout.binding_slot(2), None, "a bare for is exactly two slots");
+        // 2 for slots = 16 bytes, no params, no scratch -> alloc = -32.
+        assert_eq!(layout.alloc, -32, "one for loop (16 bytes) -> alloc -32");
+    }
+
+    #[test]
+    fn a_let_inside_a_for_body_is_counted_after_the_for_slots() {
+        // `for` slots come first (var, end), then the body's `let`. the body
+        // is `for i in 0..3 { let s = i }`: occurrences 0 (`i`), 1 (`end`),
+        // 2 (`s`) at [fp, 16], [fp, 24], [fp, 32].
+        let decl = fn_from_source("fn f() { for i in 0..3 { let s = i } }");
+        let layout = FrameLayout::plan_frame(&decl);
+        assert_eq!(layout.binding_slot(0), Some(16), "for-variable i");
+        assert_eq!(layout.binding_slot(1), Some(24), "for-end bound");
+        assert_eq!(layout.binding_slot(2), Some(32), "the let inside the body");
+        // 3 binding slots = 24 bytes -> alloc = -(16 + 24) & -16 = -48.
+        assert_eq!(layout.alloc, -48, "for (2 slots) + nested let -> alloc -48");
     }
 }
