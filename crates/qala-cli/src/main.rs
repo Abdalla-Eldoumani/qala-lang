@@ -9,6 +9,7 @@
 mod commands;
 mod diagnostics;
 mod pipeline;
+mod repl;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -47,6 +48,8 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// open an interactive qala REPL
+    Repl,
 }
 
 /// the qala build targets.
@@ -69,5 +72,6 @@ fn main() -> ExitCode {
             target,
             output,
         } => commands::build(&file, target, output),
+        Commands::Repl => repl::run_repl(),
     }
 }
