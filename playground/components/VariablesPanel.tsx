@@ -1,10 +1,9 @@
 // the variables panel: the current frame's in-scope variables, listed
 // as name : value rows, with an amber flash on a row whose value
-// changed. phase 7 shipped this as a styled placeholder; phase 8 fills
-// the body with the real view. the panel frame and the Variables header
-// chrome are kept from phase 7 unchanged.
+// changed. the body is the real in-scope-variables view; the header
+// carries the panel-header treatment shared by the state panels.
 //
-// the flash is pure css -- the @keyframes var-flash lives in globals.css
+// the flash is pure css: the @keyframes var-flash lives in globals.css
 // and this panel only applies the .var-row--flashing class. a css
 // animation replays only when its element mounts or remounts, so the
 // flash is driven by the row's key: a row keyed by name plus a
@@ -68,12 +67,12 @@ export default function VariablesPanel({
   const [prevState, setPrevState] = useState<VmState | null>(null);
 
   // the diff, computed DURING RENDER. when `state` is a new reference --
-  // the hook hands a fresh VmState per step -- this compares the previous
+  // the hook hands a fresh VmState per step, this compares the previous
   // snapshot's variables to the new ones: a name whose rendered value
   // differs flashes; a name not in the previous set is newly in scope
   // and also flashes; a name that left scope just unmounts. a frame
   // change (the whole set swaps on a call or return) is therefore not a
-  // sea of flashes -- only a genuine value change or a newly-in-scope
+  // sea of flashes: only a genuine value change or a newly-in-scope
   // name bumps a counter. computing this in render rather than a
   // post-commit effect is what makes the changed row mount with its new
   // key in the same commit its value updates, so the flash starts on the
@@ -104,7 +103,7 @@ export default function VariablesPanel({
 
     setPrevState(state);
     // bump a counter only for the changed names, and only when something
-    // changed -- a step that touched no variable leaves flashCounts as
+    // changed: a step that touched no variable leaves flashCounts as
     // its own reference, so react bails out of that part of the update.
     if (flashing.length > 0) {
       setFlashCounts((current) => {
@@ -121,9 +120,10 @@ export default function VariablesPanel({
   // header, bottom rule) renders identically in every state.
   const frame = (children: React.ReactNode) => (
     <section
+      aria-label="Variables"
       className={`flex flex-col overflow-hidden rounded-[var(--radius-panel)] border border-border bg-surface ${className ?? ""}`}
     >
-      <header className="border-b border-border p-[var(--space-3)] text-[12px] font-medium uppercase tracking-wide leading-[1.4] text-text-secondary">
+      <header className="border-b border-border px-[var(--space-3)] py-[var(--space-2)] text-[12px] font-semibold uppercase tracking-wide leading-[1.4] text-text-secondary">
         Variables
       </header>
       {children}
@@ -131,7 +131,7 @@ export default function VariablesPanel({
   );
 
   const message = (text: string) => (
-    <div className="p-[var(--space-4)] text-[14px] font-normal leading-[1.5] text-text-secondary">
+    <div className="px-[var(--space-4)] pt-[var(--space-6)] pb-[var(--space-4)] text-[14px] font-normal leading-[1.5] text-text-secondary">
       {text}
     </div>
   );
@@ -139,7 +139,7 @@ export default function VariablesPanel({
   // dirty variables are stale: show the needs-compile sentence rather
   // than a frozen stale list.
   if (dirty) {
-    return frame(message("variables are out of date -- compile to refresh"));
+    return frame(message("variables are out of date, compile to refresh"));
   }
 
   const variables = state?.variables ?? [];
@@ -147,7 +147,11 @@ export default function VariablesPanel({
   // empty: no in-scope variables in the current frame (not stepped yet,
   // or a frame with no locals).
   if (variables.length === 0) {
-    return frame(message("in-scope variables appear here during stepping"));
+    return frame(
+      message(
+        "in-scope variables appear here as you step through the program",
+      ),
+    );
   }
 
   return frame(
@@ -156,7 +160,7 @@ export default function VariablesPanel({
         // the key is name plus the change counter: stable while the
         // value holds (no remount, the row stays quiet), changing on a
         // value change (a remount restarts the var-flash). a name with
-        // no counter yet -- a row on its very first render -- uses 0,
+        // no counter yet (a row on its very first render) uses 0,
         // and the fresh mount itself plays the flash once.
         <VariableRow
           key={`${variable.name}:${flashCounts.get(variable.name) ?? 0}`}
