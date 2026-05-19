@@ -136,7 +136,14 @@ impl Arm64Backend {
     ///
     /// a value in `0..=65535` encodes directly as `mov x0, <value>`; anything
     /// else (a large constant, a negative value) uses the `ldr x0, =<value>`
-    /// literal-pool form, which the assembler resolves for any 64-bit value.
+    /// literal-pool form, which the assembler resolves for ANY 64-bit value --
+    /// `i64::MIN` and `i64::MAX` included.
+    ///
+    /// `value` is always a valid `i64`: an integer literal whose magnitude
+    /// exceeds `i64::MAX` is rejected by the lexer as an overflow before this
+    /// backend ever runs, and a leading `-` is a separate unary `Neg` over a
+    /// non-negative magnitude (handled by `compile_unary`, not folded into the
+    /// literal here). so there is no unrepresentable literal to guard against.
     fn emit_int_literal(&mut self, value: i64) {
         if (0..=MOV_IMM_MAX).contains(&value) {
             self.asm.emit_insn(&format!("mov     x0, {value}"));
@@ -531,6 +538,39 @@ mod tests {
         let asm = emit_expr("fn f() -> i64 { 100000 }", "f");
         assert!(asm.contains("ldr     x0, =100000"), "{asm}");
         assert!(!asm.contains("mov     x0, 100000"), "{asm}");
+    }
+
+    #[test]
+    fn the_i64_min_magnitude_is_rejected_at_the_lexer_before_the_backend() {
+        // `emit_int_literal` documents that `value` is always a valid `i64`.
+        // the proof of that invariant: the bare literal `9223372036854775808`
+        // -- the magnitude of `i64::MIN`, one past `i64::MAX` -- never reaches
+        // the backend at all. it is an overflow the LEXER rejects, so a typed
+        // AST carrying it cannot be built and the backend's `ldr =` form never
+        // has to encode an out-of-range value.
+        let over = i64::MAX as u64 + 1; // 9223372036854775808
+        let src = format!("fn f() -> i64 {{ -{over} }}");
+        let lexed = Lexer::tokenize(&src);
+        assert!(
+            lexed.is_err(),
+            "the i64::MIN magnitude must be rejected by the lexer, not lowered"
+        );
+    }
+
+    #[test]
+    fn an_extreme_negative_literal_round_trips_through_the_backend() {
+        // the largest-magnitude literal that IS a valid i64: i64::MAX. negated,
+        // it is `i64::MIN + 1`. the source is unary `Neg` over that literal --
+        // the literal itself goes through `emit_int_literal`'s `ldr =` path
+        // (well past the 16-bit `mov` range) and `neg x0, x0` applies the sign.
+        // the backend emits clean assembly, no panic, no overflow.
+        let src = format!("fn f() -> i64 {{ -{} }}", i64::MAX);
+        let asm = emit_expr(&src, "f");
+        assert!(
+            asm.contains(&format!("ldr     x0, ={}", i64::MAX)),
+            "the i64::MAX magnitude must use the literal pool: {asm}"
+        );
+        assert!(asm.contains("neg     x0, x0"), "the unary minus must negate: {asm}");
     }
 
     #[test]
