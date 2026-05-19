@@ -6,6 +6,7 @@ use qala_compiler::errors::QalaError;
 use qala_compiler::lexer::Lexer;
 use qala_compiler::parser::Parser;
 use qala_compiler::typechecker::{self, QalaWarning};
+use qala_compiler::typed_ast::TypedAst;
 
 /// the result of a successful compile: the optimized program plus any warnings.
 pub struct Compiled {
@@ -51,4 +52,17 @@ pub fn check_source(src: &str) -> (Vec<QalaError>, Vec<QalaWarning>) {
     };
     let (_typed, errors, warnings) = typechecker::check_program(&ast, src);
     (errors, warnings)
+}
+
+/// lex + parse + typecheck `src` and return the typed AST on success -- the
+/// front of the pipeline an alternate backend (the arm64 code generator)
+/// consumes. errors block; warnings are discarded here.
+pub fn typecheck_source(src: &str) -> Result<TypedAst, Vec<QalaError>> {
+    let tokens = Lexer::tokenize(src).map_err(|e| vec![e])?;
+    let ast = Parser::parse(&tokens).map_err(|e| vec![e])?;
+    let (typed, errors, _warnings) = typechecker::check_program(&ast, src);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    Ok(typed)
 }
