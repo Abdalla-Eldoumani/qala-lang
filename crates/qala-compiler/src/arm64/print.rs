@@ -269,7 +269,6 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::typechecker::check_program;
-    use crate::typed_ast::TypedItem;
 
     /// compile a whole program to assembly, panicking on a backend error.
     fn compile_ok(src: &str) -> String {
@@ -580,5 +579,76 @@ mod tests {
         );
         assert!(out.contains("bl      printf"), "the printf call is missing: {out}");
         assert!(!out.contains("\nP:\n"), "the struct must emit nothing: {out}");
+    }
+
+    /// read a snapshot fixture, normalising CRLF to LF. a checked-out file on
+    /// Windows may carry CRLF line endings; the emitter always produces LF, so
+    /// the fixture's carriage returns are stripped for a platform-stable
+    /// compare -- the same helper shape `mod.rs` and `stmt.rs` use.
+    fn read_snapshot(name: &str) -> String {
+        let path = format!("{}/tests/snapshots/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {path}: {e}"))
+            .replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn a_string_literal_println_matches_the_snapshot() {
+        // the zero-hole printf path: a `println` of a string literal. the
+        // fixture shows the `.data` format string, the `ldr x0, =label`, and
+        // the `bl printf`, with `main` returning 0.
+        let emitted = compile_ok("fn main() is io {\n    println(\"done\")\n}\n");
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_printf_literal.s"),
+            "arm64 printf literal emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn an_interpolation_println_matches_the_snapshot() {
+        // the multi-hole printf path: a `println` whose interpolation has two
+        // i64 holes, the second a call. the fixture shows the two holes
+        // spilled to scratch slots, loaded into x1/x2, and `bl printf`.
+        let src = "fn square(n: i64) -> i64 {\n\
+                   \x20   n * n\n\
+                   }\n\
+                   \n\
+                   fn main() is io {\n\
+                   \x20   let x = 6\n\
+                   \x20   println(\"square({x}) = {square(x)}\")\n\
+                   }\n";
+        let emitted = compile_ok(src);
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_printf_interpolation.s"),
+            "arm64 printf interpolation emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn a_non_i64_hole_rejection_matches_the_error_snapshot() {
+        // the new ARM-05 boundary the printf path introduces: a non-i64
+        // interpolation hole. `compile_arm64` returns `Err`; the rendered
+        // diagnostic text is snapshotted -- the backend's clean rejection of
+        // an unsupported interpolation hole.
+        use crate::diagnostics::Diagnostic;
+        let src = "fn main() is io {\n    let b = true\n    println(\"flag is {b}\")\n}\n";
+        let tokens = Lexer::tokenize(src).expect("lex failed");
+        let ast = Parser::parse(&tokens).expect("parse failed");
+        let (typed, terrors, _) = check_program(&ast, src);
+        assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
+        let errors = super::super::compile_arm64(&typed, src)
+            .expect_err("a non-i64 interpolation hole must be rejected");
+        let rendered = errors
+            .iter()
+            .map(|e| Diagnostic::from(e.clone()).render(src))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            read_snapshot("arm64_printf_rejected.txt"),
+            "arm64 printf rejection diagnostic drifted from snapshot"
+        );
     }
 }
