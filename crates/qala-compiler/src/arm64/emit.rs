@@ -21,12 +21,21 @@ const INDENT: &str = "        ";
 ///
 /// crate-private: only the `arm64` module builds assembly text.
 pub(crate) struct Asm {
-    /// the `.data` section buffer. empty for the integer core -- Phase 13
-    /// (`printf` output) is the first writer.
+    /// the `.data` section buffer. the `printf` output path is the first
+    /// writer: a `print` / `println` of an `i64` registers its `"%lld"` /
+    /// `"%lld\n"` format string here. empty for a program with no output.
     data: String,
     /// the `.text` section buffer: per-function directives, labels, and
     /// instructions, in emission order.
     text: String,
+    /// set once the println format string (`"%lld\n"`) has been registered
+    /// in the `.data` buffer -- guards against a duplicate registration. the
+    /// reader is the `printf` call lowering in `expr.rs`, the next commit.
+    #[allow(dead_code)]
+    println_fmt_used: bool,
+    /// set once the print format string (`"%lld"`) has been registered.
+    #[allow(dead_code)]
+    print_fmt_used: bool,
 }
 
 impl Asm {
@@ -34,7 +43,38 @@ impl Asm {
     /// written by [`Asm::finish`], not seeded here, so an in-progress `Asm`
     /// holds only the caller's emitted lines.
     pub(crate) fn new() -> Self {
-        Asm { data: String::new(), text: String::new() }
+        Asm {
+            data: String::new(),
+            text: String::new(),
+            println_fmt_used: false,
+            print_fmt_used: false,
+        }
+    }
+
+    /// ensure the `"%lld\n"` println format string is in the `.data`
+    /// section; return its label. registers the string on the first call
+    /// and is a no-op on every later call -- one shared label per program.
+    ///
+    /// the caller is `compile_print_call` in `expr.rs`, added in the next
+    /// commit; the inline tests below exercise it in the meantime.
+    #[allow(dead_code)]
+    pub(crate) fn ensure_println_fmt(&mut self) -> &'static str {
+        if !self.println_fmt_used {
+            self.data.push_str(".Lfmt_println:  .string \"%lld\\n\"\n");
+            self.println_fmt_used = true;
+        }
+        ".Lfmt_println"
+    }
+
+    /// ensure the `"%lld"` print format string is in the `.data` section;
+    /// return its label. one shared label per program -- see [`Asm::ensure_println_fmt`].
+    #[allow(dead_code)]
+    pub(crate) fn ensure_print_fmt(&mut self) -> &'static str {
+        if !self.print_fmt_used {
+            self.data.push_str(".Lfmt_print:    .string \"%lld\"\n");
+            self.print_fmt_used = true;
+        }
+        ".Lfmt_print"
     }
 
     /// append a raw line, plus a trailing newline, to the `.text` buffer.
@@ -172,5 +212,53 @@ mod tests {
         asm.emit_label("f");
         asm.emit_insn("ret");
         assert!(!asm.finish().contains('\r'));
+    }
+
+    #[test]
+    fn ensure_println_fmt_registers_the_format_string_and_returns_its_label() {
+        let mut asm = Asm::new();
+        assert_eq!(asm.ensure_println_fmt(), ".Lfmt_println");
+        let out = asm.finish();
+        // the label+directive lands inside a .data section.
+        assert!(out.contains("        .data\n"), "missing .data section: {out:?}");
+        assert!(
+            out.contains(".Lfmt_println:  .string \"%lld\\n\"\n"),
+            "missing the println format string: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_print_fmt_registers_the_format_string_and_returns_its_label() {
+        let mut asm = Asm::new();
+        assert_eq!(asm.ensure_print_fmt(), ".Lfmt_print");
+        let out = asm.finish();
+        assert!(out.contains("        .data\n"), "missing .data section: {out:?}");
+        assert!(
+            out.contains(".Lfmt_print:    .string \"%lld\"\n"),
+            "missing the print format string: {out:?}"
+        );
+        // the print format string has no trailing newline escape.
+        assert!(!out.contains("%lld\\n"), "print must not carry a newline: {out:?}");
+    }
+
+    #[test]
+    fn ensure_println_fmt_registers_the_string_only_once() {
+        // a second call is a no-op -- one shared label per program.
+        let mut asm = Asm::new();
+        asm.ensure_println_fmt();
+        asm.ensure_println_fmt();
+        let out = asm.finish();
+        assert_eq!(
+            out.matches(".Lfmt_println:").count(),
+            1,
+            "the println format string must be registered exactly once: {out:?}"
+        );
+    }
+
+    #[test]
+    fn finish_still_omits_the_data_section_when_no_format_string_is_registered() {
+        // the empty-.data behaviour is unchanged when neither ensure_* is called.
+        let asm = Asm::new();
+        assert!(!asm.finish().contains(".data"));
     }
 }
