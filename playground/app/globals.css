@@ -3,26 +3,26 @@
 :root {
   /* codex palette: the in-code source of truth for the design system.
      written in oklch: predictable lightness, correct chroma falloff at the
-     extremes. the values are computed to match the prior hex exactly, so
-     the rendered colors are identical. this is a notation change, not a
-     re-coloring. the neutrals carry a slight tint (no pure black or white):
-     the surfaces sit on a cool blue-violet ink hue, the ink and accent on
-     a warm hue. */
-  --bg: oklch(0.166 0.013 274);
-  --surface: oklch(0.197 0.014 274);
-  --border: oklch(0.252 0.018 274);
-  --text-primary: oklch(0.910 0.011 83);
-  --text-secondary: oklch(0.604 0.009 305);
-  --accent: oklch(0.726 0.118 67);
-  --accent-soft: oklch(0.726 0.118 67 / 0.15);
-  --error: oklch(0.564 0.150 21);
-  --success: oklch(0.567 0.072 162);
-  --warning: oklch(0.719 0.103 84);
-  --type-number: oklch(0.726 0.118 67 / 0.20);
-  --type-string: oklch(0.567 0.072 162 / 0.20);
-  --type-bool: oklch(0.55 0.13 270 / 0.20);
+     extremes. each value is computed from the prior hex to round-trip back
+     to the exact same srgb byte, so the rendered colors are identical.
+     this is a notation change, not a re-coloring. the neutrals carry a
+     slight tint (no pure black or white): the surfaces sit on a cool
+     blue-violet ink hue, the ink and accent on a warm hue. */
+  --bg: oklch(0.1645 0.0131 270.5);
+  --surface: oklch(0.198 0.0184 274.85);
+  --border: oklch(0.2519 0.0288 275.4);
+  --text-primary: oklch(0.9198 0.0116 84.58);
+  --text-secondary: oklch(0.6267 0.0155 303.99);
+  --accent: oklch(0.7138 0.1289 71.87);
+  --accent-soft: oklch(0.7138 0.1289 71.87 / 0.15);
+  --error: oklch(0.5813 0.1583 21.14);
+  --success: oklch(0.5881 0.0813 163.26);
+  --warning: oklch(0.7269 0.1134 85.34);
+  --type-number: oklch(0.7138 0.1289 71.87 / 0.20);
+  --type-string: oklch(0.5881 0.0813 163.26 / 0.20);
+  --type-bool: oklch(0.5631 0.1418 269.72 / 0.20);
   /* the neutral stack tint: arrays, tuples, structs, enums, void */
-  --type-other: oklch(0.604 0.009 305 / 0.12);
+  --type-other: oklch(0.6267 0.0155 303.99 / 0.12);
 
   /* codex spacing scale, sparse by design, no --space-5 / --space-7 */
   --space-1: 4px;
