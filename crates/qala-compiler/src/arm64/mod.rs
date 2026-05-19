@@ -548,4 +548,69 @@ mod tests {
             "arm64 boolean emission drifted from snapshot"
         );
     }
+
+    #[test]
+    fn a_function_call_matches_the_snapshot() {
+        // a multi-function program: `add3` with three i64 parameters and a
+        // `let`, and `main` calling it with three arguments -- the worked
+        // example. the fixture shows the callee's prologue / parameter spill /
+        // body / epilogue and the caller's argument spill/load + `bl`.
+        let src = "fn add3(a: i64, b: i64, c: i64) -> i64 {\n\
+                   \x20   let sum = a + b\n\
+                   \x20   sum + c\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20   let r = add3(10, 20, 12)\n\
+                   }\n";
+        let emitted = compile_ok(src);
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_function_call.s"),
+            "arm64 function-call emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn recursion_matches_the_snapshot() {
+        // a recursive `factorial`: an `if` base case, a `bl` to itself, the
+        // return -- the prologue/epilogue, the frame, a call, and recursion
+        // exercised together. the structural shape Phase 13's `fibonacci`
+        // round-trip needs.
+        let src = "fn factorial(n: i64) -> i64 {\n\
+                   \x20   if n <= 1 { return 1 }\n\
+                   \x20   n * factorial(n - 1)\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20   let f = factorial(5)\n\
+                   }\n";
+        let emitted = compile_ok(src);
+        assert_eq!(
+            emitted,
+            read_snapshot("arm64_recursion.s"),
+            "arm64 recursion emission drifted from snapshot"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_construct_matches_the_error_snapshot() {
+        // a program using a float -- outside the integer core. `compile_arm64`
+        // must return `Err`, never bad assembly and never a panic. the
+        // rendered diagnostic text is snapshotted: the backend's clean
+        // rejection of an unsupported construct.
+        use crate::diagnostics::Diagnostic;
+        let src = "fn main() {\n    let x = 1.5\n}\n";
+        let typed = typecheck(src);
+        let errors = compile_arm64(&typed, src)
+            .expect_err("a float program must be rejected by the backend");
+        let rendered = errors
+            .iter()
+            .map(|e| Diagnostic::from(e.clone()).render(src))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            read_snapshot("arm64_unsupported.txt"),
+            "arm64 unsupported-construct rejection drifted from snapshot"
+        );
+    }
 }
