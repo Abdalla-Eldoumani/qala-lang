@@ -264,9 +264,7 @@ impl Chunk {
         if jump < i16::MIN as isize || jump > i16::MAX as isize {
             return Err(QalaError::Parse {
                 span: Span::new(0, 0),
-                message: format!(
-                    "branch too far -- chunk exceeds i16 jump range ({jump} bytes)"
-                ),
+                message: format!("branch too far -- chunk exceeds i16 jump range ({jump} bytes)"),
             });
         }
         let bytes = (jump as i16).to_le_bytes();
@@ -289,9 +287,7 @@ impl Chunk {
         if offset < i16::MIN as isize || offset > i16::MAX as isize {
             return Err(QalaError::Parse {
                 span: Span::new(0, 0),
-                message: format!(
-                    "branch too far -- chunk exceeds i16 jump range ({offset} bytes)"
-                ),
+                message: format!("branch too far -- chunk exceeds i16 jump range ({offset} bytes)"),
             });
         }
         self.write_op(Opcode::Jump, line);
@@ -618,7 +614,9 @@ mod tests {
         c.write_op(Opcode::Const, 1);
         c.write_u16(7, 1);
         assert_eq!(c.last_const(), Some((0, 7)));
-        let idx = c.rewind_last_const().expect("rewind on a trailing CONST returns Some");
+        let idx = c
+            .rewind_last_const()
+            .expect("rewind on a trailing CONST returns Some");
         assert_eq!(idx, 7);
         assert_eq!(c.code.len(), 0);
         assert_eq!(c.source_lines.len(), 0);
@@ -660,7 +658,9 @@ mod tests {
         c.write_u16(1, 2);
         assert_eq!(c.code.len(), c.source_lines.len());
         // rewind the trailing CONST; one CONST remains.
-        let idx = c.rewind_last_const().expect("rewind on a trailing CONST returns Some");
+        let idx = c
+            .rewind_last_const()
+            .expect("rewind on a trailing CONST returns Some");
         assert_eq!(idx, 1);
         assert_eq!(c.code.len(), 3);
         assert_eq!(c.source_lines.len(), 3);
@@ -803,7 +803,8 @@ mod tests {
         p.globals.push("g".to_string());
         p.fn_names.push("main".to_string());
         p.fn_names.push("callee".to_string());
-        p.enum_variant_names.push(("Shape".to_string(), "Circle".to_string()));
+        p.enum_variant_names
+            .push(("Shape".to_string(), "Circle".to_string()));
 
         let mut c = Chunk::new();
         // CONST (u16 idx)
@@ -846,18 +847,42 @@ mod tests {
         p.chunks.push(c.clone());
         let out = c.disassemble(&p);
         // each rendered fragment must appear somewhere in the output.
-        assert!(out.contains("CONST     #0 7"), "missing CONST line in:\n{out}");
-        assert!(out.contains("GET_LOCAL 0"), "missing GET_LOCAL line in:\n{out}");
-        assert!(out.contains("GET_GLOBAL #0(g)"), "missing GET_GLOBAL line in:\n{out}");
-        assert!(out.contains("JUMP      +5"), "missing JUMP signed-offset rendering in:\n{out}");
-        assert!(out.contains("CALL      #1(callee)/2"), "missing CALL line in:\n{out}");
-        assert!(out.contains("MAKE_ARRAY 3"), "missing MAKE_ARRAY line in:\n{out}");
+        assert!(
+            out.contains("CONST     #0 7"),
+            "missing CONST line in:\n{out}"
+        );
+        assert!(
+            out.contains("GET_LOCAL 0"),
+            "missing GET_LOCAL line in:\n{out}"
+        );
+        assert!(
+            out.contains("GET_GLOBAL #0(g)"),
+            "missing GET_GLOBAL line in:\n{out}"
+        );
+        assert!(
+            out.contains("JUMP      +5"),
+            "missing JUMP signed-offset rendering in:\n{out}"
+        );
+        assert!(
+            out.contains("CALL      #1(callee)/2"),
+            "missing CALL line in:\n{out}"
+        );
+        assert!(
+            out.contains("MAKE_ARRAY 3"),
+            "missing MAKE_ARRAY line in:\n{out}"
+        );
         assert!(
             out.contains("MAKE_ENUM_VARIANT #0(Shape::Circle)/1"),
             "missing MAKE_ENUM_VARIANT line in:\n{out}"
         );
-        assert!(out.contains("FIELD     #2"), "missing FIELD line in:\n{out}");
-        assert!(out.contains("CONCAT_N  4"), "missing CONCAT_N line in:\n{out}");
+        assert!(
+            out.contains("FIELD     #2"),
+            "missing FIELD line in:\n{out}"
+        );
+        assert!(
+            out.contains("CONCAT_N  4"),
+            "missing CONCAT_N line in:\n{out}"
+        );
         assert!(
             out.contains("MATCH_VARIANT #0(Shape::Circle) miss-> "),
             "missing MATCH_VARIANT line in:\n{out}"
@@ -942,7 +967,8 @@ mod tests {
         let mut p = Program::new();
         p.fn_names.push("main".to_string());
         p.fn_names.push("f".to_string());
-        p.enum_variant_names.push(("E".to_string(), "A".to_string()));
+        p.enum_variant_names
+            .push(("E".to_string(), "A".to_string()));
 
         let mut c = Chunk::new();
         // zero-operand
@@ -1031,7 +1057,10 @@ mod tests {
         p.optimize();
         let after_first = p.chunks[0].code.clone();
         p.optimize();
-        assert_eq!(p.chunks[0].code, after_first, "second optimize changed bytes");
+        assert_eq!(
+            p.chunks[0].code, after_first,
+            "second optimize changed bytes"
+        );
     }
 
     // bonus: Program::disassemble header + body composition is determ.

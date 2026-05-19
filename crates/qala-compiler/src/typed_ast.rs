@@ -231,19 +231,43 @@ pub enum TypedStmt {
     /// of the binding (inferred from `init` or checked against an explicit
     /// annotation). `is_mut` is carried forward from the untyped AST so
     /// codegen does not have to re-read the original tree.
-    Let { is_mut: bool, name: String, ty: QalaType, init: TypedExpr, span: Span },
+    Let {
+        is_mut: bool,
+        name: String,
+        ty: QalaType,
+        init: TypedExpr,
+        span: Span,
+    },
     /// `if cond { ... }` with an optional `else` (a block, or another `if` for
     /// an `else if` chain). a statement, not an expression.
-    If { cond: TypedExpr, then_block: TypedBlock, else_branch: Option<TypedElseBranch>, span: Span },
+    If {
+        cond: TypedExpr,
+        then_block: TypedBlock,
+        else_branch: Option<TypedElseBranch>,
+        span: Span,
+    },
     /// `while cond { ... }`.
-    While { cond: TypedExpr, body: TypedBlock, span: Span },
+    While {
+        cond: TypedExpr,
+        body: TypedBlock,
+        span: Span,
+    },
     /// `for var in iter { ... }`. `var_ty` is the resolved type of the loop
     /// variable (the element type of the iterable). kept as a `For` node, not
     /// lowered.
-    For { var: String, var_ty: QalaType, iter: TypedExpr, body: TypedBlock, span: Span },
+    For {
+        var: String,
+        var_ty: QalaType,
+        iter: TypedExpr,
+        body: TypedBlock,
+        span: Span,
+    },
     /// `return` or `return expr`. the value is optional -- a bare `return` in
     /// a `void` function is legal.
-    Return { value: Option<TypedExpr>, span: Span },
+    Return {
+        value: Option<TypedExpr>,
+        span: Span,
+    },
     /// `break`. no labels, no value in v1.
     Break { span: Span },
     /// `continue`. no labels, no value in v1.
@@ -304,83 +328,194 @@ pub enum TypedElseBranch {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExpr {
     /// an integer literal with its resolved type ([`QalaType::I64`]).
-    Int { value: i64, ty: QalaType, span: Span },
+    Int {
+        value: i64,
+        ty: QalaType,
+        span: Span,
+    },
     /// a float literal with its resolved type ([`QalaType::F64`]).
-    Float { value: f64, ty: QalaType, span: Span },
+    Float {
+        value: f64,
+        ty: QalaType,
+        span: Span,
+    },
     /// a byte literal with its resolved type ([`QalaType::Byte`]).
     Byte { value: u8, ty: QalaType, span: Span },
     /// a string literal with its resolved type ([`QalaType::Str`]).
-    Str { value: String, ty: QalaType, span: Span },
+    Str {
+        value: String,
+        ty: QalaType,
+        span: Span,
+    },
     /// a boolean literal with its resolved type ([`QalaType::Bool`]).
-    Bool { value: bool, ty: QalaType, span: Span },
+    Bool {
+        value: bool,
+        ty: QalaType,
+        span: Span,
+    },
     /// an identifier reference resolved to its bound type.
-    Ident { name: String, ty: QalaType, span: Span },
+    Ident {
+        name: String,
+        ty: QalaType,
+        span: Span,
+    },
     /// `( inner )` -- a parenthesized expression. semantically transparent; the
     /// resolved type is the inner's type.
-    Paren { inner: Box<TypedExpr>, ty: QalaType, span: Span },
+    Paren {
+        inner: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `( e1, e2, ... )` -- a tuple. resolved type is
     /// [`QalaType::Tuple`] of the element types.
-    Tuple { elems: Vec<TypedExpr>, ty: QalaType, span: Span },
+    Tuple {
+        elems: Vec<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `[ e1, e2, ... ]` -- an array literal. resolved type is
     /// [`QalaType::Array`] with `Some(n)` length matching `elems.len()`.
-    ArrayLit { elems: Vec<TypedExpr>, ty: QalaType, span: Span },
+    ArrayLit {
+        elems: Vec<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `[ value; count ]` -- the repeat form of an array literal.
-    ArrayRepeat { value: Box<TypedExpr>, count: Box<TypedExpr>, ty: QalaType, span: Span },
+    ArrayRepeat {
+        value: Box<TypedExpr>,
+        count: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `Name { field: e, ... }` -- a struct literal. resolved type is
     /// [`QalaType::Named`] of the struct.
-    StructLit { name: String, fields: Vec<TypedFieldInit>, ty: QalaType, span: Span },
+    StructLit {
+        name: String,
+        fields: Vec<TypedFieldInit>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `obj.name` -- field access. distinct from [`TypedExpr::MethodCall`]:
     /// this is the form with no `( ... )` after the `.name`. resolved type is
     /// the field's type.
-    FieldAccess { obj: Box<TypedExpr>, name: String, ty: QalaType, span: Span },
+    FieldAccess {
+        obj: Box<TypedExpr>,
+        name: String,
+        ty: QalaType,
+        span: Span,
+    },
     /// `receiver.name(args)` -- a method call. distinct from a field access
     /// followed by a call; the typechecker resolves it to the
     /// `fn Type.name(self, ...)` declaration. resolved type is the method's
     /// return type.
-    MethodCall { receiver: Box<TypedExpr>, name: String, args: Vec<TypedExpr>, ty: QalaType, span: Span },
+    MethodCall {
+        receiver: Box<TypedExpr>,
+        name: String,
+        args: Vec<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `callee(args)` -- a call expression. resolved type is the callee's
     /// return type.
-    Call { callee: Box<TypedExpr>, args: Vec<TypedExpr>, ty: QalaType, span: Span },
+    Call {
+        callee: Box<TypedExpr>,
+        args: Vec<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `obj[index]` -- an index expression. resolved type is the element type
     /// of the array.
-    Index { obj: Box<TypedExpr>, index: Box<TypedExpr>, ty: QalaType, span: Span },
+    Index {
+        obj: Box<TypedExpr>,
+        index: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `expr?` -- error propagation. resolved type is the `Ok` payload (for
     /// `Result<T, E>`) or the `Some` payload (for `Option<T>`).
-    Try { expr: Box<TypedExpr>, ty: QalaType, span: Span },
+    Try {
+        expr: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// a unary-operator application: `!operand` or `-operand`. resolved type
     /// is determined by the operand and the operator.
-    Unary { op: UnaryOp, operand: Box<TypedExpr>, ty: QalaType, span: Span },
+    Unary {
+        op: UnaryOp,
+        operand: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// a binary-operator application. resolved type is determined by the
     /// operator (arithmetic: matches the operand type; comparison and equality:
     /// `bool`; `&&`/`||`: `bool`). the `or` fallback is *not* here -- it is
     /// [`TypedExpr::OrElse`].
-    Binary { op: BinOp, lhs: Box<TypedExpr>, rhs: Box<TypedExpr>, ty: QalaType, span: Span },
+    Binary {
+        op: BinOp,
+        lhs: Box<TypedExpr>,
+        rhs: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `start .. end` or `start ..= end`. resolved type is the iterable type
     /// the range stands for.
-    Range { start: Option<Box<TypedExpr>>, end: Option<Box<TypedExpr>>, inclusive: bool, ty: QalaType, span: Span },
+    Range {
+        start: Option<Box<TypedExpr>>,
+        end: Option<Box<TypedExpr>>,
+        inclusive: bool,
+        ty: QalaType,
+        span: Span,
+    },
     /// `lhs |> call` -- the pipeline operator. NOT desugared in the typed AST
     /// either; desugaring is Phase 4 codegen's job. resolved type is the call's
     /// return type.
-    Pipeline { lhs: Box<TypedExpr>, call: Box<TypedExpr>, ty: QalaType, span: Span },
+    Pipeline {
+        lhs: Box<TypedExpr>,
+        call: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `comptime body` -- compile-time evaluated. resolved type is the body's
     /// type (the typechecker only types it; evaluation is codegen).
-    Comptime { body: Box<TypedExpr>, ty: QalaType, span: Span },
+    Comptime {
+        body: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `{ ...; trailing }` used as an expression. resolved type is the block's
     /// trailing-value type (or `void`); duplicated at this level so the
     /// uniform [`TypedExpr::ty`] accessor reads from a variant field rather
     /// than peeking into the [`TypedBlock`].
-    Block { block: TypedBlock, ty: QalaType, span: Span },
+    Block {
+        block: TypedBlock,
+        ty: QalaType,
+        span: Span,
+    },
     /// `match scrutinee { arm, ... }`. NOT desugared. resolved type is the
     /// common type of all arm bodies; exhaustiveness is checked by the
     /// typechecker against the scrutinee's enum type.
-    Match { scrutinee: Box<TypedExpr>, arms: Vec<TypedMatchArm>, ty: QalaType, span: Span },
+    Match {
+        scrutinee: Box<TypedExpr>,
+        arms: Vec<TypedMatchArm>,
+        ty: QalaType,
+        span: Span,
+    },
     /// `expr or fallback` -- the inline fallback for a `Result`/`Option`. NOT
     /// desugared. resolved type is the `T` of `Result<T, E>` / `Option<T>`.
-    OrElse { expr: Box<TypedExpr>, fallback: Box<TypedExpr>, ty: QalaType, span: Span },
+    OrElse {
+        expr: Box<TypedExpr>,
+        fallback: Box<TypedExpr>,
+        ty: QalaType,
+        span: Span,
+    },
     /// a string with `{expr}` interpolations. NOT desugared to a `+` chain;
     /// the conversion-and-concatenation happens in Phase 4 codegen. resolved
     /// type is [`QalaType::Str`].
-    Interpolation { parts: Vec<TypedInterpPart>, ty: QalaType, span: Span },
+    Interpolation {
+        parts: Vec<TypedInterpPart>,
+        ty: QalaType,
+        span: Span,
+    },
 }
 
 impl TypedExpr {
@@ -525,8 +660,16 @@ mod tests {
         // different one, assert not equal. mirror of ast.rs's analogous test.
         let a = TypedExpr::Binary {
             op: BinOp::Add,
-            lhs: Box::new(TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(0) }),
-            rhs: Box::new(TypedExpr::Int { value: 2, ty: QalaType::I64, span: span(2) }),
+            lhs: Box::new(TypedExpr::Int {
+                value: 1,
+                ty: QalaType::I64,
+                span: span(0),
+            }),
+            rhs: Box::new(TypedExpr::Int {
+                value: 2,
+                ty: QalaType::I64,
+                span: span(2),
+            }),
             ty: QalaType::I64,
             span: span(0),
         };
@@ -537,8 +680,16 @@ mod tests {
         let _ = format!("{a:?}");
         let c = TypedExpr::Binary {
             op: BinOp::Mul, // different operator
-            lhs: Box::new(TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(0) }),
-            rhs: Box::new(TypedExpr::Int { value: 2, ty: QalaType::I64, span: span(2) }),
+            lhs: Box::new(TypedExpr::Int {
+                value: 1,
+                ty: QalaType::I64,
+                span: span(0),
+            }),
+            rhs: Box::new(TypedExpr::Int {
+                value: 2,
+                ty: QalaType::I64,
+                span: span(2),
+            }),
             ty: QalaType::I64,
             span: span(0),
         };
@@ -552,23 +703,43 @@ mod tests {
         // variant in the .ty() exhaustive match returns the right field.
         let cases: Vec<(TypedExpr, QalaType)> = vec![
             (
-                TypedExpr::Int { value: 0, ty: QalaType::I64, span: span(1) },
+                TypedExpr::Int {
+                    value: 0,
+                    ty: QalaType::I64,
+                    span: span(1),
+                },
                 QalaType::I64,
             ),
             (
-                TypedExpr::Float { value: 0.0, ty: QalaType::F64, span: span(2) },
+                TypedExpr::Float {
+                    value: 0.0,
+                    ty: QalaType::F64,
+                    span: span(2),
+                },
                 QalaType::F64,
             ),
             (
-                TypedExpr::Byte { value: 0, ty: QalaType::Byte, span: span(3) },
+                TypedExpr::Byte {
+                    value: 0,
+                    ty: QalaType::Byte,
+                    span: span(3),
+                },
                 QalaType::Byte,
             ),
             (
-                TypedExpr::Str { value: String::new(), ty: QalaType::Str, span: span(4) },
+                TypedExpr::Str {
+                    value: String::new(),
+                    ty: QalaType::Str,
+                    span: span(4),
+                },
                 QalaType::Str,
             ),
             (
-                TypedExpr::Bool { value: true, ty: QalaType::Bool, span: span(5) },
+                TypedExpr::Bool {
+                    value: true,
+                    ty: QalaType::Bool,
+                    span: span(5),
+                },
                 QalaType::Bool,
             ),
             (
@@ -582,7 +753,11 @@ mod tests {
             (
                 TypedExpr::Unary {
                     op: UnaryOp::Neg,
-                    operand: Box::new(TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(8) }),
+                    operand: Box::new(TypedExpr::Int {
+                        value: 1,
+                        ty: QalaType::I64,
+                        span: span(8),
+                    }),
                     ty: QalaType::I64,
                     span: span(7),
                 },
@@ -591,8 +766,16 @@ mod tests {
             (
                 TypedExpr::Tuple {
                     elems: vec![
-                        TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(10) },
-                        TypedExpr::Bool { value: true, ty: QalaType::Bool, span: span(11) },
+                        TypedExpr::Int {
+                            value: 1,
+                            ty: QalaType::I64,
+                            span: span(10),
+                        },
+                        TypedExpr::Bool {
+                            value: true,
+                            ty: QalaType::Bool,
+                            span: span(11),
+                        },
                     ],
                     ty: QalaType::Tuple(vec![QalaType::I64, QalaType::Bool]),
                     span: span(9),
@@ -625,25 +808,62 @@ mod tests {
         // every faithful node form (incl. Pipeline / OrElse / Interpolation /
         // MethodCall) is represented so a missing arm in .span() trips the test.
         let cases: Vec<(TypedExpr, Span)> = vec![
-            (TypedExpr::Int { value: 0, ty: QalaType::I64, span: span(1) }, span(1)),
-            (TypedExpr::Float { value: 0.0, ty: QalaType::F64, span: span(2) }, span(2)),
-            (TypedExpr::Byte { value: 0, ty: QalaType::Byte, span: span(3) }, span(3)),
             (
-                TypedExpr::Str { value: String::new(), ty: QalaType::Str, span: span(4) },
+                TypedExpr::Int {
+                    value: 0,
+                    ty: QalaType::I64,
+                    span: span(1),
+                },
+                span(1),
+            ),
+            (
+                TypedExpr::Float {
+                    value: 0.0,
+                    ty: QalaType::F64,
+                    span: span(2),
+                },
+                span(2),
+            ),
+            (
+                TypedExpr::Byte {
+                    value: 0,
+                    ty: QalaType::Byte,
+                    span: span(3),
+                },
+                span(3),
+            ),
+            (
+                TypedExpr::Str {
+                    value: String::new(),
+                    ty: QalaType::Str,
+                    span: span(4),
+                },
                 span(4),
             ),
             (
-                TypedExpr::Bool { value: true, ty: QalaType::Bool, span: span(5) },
+                TypedExpr::Bool {
+                    value: true,
+                    ty: QalaType::Bool,
+                    span: span(5),
+                },
                 span(5),
             ),
             (
-                TypedExpr::Ident { name: "x".to_string(), ty: QalaType::I64, span: span(6) },
+                TypedExpr::Ident {
+                    name: "x".to_string(),
+                    ty: QalaType::I64,
+                    span: span(6),
+                },
                 span(6),
             ),
             (
                 TypedExpr::Unary {
                     op: UnaryOp::Neg,
-                    operand: Box::new(TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(8) }),
+                    operand: Box::new(TypedExpr::Int {
+                        value: 1,
+                        ty: QalaType::I64,
+                        span: span(8),
+                    }),
                     ty: QalaType::I64,
                     span: span(7),
                 },
@@ -665,7 +885,11 @@ mod tests {
             ),
             (
                 TypedExpr::Pipeline {
-                    lhs: Box::new(TypedExpr::Int { value: 5, ty: QalaType::I64, span: span(12) }),
+                    lhs: Box::new(TypedExpr::Int {
+                        value: 5,
+                        ty: QalaType::I64,
+                        span: span(12),
+                    }),
                     call: Box::new(TypedExpr::Ident {
                         name: "double".to_string(),
                         ty: QalaType::Function {
@@ -749,14 +973,24 @@ mod tests {
                     is_mut: false,
                     name: "x".to_string(),
                     ty: QalaType::I64,
-                    init: TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(1) },
+                    init: TypedExpr::Int {
+                        value: 1,
+                        ty: QalaType::I64,
+                        span: span(1),
+                    },
                     span: span(0),
                 },
                 span(0),
             ),
             (TypedStmt::Break { span: span(2) }, span(2)),
             (TypedStmt::Continue { span: span(3) }, span(3)),
-            (TypedStmt::Return { value: None, span: span(4) }, span(4)),
+            (
+                TypedStmt::Return {
+                    value: None,
+                    span: span(4),
+                },
+                span(4),
+            ),
             (
                 TypedStmt::For {
                     var: "i".to_string(),
@@ -901,7 +1135,11 @@ mod tests {
                 is_mut: false,
                 name: "x".to_string(),
                 ty: QalaType::I64,
-                init: TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(1) },
+                init: TypedExpr::Int {
+                    value: 1,
+                    ty: QalaType::I64,
+                    span: span(1),
+                },
                 span: span(0),
             }],
             value: Some(Box::new(TypedExpr::Ident {
@@ -927,8 +1165,16 @@ mod tests {
         prog.push(TypedItem::Struct(TypedStructDecl {
             name: "Point".to_string(),
             fields: vec![
-                TypedField { name: "x".to_string(), ty: QalaType::I64, span: span(1) },
-                TypedField { name: "y".to_string(), ty: QalaType::I64, span: span(2) },
+                TypedField {
+                    name: "x".to_string(),
+                    ty: QalaType::I64,
+                    span: span(1),
+                },
+                TypedField {
+                    name: "y".to_string(),
+                    ty: QalaType::I64,
+                    span: span(2),
+                },
             ],
             span: span(0),
         }));
@@ -945,7 +1191,11 @@ mod tests {
         // a typed Unary node uses the ast::UnaryOp value directly.
         let neg = TypedExpr::Unary {
             op: UnaryOp::Neg,
-            operand: Box::new(TypedExpr::Int { value: 5, ty: QalaType::I64, span: span(1) }),
+            operand: Box::new(TypedExpr::Int {
+                value: 5,
+                ty: QalaType::I64,
+                span: span(1),
+            }),
             ty: QalaType::I64,
             span: span(0),
         };
@@ -960,7 +1210,10 @@ mod tests {
         let arm = TypedMatchArm {
             pattern: Pattern::Variant {
                 name: "Circle".to_string(),
-                sub: vec![Pattern::Binding { name: "r".to_string(), span: span(1) }],
+                sub: vec![Pattern::Binding {
+                    name: "r".to_string(),
+                    span: span(1),
+                }],
                 span: span(0),
             },
             guard: Some(TypedExpr::Binary {
@@ -970,7 +1223,11 @@ mod tests {
                     ty: QalaType::F64,
                     span: span(2),
                 }),
-                rhs: Box::new(TypedExpr::Float { value: 0.0, ty: QalaType::F64, span: span(3) }),
+                rhs: Box::new(TypedExpr::Float {
+                    value: 0.0,
+                    ty: QalaType::F64,
+                    span: span(3),
+                }),
                 ty: QalaType::Bool,
                 span: span(2),
             }),
@@ -987,7 +1244,10 @@ mod tests {
             arm.pattern,
             Pattern::Variant {
                 name: "Circle".to_string(),
-                sub: vec![Pattern::Binding { name: "r".to_string(), span: span(1) }],
+                sub: vec![Pattern::Binding {
+                    name: "r".to_string(),
+                    span: span(1)
+                }],
                 span: span(0),
             }
         );
@@ -1000,7 +1260,11 @@ mod tests {
         // Match, OrElse, and Interpolation are real variants, not desugared.
         // build one of each and confirm .ty() / .span() work.
         let pipe = TypedExpr::Pipeline {
-            lhs: Box::new(TypedExpr::Int { value: 1, ty: QalaType::I64, span: span(1) }),
+            lhs: Box::new(TypedExpr::Int {
+                value: 1,
+                ty: QalaType::I64,
+                span: span(1),
+            }),
             call: Box::new(TypedExpr::Ident {
                 name: "double".to_string(),
                 ty: QalaType::Function {
@@ -1016,9 +1280,16 @@ mod tests {
         assert_eq!(pipe.span(), span(0));
 
         let m = TypedExpr::Match {
-            scrutinee: Box::new(TypedExpr::Bool { value: true, ty: QalaType::Bool, span: span(5) }),
+            scrutinee: Box::new(TypedExpr::Bool {
+                value: true,
+                ty: QalaType::Bool,
+                span: span(5),
+            }),
             arms: vec![TypedMatchArm {
-                pattern: Pattern::Bool { value: true, span: span(6) },
+                pattern: Pattern::Bool {
+                    value: true,
+                    span: span(6),
+                },
                 guard: None,
                 body: TypedMatchArmBody::Expr(Box::new(TypedExpr::Int {
                     value: 1,
@@ -1038,7 +1309,11 @@ mod tests {
                 ty: QalaType::Option(Box::new(QalaType::I64)),
                 span: span(9),
             }),
-            fallback: Box::new(TypedExpr::Int { value: 0, ty: QalaType::I64, span: span(10) }),
+            fallback: Box::new(TypedExpr::Int {
+                value: 0,
+                ty: QalaType::I64,
+                span: span(10),
+            }),
             ty: QalaType::I64,
             span: span(8),
         };

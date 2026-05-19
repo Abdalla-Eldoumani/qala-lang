@@ -27,8 +27,8 @@ use crate::errors::QalaError;
 #[allow(unused_imports)] // task 2 uses this in the depth-cap check.
 use crate::parser::MAX_DEPTH;
 use crate::span::{LineIndex, Span};
-use crate::types::{QalaType, Symbol};
 use crate::typed_ast;
+use crate::types::{QalaType, Symbol};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---- public surface --------------------------------------------------------
@@ -403,9 +403,13 @@ impl<'src> Checker<'src> {
             let ty = self.resolve_type_expr(&f.ty);
             fields.push((f.name.clone(), ty));
         }
-        self.symbols
-            .structs
-            .insert(decl.name.clone(), StructInfo { fields, span: decl.span });
+        self.symbols.structs.insert(
+            decl.name.clone(),
+            StructInfo {
+                fields,
+                span: decl.span,
+            },
+        );
         self.struct_decl_order.push(decl.name.clone());
     }
 
@@ -421,12 +425,17 @@ impl<'src> Checker<'src> {
         self.collected_enum_names.push(decl.name.clone());
         let mut variants: Vec<(String, Vec<QalaType>)> = Vec::with_capacity(decl.variants.len());
         for v in &decl.variants {
-            let fields: Vec<QalaType> = v.fields.iter().map(|t| self.resolve_type_expr(t)).collect();
+            let fields: Vec<QalaType> =
+                v.fields.iter().map(|t| self.resolve_type_expr(t)).collect();
             variants.push((v.name.clone(), fields));
         }
-        self.symbols
-            .enums
-            .insert(decl.name.clone(), EnumInfo { variants, span: decl.span });
+        self.symbols.enums.insert(
+            decl.name.clone(),
+            EnumInfo {
+                variants,
+                span: decl.span,
+            },
+        );
     }
 
     /// collect an interface declaration into the symbol table.
@@ -477,9 +486,13 @@ impl<'src> Checker<'src> {
                 }
             })
             .collect();
-        self.symbols
-            .interfaces
-            .insert(decl.name.clone(), InterfaceInfo { methods, span: decl.span });
+        self.symbols.interfaces.insert(
+            decl.name.clone(),
+            InterfaceInfo {
+                methods,
+                span: decl.span,
+            },
+        );
     }
 
     /// collect a function (free function or `fn T.method`) into the symbol
@@ -501,7 +514,8 @@ impl<'src> Checker<'src> {
             });
             return;
         }
-        let mut params: Vec<(String, QalaType, Option<ast::Expr>)> = Vec::with_capacity(decl.params.len());
+        let mut params: Vec<(String, QalaType, Option<ast::Expr>)> =
+            Vec::with_capacity(decl.params.len());
         for p in &decl.params {
             let ty = if p.is_self {
                 // self's type is the receiver type, when present.
@@ -689,11 +703,7 @@ impl<'src> Checker<'src> {
                 continue;
             }
             // the head is the lexicographically smallest name in the SCC.
-            let head = scc
-                .iter()
-                .min()
-                .cloned()
-                .unwrap_or_else(|| scc[0].clone());
+            let head = scc.iter().min().cloned().unwrap_or_else(|| scc[0].clone());
             // build the path by DFS from head along the SCC's adjacency
             // until we return to head. for a self-loop the path is `[head,
             // head]`.
@@ -705,12 +715,7 @@ impl<'src> Checker<'src> {
             for _ in 0..=scc.len() {
                 let next: Option<String> = adj
                     .get(&current)
-                    .and_then(|nbrs| {
-                        nbrs.iter()
-                            .filter(|n| scc_set.contains(*n))
-                            .min()
-                            .cloned()
-                    });
+                    .and_then(|nbrs| nbrs.iter().filter(|n| scc_set.contains(*n)).min().cloned());
                 let Some(next_name) = next else {
                     break;
                 };
@@ -814,7 +819,10 @@ fn tarjan_scc(nodes: &[String], adj: &HashMap<String, Vec<String>>) -> Vec<Vec<S
                     next_index += 1;
                     stack.push(w.clone());
                     on_stack.insert(w.clone(), true);
-                    call_stack.push(Frame { node: w, next_child: 0 });
+                    call_stack.push(Frame {
+                        node: w,
+                        next_child: 0,
+                    });
                 } else if *on_stack.get(&w).unwrap_or(&false) {
                     // back-edge: update v's lowlink.
                     let w_idx = *index_of.get(&w).unwrap_or(&0);
@@ -929,7 +937,11 @@ impl<'src> Checker<'src> {
                                 .as_ref()
                                 .map(|t| resolve_type_silent(t, &self.symbols))
                                 .unwrap_or(QalaType::Void),
-                            effect: m.effect.as_ref().map(effect_set_from_ast).unwrap_or(EffectSet::pure()),
+                            effect: m
+                                .effect
+                                .as_ref()
+                                .map(effect_set_from_ast)
+                                .unwrap_or(EffectSet::pure()),
                             span: m.span,
                         })
                         .collect(),
@@ -961,7 +973,12 @@ impl<'src> Checker<'src> {
                 }
                 None
             }
-            ast::Expr::MethodCall { receiver, name, args, .. } => {
+            ast::Expr::MethodCall {
+                receiver,
+                name,
+                args,
+                ..
+            } => {
                 if name == "close"
                     && args.is_empty()
                     && let ast::Expr::Ident { name: h, .. } = receiver.as_ref()
@@ -982,7 +999,9 @@ impl<'src> Checker<'src> {
         // recursion below.
         let mut handle_bindings: Vec<(String, Span)> = Vec::new();
         for stmt in &block.stmts {
-            if let ast::Stmt::Let { name, init, span, .. } = stmt
+            if let ast::Stmt::Let {
+                name, init, span, ..
+            } = stmt
                 && let ast::Expr::Call { callee, .. } = init
                 && let ast::Expr::Ident { name: cname, .. } = callee.as_ref()
                 && Self::is_resource_returning(cname)
@@ -1030,7 +1049,11 @@ impl<'src> Checker<'src> {
     /// deep `else if` nesting) so every branch is checked.
     fn check_unmatched_defer_stmt(&mut self, stmt: &ast::Stmt) {
         match stmt {
-            ast::Stmt::If { then_block, else_branch, .. } => {
+            ast::Stmt::If {
+                then_block,
+                else_branch,
+                ..
+            } => {
                 self.check_unmatched_defer(then_block);
                 match else_branch {
                     Some(ast::ElseBranch::Block(b)) => self.check_unmatched_defer(b),
@@ -1118,16 +1141,18 @@ impl<'src> Checker<'src> {
         // and the body's trailing value is None AND the body does not end
         // with a Return statement, emit MissingReturn.
         if !ret_ty.types_match(&QalaType::Void) && body.value.is_none() {
-            let ends_in_return = d.body.stmts.last().map(|s| matches!(s, ast::Stmt::Return { .. })).unwrap_or(false);
+            let ends_in_return = d
+                .body
+                .stmts
+                .last()
+                .map(|s| matches!(s, ast::Stmt::Return { .. }))
+                .unwrap_or(false);
             // also accept an if-with-returns or a while-with-returns -- v1
             // does not do dataflow, so any non-Return tail with a Void
             // trailing value triggers the warning. picking up the trailing
             // brace as the span: the closing token is the body's span.end.
             if !ends_in_return {
-                let span = Span::new(
-                    d.body.span.end().saturating_sub(1),
-                    1,
-                );
+                let span = Span::new(d.body.span.end().saturating_sub(1), 1);
                 self.errors.push(QalaError::MissingReturn {
                     span,
                     fn_name: d.name.clone(),
@@ -1139,10 +1164,7 @@ impl<'src> Checker<'src> {
         // pop the function scope; fire any unused_var warnings.
         if let Some(scope) = self.scopes.pop() {
             for (name, info) in scope {
-                if !info.is_param
-                    && !info.used
-                    && !name.starts_with('_')
-                {
+                if !info.is_param && !info.used && !name.starts_with('_') {
                     let w = QalaWarning {
                         category: "unused_var".to_string(),
                         message: format!("unused variable `{name}`"),
@@ -1187,7 +1209,11 @@ impl<'src> Checker<'src> {
     /// check a block: open a scope, walk each statement, then either check
     /// or infer the trailing value. fire unreachable-code warnings inside
     /// the loop; fire unused-var warnings when the scope is popped.
-    fn check_block(&mut self, block: &ast::Block, expected: Option<&QalaType>) -> typed_ast::TypedBlock {
+    fn check_block(
+        &mut self,
+        block: &ast::Block,
+        expected: Option<&QalaType>,
+    ) -> typed_ast::TypedBlock {
         // a top-level fn body's scope is already on the stack (with params);
         // for any nested block we push a fresh scope so name resolution and
         // unused_var fire correctly.
@@ -1236,10 +1262,7 @@ impl<'src> Checker<'src> {
         // pop the nested scope, fire unused_var.
         if pushed_scope && let Some(scope) = self.scopes.pop() {
             for (name, info) in scope {
-                if !info.is_param
-                    && !info.used
-                    && !name.starts_with('_')
-                {
+                if !info.is_param && !info.used && !name.starts_with('_') {
                     let w = QalaWarning {
                         category: "unused_var".to_string(),
                         message: format!("unused variable `{name}`"),
@@ -1261,7 +1284,13 @@ impl<'src> Checker<'src> {
     /// check a single statement.
     fn check_stmt(&mut self, stmt: &ast::Stmt) -> typed_ast::TypedStmt {
         match stmt {
-            ast::Stmt::Let { is_mut, name, ty, init, span } => {
+            ast::Stmt::Let {
+                is_mut,
+                name,
+                ty,
+                init,
+                span,
+            } => {
                 let (typed_init, decl_ty) = match ty {
                     Some(t) => {
                         let expected = resolve_type_silent(t, &self.symbols);
@@ -1344,7 +1373,12 @@ impl<'src> Checker<'src> {
                     span: *span,
                 }
             }
-            ast::Stmt::If { cond, then_block, else_branch, span } => {
+            ast::Stmt::If {
+                cond,
+                then_block,
+                else_branch,
+                span,
+            } => {
                 let typed_cond = self.check_expr(cond, &QalaType::Bool);
                 let typed_then = self.check_block(then_block, None);
                 let typed_else = match else_branch {
@@ -1373,7 +1407,12 @@ impl<'src> Checker<'src> {
                     span: *span,
                 }
             }
-            ast::Stmt::For { var, iter, body, span } => {
+            ast::Stmt::For {
+                var,
+                iter,
+                body,
+                span,
+            } => {
                 let typed_iter = self.infer_expr(iter);
                 // element type: an Array's elem, or i64 for a Range
                 // (Range expressions resolve their ty to Array(elem=I64, None)
@@ -1438,17 +1477,26 @@ impl<'src> Checker<'src> {
                         None
                     }
                 };
-                typed_ast::TypedStmt::Return { value: typed_value, span: *span }
+                typed_ast::TypedStmt::Return {
+                    value: typed_value,
+                    span: *span,
+                }
             }
             ast::Stmt::Break { span } => typed_ast::TypedStmt::Break { span: *span },
             ast::Stmt::Continue { span } => typed_ast::TypedStmt::Continue { span: *span },
             ast::Stmt::Defer { expr, span } => {
                 let typed_expr = self.infer_expr(expr);
-                typed_ast::TypedStmt::Defer { expr: typed_expr, span: *span }
+                typed_ast::TypedStmt::Defer {
+                    expr: typed_expr,
+                    span: *span,
+                }
             }
             ast::Stmt::Expr { expr, span } => {
                 let typed_expr = self.infer_expr(expr);
-                typed_ast::TypedStmt::Expr { expr: typed_expr, span: *span }
+                typed_ast::TypedStmt::Expr {
+                    expr: typed_expr,
+                    span: *span,
+                }
             }
         }
     }
@@ -1465,7 +1513,10 @@ impl<'src> Checker<'src> {
             }
         }
         // user-defined free function?
-        let key = FnKey { type_name: None, name: name.to_string() };
+        let key = FnKey {
+            type_name: None,
+            name: name.to_string(),
+        };
         if let Some(info) = self.symbols.fns.get(&key) {
             let params: Vec<QalaType> = info.params.iter().map(|(_, ty, _)| ty.clone()).collect();
             return Some(QalaType::Function {
@@ -1475,7 +1526,10 @@ impl<'src> Checker<'src> {
         }
         // stdlib?
         let stdlib = stdlib_signatures();
-        if let Some(entry) = stdlib.iter().find(|e| e.type_name.is_none() && e.name == name) {
+        if let Some(entry) = stdlib
+            .iter()
+            .find(|e| e.type_name.is_none() && e.name == name)
+        {
             return Some(QalaType::Function {
                 params: entry.params.clone(),
                 returns: Box::new(entry.ret_ty.clone()),
@@ -1555,7 +1609,11 @@ impl<'src> Checker<'src> {
                 // is this a zero-data enum variant from any known enum?
                 let mut variant_match: Option<String> = None;
                 for (enum_name, info) in &self.symbols.enums {
-                    if info.variants.iter().any(|(vn, fields)| vn == name && fields.is_empty()) {
+                    if info
+                        .variants
+                        .iter()
+                        .any(|(vn, fields)| vn == name && fields.is_empty())
+                    {
                         variant_match = Some(enum_name.clone());
                         break;
                     }
@@ -1587,12 +1645,14 @@ impl<'src> Checker<'src> {
                 }
             }
             ast::Expr::Tuple { elems, span } => {
-                let typed_elems: Vec<typed_ast::TypedExpr> = elems
-                    .iter()
-                    .map(|e| self.infer_expr(e))
-                    .collect();
+                let typed_elems: Vec<typed_ast::TypedExpr> =
+                    elems.iter().map(|e| self.infer_expr(e)).collect();
                 let ty = QalaType::Tuple(typed_elems.iter().map(|e| e.ty().clone()).collect());
-                typed_ast::TypedExpr::Tuple { elems: typed_elems, ty, span: *span }
+                typed_ast::TypedExpr::Tuple {
+                    elems: typed_elems,
+                    ty,
+                    span: *span,
+                }
             }
             ast::Expr::ArrayLit { elems, span } => {
                 if elems.is_empty() {
@@ -1657,7 +1717,10 @@ impl<'src> Checker<'src> {
                         } else {
                             self.errors.push(QalaError::Type {
                                 span: *span,
-                                message: format!("no field `{name}` on type `{}`", obj_ty.display()),
+                                message: format!(
+                                    "no field `{name}` on type `{}`",
+                                    obj_ty.display()
+                                ),
                             });
                             QalaType::Unknown
                         }
@@ -1678,9 +1741,12 @@ impl<'src> Checker<'src> {
                     span: *span,
                 }
             }
-            ast::Expr::MethodCall { receiver, name, args, span } => {
-                self.check_method_call(receiver, name, args, *span)
-            }
+            ast::Expr::MethodCall {
+                receiver,
+                name,
+                args,
+                span,
+            } => self.check_method_call(receiver, name, args, *span),
             ast::Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
             ast::Expr::Index { obj, index, span } => {
                 let typed_obj = self.infer_expr(obj);
@@ -1783,7 +1849,12 @@ impl<'src> Checker<'src> {
                 }
             }
             ast::Expr::Binary { op, lhs, rhs, span } => self.check_binary(op, lhs, rhs, *span),
-            ast::Expr::Range { start, end, inclusive, span } => {
+            ast::Expr::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
                 let typed_start = start.as_ref().map(|e| self.check_expr(e, &QalaType::I64));
                 let typed_end = end.as_ref().map(|e| self.check_expr(e, &QalaType::I64));
                 // ranges iterate as `[i64]` so for-loops bind the element to i64.
@@ -1830,10 +1901,16 @@ impl<'src> Checker<'src> {
                     span: *span,
                 }
             }
-            ast::Expr::Match { scrutinee, arms, span } => {
-                self.check_match(scrutinee, arms, *span)
-            }
-            ast::Expr::OrElse { expr: e, fallback, span } => {
+            ast::Expr::Match {
+                scrutinee,
+                arms,
+                span,
+            } => self.check_match(scrutinee, arms, *span),
+            ast::Expr::OrElse {
+                expr: e,
+                fallback,
+                span,
+            } => {
                 let typed_e = self.infer_expr(e);
                 let success_ty = match typed_e.ty() {
                     QalaType::Result(ok, _) => (**ok).clone(),
@@ -1862,7 +1939,9 @@ impl<'src> Checker<'src> {
                 let typed_parts: Vec<typed_ast::TypedInterpPart> = parts
                     .iter()
                     .map(|p| match p {
-                        ast::InterpPart::Literal(s) => typed_ast::TypedInterpPart::Literal(s.clone()),
+                        ast::InterpPart::Literal(s) => {
+                            typed_ast::TypedInterpPart::Literal(s.clone())
+                        }
                         ast::InterpPart::Expr(e) => {
                             typed_ast::TypedInterpPart::Expr(self.infer_expr(e))
                         }
@@ -1904,11 +1983,8 @@ impl<'src> Checker<'src> {
     ) -> typed_ast::TypedExpr {
         // capture declared fields as (name, type) so we can iterate without
         // re-borrowing self.
-        let declared: Option<Vec<(String, QalaType)>> = self
-            .symbols
-            .structs
-            .get(name)
-            .map(|s| s.fields.clone());
+        let declared: Option<Vec<(String, QalaType)>> =
+            self.symbols.structs.get(name).map(|s| s.fields.clone());
         let Some(declared) = declared else {
             self.errors.push(QalaError::UndefinedName {
                 span,
@@ -1923,8 +1999,7 @@ impl<'src> Checker<'src> {
         };
         let mut typed_fields: Vec<typed_ast::TypedFieldInit> = Vec::new();
         // missing-field detection.
-        let provided_names: BTreeSet<String> =
-            fields.iter().map(|f| f.name.clone()).collect();
+        let provided_names: BTreeSet<String> = fields.iter().map(|f| f.name.clone()).collect();
         let missing: Vec<String> = declared
             .iter()
             .filter(|(dn, _)| !provided_names.contains(dn))
@@ -1956,10 +2031,7 @@ impl<'src> Checker<'src> {
                 None => {
                     self.errors.push(QalaError::Type {
                         span: fi.span,
-                        message: format!(
-                            "no field `{}` on struct `{name}`",
-                            fi.name
-                        ),
+                        message: format!("no field `{}` on struct `{name}`", fi.name),
                     });
                     // still type the value so cascading errors don't fire.
                     let typed_value = self.infer_expr(&fi.value);
@@ -2000,17 +2072,27 @@ impl<'src> Checker<'src> {
                 _ => None,
             };
             if let Some(tn) = type_name {
-                let key = FnKey { type_name: Some(tn.clone()), name: name.to_string() };
+                let key = FnKey {
+                    type_name: Some(tn.clone()),
+                    name: name.to_string(),
+                };
                 if let Some(info) = self.symbols.fns.get(&key) {
                     // params after self.
                     let params: Vec<QalaType> = info
                         .params
                         .iter()
-                        .skip(if info.params.first().map(|(n, _, _)| n == "self").unwrap_or(false) {
-                            1
-                        } else {
-                            0
-                        })
+                        .skip(
+                            if info
+                                .params
+                                .first()
+                                .map(|(n, _, _)| n == "self")
+                                .unwrap_or(false)
+                            {
+                                1
+                            } else {
+                                0
+                            },
+                        )
                         .map(|(_, t, _)| t.clone())
                         .collect();
                     return Some((params, info.ret_ty.clone(), key));
@@ -2054,10 +2136,7 @@ impl<'src> Checker<'src> {
                 if !matches!(receiver_ty, QalaType::Unknown) {
                     self.errors.push(QalaError::Type {
                         span,
-                        message: format!(
-                            "no method `{name}` on type `{}`",
-                            receiver_ty.display()
-                        ),
+                        message: format!("no method `{name}` on type `{}`", receiver_ty.display()),
                     });
                 }
                 (Vec::new(), QalaType::Unknown)
@@ -2077,7 +2156,10 @@ impl<'src> Checker<'src> {
                 })
                 .collect()
         };
-        if args.len() != params.len() && !matches!(receiver_ty, QalaType::Unknown) && !ret_ty.types_match(&QalaType::Unknown) {
+        if args.len() != params.len()
+            && !matches!(receiver_ty, QalaType::Unknown)
+            && !ret_ty.types_match(&QalaType::Unknown)
+        {
             // arity mismatch -- emit a generic Type error.
             self.errors.push(QalaError::Type {
                 span,
@@ -2386,7 +2468,10 @@ impl<'src> Checker<'src> {
         &self,
         name: &str,
     ) -> Option<(Vec<QalaType>, QalaType, bool, String, FnKey)> {
-        let key = FnKey { type_name: None, name: name.to_string() };
+        let key = FnKey {
+            type_name: None,
+            name: name.to_string(),
+        };
         if let Some(info) = self.symbols.fns.get(&key) {
             let params: Vec<QalaType> = info.params.iter().map(|(_, t, _)| t.clone()).collect();
             return Some((params, info.ret_ty.clone(), false, name.to_string(), key));
@@ -2398,7 +2483,10 @@ impl<'src> Checker<'src> {
                     entry.ret_ty.clone(),
                     entry.is_generic,
                     name.to_string(),
-                    FnKey { type_name: None, name: name.to_string() },
+                    FnKey {
+                        type_name: None,
+                        name: name.to_string(),
+                    },
                 ));
             }
         }
@@ -2608,10 +2696,7 @@ impl<'src> Checker<'src> {
                         }
                     }
                     // check param 0 against lhs_ty (when not generic).
-                    if !is_generic
-                        && !params.is_empty()
-                        && !lhs_ty.types_match(&params[0])
-                    {
+                    if !is_generic && !params.is_empty() && !lhs_ty.types_match(&params[0]) {
                         self.errors.push(QalaError::TypeMismatch {
                             span: *span,
                             expected: params[0].display(),
@@ -2685,7 +2770,10 @@ impl<'src> Checker<'src> {
             // introduces are local to the arm.
             self.scopes.push(HashMap::new());
             self.bind_pattern(&arm.pattern, &scrut_ty);
-            let typed_guard = arm.guard.as_ref().map(|g| self.check_expr(g, &QalaType::Bool));
+            let typed_guard = arm
+                .guard
+                .as_ref()
+                .map(|g| self.check_expr(g, &QalaType::Bool));
             let typed_body = match &arm.body {
                 ast::MatchArmBody::Expr(e) => {
                     let typed = self.infer_expr(e);
@@ -2770,9 +2858,7 @@ impl<'src> Checker<'src> {
                     if !variants.contains(name) {
                         self.errors.push(QalaError::Type {
                             span: *span,
-                            message: format!(
-                                "variant `{name}` is not part of enum `{enum_name}`"
-                            ),
+                            message: format!("variant `{name}` is not part of enum `{enum_name}`"),
                         });
                         continue;
                     }
@@ -2822,8 +2908,8 @@ impl<'src> Checker<'src> {
         }
         // overlapping_guards: per-variant counts > 1 OR multiple binding
         // arms with guards (all matching everything).
-        let any_overlap = guarded_arms_by_variant.values().any(|c| *c > 1)
-            || guarded_binding_arms > 1;
+        let any_overlap =
+            guarded_arms_by_variant.values().any(|c| *c > 1) || guarded_binding_arms > 1;
         if any_overlap {
             let w = QalaWarning {
                 category: "overlapping_guards".to_string(),
@@ -2847,18 +2933,15 @@ impl<'src> Checker<'src> {
             QalaType::Named(Symbol(s)) => s.clone(),
             _ => return,
         };
-        let interface: Vec<(String, Vec<QalaType>, QalaType)> = match self
-            .symbols
-            .interfaces
-            .get(interface_name)
-        {
-            Some(i) => i
-                .methods
-                .iter()
-                .map(|m| (m.name.clone(), m.params.clone(), m.ret_ty.clone()))
-                .collect(),
-            None => return,
-        };
+        let interface: Vec<(String, Vec<QalaType>, QalaType)> =
+            match self.symbols.interfaces.get(interface_name) {
+                Some(i) => i
+                    .methods
+                    .iter()
+                    .map(|m| (m.name.clone(), m.params.clone(), m.ret_ty.clone()))
+                    .collect(),
+                None => return,
+            };
         let mut missing: Vec<String> = Vec::new();
         let mut mismatched: Vec<(String, String, String)> = Vec::new();
         for (mname, mparams, mret) in interface {
@@ -2874,11 +2957,18 @@ impl<'src> Checker<'src> {
                     let impl_params: Vec<QalaType> = info
                         .params
                         .iter()
-                        .skip(if info.params.first().map(|(n, _, _)| n == "self").unwrap_or(false) {
-                            1
-                        } else {
-                            0
-                        })
+                        .skip(
+                            if info
+                                .params
+                                .first()
+                                .map(|(n, _, _)| n == "self")
+                                .unwrap_or(false)
+                            {
+                                1
+                            } else {
+                                0
+                            },
+                        )
                         .map(|(_, t, _)| t.clone())
                         .collect();
                     // interface method's params skip self (interface
@@ -2947,18 +3037,13 @@ impl<'src> Checker<'src> {
                     if variant_fields.is_none() {
                         self.errors.push(QalaError::Type {
                             span: *span,
-                            message: format!(
-                                "variant `{name}` is not part of enum `{enum_name}`"
-                            ),
+                            message: format!("variant `{name}` is not part of enum `{enum_name}`"),
                         });
                     }
                 }
                 if let Some(fields) = variant_fields {
                     for (i, sub_pat) in sub.iter().enumerate() {
-                        let sub_ty = fields
-                            .get(i)
-                            .cloned()
-                            .unwrap_or(QalaType::Unknown);
+                        let sub_ty = fields.get(i).cloned().unwrap_or(QalaType::Unknown);
                         self.bind_pattern(sub_pat, &sub_ty);
                     }
                 } else {
@@ -3404,17 +3489,24 @@ fn resolve_type_silent(ty: &ast::TypeExpr, symbols: &SymbolTable) -> QalaType {
             }
             QalaType::Unknown
         }
-        ast::TypeExpr::Array { elem, size, .. } => {
-            QalaType::Array(Box::new(resolve_type_silent(elem, symbols)), Some(*size as usize))
-        }
+        ast::TypeExpr::Array { elem, size, .. } => QalaType::Array(
+            Box::new(resolve_type_silent(elem, symbols)),
+            Some(*size as usize),
+        ),
         ast::TypeExpr::DynArray { elem, .. } => {
             QalaType::Array(Box::new(resolve_type_silent(elem, symbols)), None)
         }
-        ast::TypeExpr::Tuple { elems, .. } => {
-            QalaType::Tuple(elems.iter().map(|e| resolve_type_silent(e, symbols)).collect())
-        }
+        ast::TypeExpr::Tuple { elems, .. } => QalaType::Tuple(
+            elems
+                .iter()
+                .map(|e| resolve_type_silent(e, symbols))
+                .collect(),
+        ),
         ast::TypeExpr::Fn { params, ret, .. } => QalaType::Function {
-            params: params.iter().map(|p| resolve_type_silent(p, symbols)).collect(),
+            params: params
+                .iter()
+                .map(|p| resolve_type_silent(p, symbols))
+                .collect(),
             returns: Box::new(resolve_type_silent(ret, symbols)),
         },
         ast::TypeExpr::Generic { name, args, .. } => {
@@ -3557,7 +3649,11 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, QalaError::RecursiveStructByValue { .. }))
             .collect();
-        assert_eq!(cycle_errors.len(), 1, "expected exactly one cycle error: {errors:?}");
+        assert_eq!(
+            cycle_errors.len(),
+            1,
+            "expected exactly one cycle error: {errors:?}"
+        );
         match cycle_errors[0] {
             QalaError::RecursiveStructByValue { path, .. } => {
                 assert_eq!(path, &vec!["A".to_string(), "A".to_string()]);
@@ -3578,7 +3674,10 @@ mod tests {
         match cycle_errors[0] {
             QalaError::RecursiveStructByValue { path, .. } => {
                 // head is alphabetically smallest -> "A".
-                assert_eq!(path, &vec!["A".to_string(), "B".to_string(), "A".to_string()]);
+                assert_eq!(
+                    path,
+                    &vec!["A".to_string(), "B".to_string(), "A".to_string()]
+                );
             }
             _ => unreachable!(),
         }
@@ -3626,7 +3725,9 @@ mod tests {
         // exactly one duplicate-error.
         let dup: Vec<&QalaError> = errors
             .iter()
-            .filter(|e| matches!(e, QalaError::Type { message, .. } if message.contains("duplicate")))
+            .filter(
+                |e| matches!(e, QalaError::Type { message, .. } if message.contains("duplicate")),
+            )
             .collect();
         assert_eq!(dup.len(), 1, "{errors:?}");
     }
@@ -3642,7 +3743,10 @@ mod tests {
         let starts: Vec<u32> = errors.iter().map(|e| e.span().start).collect();
         let mut sorted = starts.clone();
         sorted.sort();
-        assert_eq!(starts, sorted, "errors not sorted by span.start: {errors:?}");
+        assert_eq!(
+            starts, sorted,
+            "errors not sorted by span.start: {errors:?}"
+        );
     }
 
     // ---- pass 2: bidirectional type checking -------------------------------
@@ -3653,8 +3757,10 @@ mod tests {
         let src = "fn main() is io { let x = 42; println(\"hi\") }";
         let (_, errors, _) = check(src);
         // unused-var on x is expected since it is not read.
-        let type_errors: Vec<&QalaError> =
-            errors.iter().filter(|e| !matches!(e, QalaError::UndefinedName { .. })).collect();
+        let type_errors: Vec<&QalaError> = errors
+            .iter()
+            .filter(|e| !matches!(e, QalaError::UndefinedName { .. }))
+            .collect();
         assert!(type_errors.is_empty(), "{errors:?}");
     }
 
@@ -3709,7 +3815,9 @@ mod tests {
             .collect();
         assert!(!mismatch.is_empty(), "expected TypeMismatch in {errors:?}");
         match mismatch[0] {
-            QalaError::TypeMismatch { expected, found, .. } => {
+            QalaError::TypeMismatch {
+                expected, found, ..
+            } => {
                 assert_eq!(expected, "str");
                 assert_eq!(found, "i64");
             }
@@ -3999,7 +4107,11 @@ mod tests {
         assert_eq!(viol.len(), 1, "{errors:?}");
         match viol[0] {
             QalaError::EffectViolation {
-                caller, caller_effect, callee, callee_effect, ..
+                caller,
+                caller_effect,
+                callee,
+                callee_effect,
+                ..
             } => {
                 assert_eq!(caller, "shout");
                 assert_eq!(caller_effect, "pure");
@@ -4047,7 +4159,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, QalaError::EffectViolation { .. }))
             .collect();
-        assert!(viol.is_empty(), "no annotated callers; no violations: {errors:?}");
+        assert!(
+            viol.is_empty(),
+            "no annotated callers; no violations: {errors:?}"
+        );
     }
 
     #[test]
@@ -4068,7 +4183,9 @@ mod tests {
             .collect();
         assert_eq!(nonex.len(), 1, "{errors:?}");
         match nonex[0] {
-            QalaError::NonExhaustiveMatch { enum_name, missing, .. } => {
+            QalaError::NonExhaustiveMatch {
+                enum_name, missing, ..
+            } => {
                 assert_eq!(enum_name, "Shape");
                 assert_eq!(missing, &vec!["Triangle".to_string()]);
             }
@@ -4191,7 +4308,12 @@ mod tests {
             .collect();
         assert_eq!(ifaces.len(), 1, "{errors:?}");
         match ifaces[0] {
-            QalaError::InterfaceNotSatisfied { ty, interface, missing, .. } => {
+            QalaError::InterfaceNotSatisfied {
+                ty,
+                interface,
+                missing,
+                ..
+            } => {
                 assert_eq!(ty, "Point");
                 assert_eq!(interface, "Printable");
                 assert!(missing.contains(&"to_string".to_string()));
@@ -4206,7 +4328,10 @@ mod tests {
     fn unused_var_warns_with_correct_category() {
         let src = "fn main() is io { let x = 1; println(\"hi\") }";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> = warnings.iter().filter(|w| w.category == "unused_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unused_var")
+            .collect();
         assert_eq!(w.len(), 1, "{warnings:?}");
         assert!(w[0].message.contains("`x`"), "{w:?}");
     }
@@ -4215,8 +4340,10 @@ mod tests {
     fn underscore_prefixed_name_exempt_from_unused_var() {
         let src = "fn main() is io { let _ = 1; println(\"hi\") }";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unused_var")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4225,8 +4352,10 @@ mod tests {
         // open question 4: parameters never fire unused_var.
         let src = "fn f(x: i64) -> i64 is pure { 1 }";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unused_var")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4242,11 +4371,16 @@ mod tests {
             }
         "#;
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "shadowed_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "shadowed_var")
+            .collect();
         assert_eq!(w.len(), 1, "{warnings:?}");
         assert!(w[0].note.is_some(), "{w:?}");
-        assert!(w[0].note.as_ref().unwrap().contains("prior binding"), "{w:?}");
+        assert!(
+            w[0].note.as_ref().unwrap().contains("prior binding"),
+            "{w:?}"
+        );
     }
 
     #[test]
@@ -4275,8 +4409,10 @@ mod tests {
             }
         "#;
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unmatched_defer")
+            .collect();
         assert_eq!(w.len(), 1, "{warnings:?}");
     }
 
@@ -4290,8 +4426,10 @@ mod tests {
             }
         "#;
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unmatched_defer")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4305,8 +4443,10 @@ mod tests {
             }
         "#;
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unmatched_defer")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4321,8 +4461,10 @@ mod tests {
             }
         "#;
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unmatched_defer")
+            .collect();
         assert_eq!(w.len(), 1, "{warnings:?}");
         // the warning is at the `let g` site.
         assert!(w[0].message.contains("`g`"), "{w:?}");
@@ -4374,16 +4516,12 @@ mod tests {
         let t = scan_allow_directives("let x = 1 // qala: allow(unused_var)");
         assert!(t.is_empty());
         // row 3: multiple categories.
-        let t = scan_allow_directives(
-            "// qala: allow(unused_var, shadowed_var)\nlet x = 1",
-        );
+        let t = scan_allow_directives("// qala: allow(unused_var, shadowed_var)\nlet x = 1");
         let line2 = t.get(&2).expect("row 3 must populate line 2");
         assert!(line2.contains("unused_var"));
         assert!(line2.contains("shadowed_var"));
         // row 4: whitespace tolerance.
-        let t = scan_allow_directives(
-            "// qala: allow(  unused_var  ,shadowed_var  )\nlet x = 1",
-        );
+        let t = scan_allow_directives("// qala: allow(  unused_var  ,shadowed_var  )\nlet x = 1");
         let line2 = t.get(&2).expect("row 4 must populate line 2");
         assert!(line2.contains("unused_var"));
         assert!(line2.contains("shadowed_var"));
@@ -4397,9 +4535,7 @@ mod tests {
         let t = scan_allow_directives("let msg = \"// qala: allow(unused_var)\"");
         assert!(t.is_empty());
         // row 8: a directive between two statements.
-        let t = scan_allow_directives(
-            "let msg = \"...\"\n// qala: allow(unused_var)\nlet x = 1",
-        );
+        let t = scan_allow_directives("let msg = \"...\"\n// qala: allow(unused_var)\nlet x = 1");
         assert!(t.get(&3).map(|s| s.contains("unused_var")).unwrap_or(false));
     }
 
@@ -4407,8 +4543,10 @@ mod tests {
     fn directive_silences_unused_var() {
         let src = "// qala: allow(unused_var)\nfn main() is io { let x = 1; println(\"hi\") }";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unused_var")
+            .collect();
         // the directive on line 1 silences line 2 -- which is the `fn main` line,
         // not the `let x` line. so the warning still fires (its span is the let).
         // this test verifies the silencing is line-specific.
@@ -4420,8 +4558,10 @@ mod tests {
         // arrange the source so the directive directly precedes the `let x`.
         let src = "fn main() is io {\n// qala: allow(unused_var)\nlet x = 1; println(\"hi\") }";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unused_var")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4429,8 +4569,10 @@ mod tests {
     fn directive_silences_shadowed_var() {
         let src = "fn main() is io {\nlet x = 1\n// qala: allow(shadowed_var)\n{ let x = 2; println(\"{x}\") }\n}";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "shadowed_var").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "shadowed_var")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4449,8 +4591,10 @@ mod tests {
     fn directive_silences_unmatched_defer() {
         let src = "fn main() is io {\n// qala: allow(unmatched_defer)\nlet f = open(\"x.txt\")\nprintln(\"hi\")\n}";
         let (_, _, warnings) = check(src);
-        let w: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unmatched_defer").collect();
+        let w: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unmatched_defer")
+            .collect();
         assert!(w.is_empty(), "{warnings:?}");
     }
 
@@ -4483,8 +4627,10 @@ mod tests {
         let src = "fn main() is io {\n// qala: allow(unused_var)\nlet x = 1\nlet y = 2\nprintln(\"hi\")\n}";
         let (_, _, warnings) = check(src);
         // x silenced; y still fires.
-        let unused: Vec<&QalaWarning> =
-            warnings.iter().filter(|w| w.category == "unused_var").collect();
+        let unused: Vec<&QalaWarning> = warnings
+            .iter()
+            .filter(|w| w.category == "unused_var")
+            .collect();
         assert_eq!(unused.len(), 1, "{warnings:?}");
         assert!(unused[0].message.contains("`y`"), "{unused:?}");
     }
@@ -4538,7 +4684,12 @@ fn f() -> Alpha is pure { return Mark }
         // errors are expected.
         let relevant: Vec<&QalaError> = errors
             .iter()
-            .filter(|e| matches!(e, QalaError::UndefinedName { .. } | QalaError::TypeMismatch { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    QalaError::UndefinedName { .. } | QalaError::TypeMismatch { .. }
+                )
+            })
             .collect();
         assert!(
             relevant.is_empty(),
@@ -4580,7 +4731,10 @@ fn f() -> Alpha is pure { return Mark }
             .iter()
             .filter(|e| matches!(e, QalaError::TypeMismatch { .. }))
             .collect();
-        assert!(!mismatch.is_empty(), "abs(bool) should produce TypeMismatch: {errors:?}");
+        assert!(
+            !mismatch.is_empty(),
+            "abs(bool) should produce TypeMismatch: {errors:?}"
+        );
     }
 
     #[test]
@@ -4644,7 +4798,11 @@ fn f(v: Fruit) -> i64 is pure {
             .iter()
             .filter(|e| matches!(e, QalaError::NonExhaustiveMatch { .. }))
             .collect();
-        assert_eq!(non_ex.len(), 1, "expected exactly one NonExhaustiveMatch: {errors:?}");
+        assert_eq!(
+            non_ex.len(),
+            1,
+            "expected exactly one NonExhaustiveMatch: {errors:?}"
+        );
         match non_ex[0] {
             QalaError::NonExhaustiveMatch { missing, .. } => {
                 assert_eq!(missing, &vec!["Apple".to_string(), "Mango".to_string()]);
@@ -4657,18 +4815,27 @@ fn f(v: Fruit) -> i64 is pure {
     fn six_bundled_examples_typecheck_without_errors() {
         // the centerpiece smoke test: every example bundled with the
         // playground must lex, parse, AND typecheck with zero errors.
-        for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
+        for name in [
+            "hello",
+            "fibonacci",
+            "effects",
+            "pattern-matching",
+            "pipeline",
+            "defer-demo",
+        ] {
             let path = format!(
                 "{}/../../playground/public/examples/{}.qala",
                 env!("CARGO_MANIFEST_DIR"),
                 name
             );
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
             let tokens = crate::lexer::Lexer::tokenize(&src).expect("lex");
             let ast = crate::parser::Parser::parse(&tokens).expect("parse");
             let (_, errors, _warnings) = check_program(&ast, &src);
-            assert!(errors.is_empty(), "{name}.qala: unexpected errors: {errors:?}");
+            assert!(
+                errors.is_empty(),
+                "{name}.qala: unexpected errors: {errors:?}"
+            );
         }
     }
 }

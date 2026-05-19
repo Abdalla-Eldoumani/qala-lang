@@ -22,7 +22,10 @@ pub struct Span {
 impl Span {
     /// construct a span from a byte offset and a byte length.
     pub fn new(start: usize, len: usize) -> Self {
-        Span { start: start as u32, len: len as u32 }
+        Span {
+            start: start as u32,
+            len: len as u32,
+        }
     }
 
     /// the byte offset one past the last byte of this region (`start + len`).
@@ -39,7 +42,10 @@ impl Span {
     pub fn merge(self, other: Span) -> Span {
         let start = self.start.min(other.start);
         let end = (self.end().max(other.end())) as u32;
-        Span { start, len: end - start }
+        Span {
+            start,
+            len: end - start,
+        }
     }
 
     /// alias for [`Span::merge`]; reads better at parser call sites

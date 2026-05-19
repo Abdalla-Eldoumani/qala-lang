@@ -677,7 +677,11 @@ mod tests {
             (Opcode::MatchVariant, 4),
             (Opcode::Halt, 0),
         ];
-        assert_eq!(cases.len(), ALL.len(), "operand_bytes table missing a variant");
+        assert_eq!(
+            cases.len(),
+            ALL.len(),
+            "operand_bytes table missing a variant"
+        );
         for (op, expected) in cases {
             assert_eq!(
                 op.operand_bytes(),

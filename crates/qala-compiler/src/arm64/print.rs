@@ -85,9 +85,7 @@ impl Arm64Backend {
         let [arg] = args else {
             return Err(QalaError::Type {
                 span,
-                message: format!(
-                    "the arm64 backend expects `{name}` to take exactly one argument"
-                ),
+                message: format!("the arm64 backend expects `{name}` to take exactly one argument"),
             });
         };
         // `println` terminates its output with a newline; `print` does not.
@@ -260,9 +258,7 @@ fn print_arg_description(expr: &TypedExpr) -> &'static str {
     match expr {
         TypedExpr::Ident { .. } => "a string variable",
         TypedExpr::Binary { .. } => "string concatenation",
-        TypedExpr::Call { .. } | TypedExpr::MethodCall { .. } => {
-            "a string-returning call"
-        }
+        TypedExpr::Call { .. } | TypedExpr::MethodCall { .. } => "a string-returning call",
         TypedExpr::Paren { .. } => "a parenthesized string expression",
         TypedExpr::Block { .. } => "a block expression",
         TypedExpr::OrElse { .. } => "an `or` fallback expression",
@@ -289,8 +285,7 @@ mod tests {
         let ast = Parser::parse(&tokens).expect("parse failed");
         let (typed, terrors, _) = check_program(&ast, src);
         assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
-        super::super::compile_arm64(&typed, src)
-            .unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
+        super::super::compile_arm64(&typed, src).unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
     }
 
     /// compile a program expected to be rejected, returning the first error's
@@ -318,21 +313,36 @@ mod tests {
         // literal text plus a newline, in .data; printf is called with just
         // the format-string pointer in x0.
         let out = compile_ok("fn main() is io { println(\"done\") }");
-        assert!(out.contains("        .data\n"), "missing .data section: {out}");
+        assert!(
+            out.contains("        .data\n"),
+            "missing .data section: {out}"
+        );
         assert!(
             out.contains(".string \"done\\n\"\n"),
             "missing the println format string: {out}"
         );
-        assert!(out.contains("ldr     x0, =.Lfmt_0"), "missing the format load: {out}");
-        assert!(out.contains("bl      printf"), "missing the printf call: {out}");
+        assert!(
+            out.contains("ldr     x0, =.Lfmt_0"),
+            "missing the format load: {out}"
+        );
+        assert!(
+            out.contains("bl      printf"),
+            "missing the printf call: {out}"
+        );
     }
 
     #[test]
     fn a_string_literal_print_omits_the_trailing_newline() {
         // `print` -- unlike `println` -- adds no newline to the format string.
         let out = compile_ok("fn main() is io { print(\"hi\") }");
-        assert!(out.contains(".string \"hi\"\n"), "print must not add a newline: {out}");
-        assert!(!out.contains(".string \"hi\\n\""), "print added a newline: {out}");
+        assert!(
+            out.contains(".string \"hi\"\n"),
+            "print must not add a newline: {out}"
+        );
+        assert!(
+            !out.contains(".string \"hi\\n\""),
+            "print added a newline: {out}"
+        );
     }
 
     #[test]
@@ -340,14 +350,26 @@ mod tests {
         // `println("{x}")` -- a single i64 hole. the format string carries one
         // `%lld`; the hole is evaluated and loaded into x1.
         let out = compile_ok("fn main() is io { let x = 7\nprintln(\"{x}\") }");
-        assert!(out.contains(".string \"%lld\\n\"\n"), "missing the %lld format: {out}");
+        assert!(
+            out.contains(".string \"%lld\\n\"\n"),
+            "missing the %lld format: {out}"
+        );
         assert!(
             out.contains("str     x0, [fp,") && out.contains("// printf arg 1"),
             "missing the hole spill: {out}"
         );
-        assert!(out.contains("ldr     x1, [fp,"), "missing the x1 load: {out}");
-        assert!(out.contains("ldr     x0, =.Lfmt_0"), "missing the format load: {out}");
-        assert!(out.contains("bl      printf"), "missing the printf call: {out}");
+        assert!(
+            out.contains("ldr     x1, [fp,"),
+            "missing the x1 load: {out}"
+        );
+        assert!(
+            out.contains("ldr     x0, =.Lfmt_0"),
+            "missing the format load: {out}"
+        );
+        assert!(
+            out.contains("bl      printf"),
+            "missing the printf call: {out}"
+        );
     }
 
     #[test]
@@ -365,9 +387,18 @@ mod tests {
             "the two-hole format string is wrong: {out}"
         );
         // two holes -> x1 and x2 both loaded.
-        assert!(out.contains("ldr     x1, [fp,"), "missing the x1 load: {out}");
-        assert!(out.contains("ldr     x2, [fp,"), "missing the x2 load: {out}");
-        assert!(out.contains("bl      printf"), "missing the printf call: {out}");
+        assert!(
+            out.contains("ldr     x1, [fp,"),
+            "missing the x1 load: {out}"
+        );
+        assert!(
+            out.contains("ldr     x2, [fp,"),
+            "missing the x2 load: {out}"
+        );
+        assert!(
+            out.contains("bl      printf"),
+            "missing the printf call: {out}"
+        );
     }
 
     #[test]
@@ -410,15 +441,16 @@ mod tests {
     fn two_identical_format_strings_share_one_data_entry() {
         // two `println("done")` calls intern the same format string -- one
         // .data entry, one label, reused.
-        let out = compile_ok(
-            "fn main() is io { println(\"done\")\nprintln(\"done\") }",
-        );
+        let out = compile_ok("fn main() is io { println(\"done\")\nprintln(\"done\") }");
         assert_eq!(
             out.matches(".Lfmt_0:").count(),
             1,
             "an identical format string must be interned once: {out}"
         );
-        assert!(!out.contains(".Lfmt_1:"), "no second entry for the same string: {out}");
+        assert!(
+            !out.contains(".Lfmt_1:"),
+            "no second entry for the same string: {out}"
+        );
     }
 
     #[test]
@@ -548,8 +580,14 @@ mod tests {
                    \x20   println(\"{a}{a}{a}{a}{a}{a}{a}\")\n\
                    }";
         let out = compile_ok(src);
-        assert!(out.contains("ldr     x7, [fp,"), "the seventh hole must load x7: {out}");
-        assert!(!out.contains("ldr     x8, [fp,"), "there is no eighth argument register: {out}");
+        assert!(
+            out.contains("ldr     x7, [fp,"),
+            "the seventh hole must load x7: {out}"
+        );
+        assert!(
+            !out.contains("ldr     x8, [fp,"),
+            "there is no eighth argument register: {out}"
+        );
     }
 
     #[test]
@@ -557,8 +595,14 @@ mod tests {
         // a sanity check that the printf path produces a complete program: the
         // preamble, the .data format string, the .text section, and `main`.
         let out = compile_ok("fn main() is io { println(\"done\") }");
-        assert!(out.starts_with("define(fp, x29)\n"), "missing the m4 preamble: {out}");
-        assert!(out.contains("        .text\n"), "missing the .text section: {out}");
+        assert!(
+            out.starts_with("define(fp, x29)\n"),
+            "missing the m4 preamble: {out}"
+        );
+        assert!(
+            out.contains("        .text\n"),
+            "missing the .text section: {out}"
+        );
         assert!(out.contains("\nmain:\n"), "missing the main label: {out}");
     }
 
@@ -596,18 +640,25 @@ mod tests {
             .iter()
             .position(|l| l.contains("bl      printf"))
             .expect("missing bl printf");
-        assert!(bl_fib < bl_printf, "the hole's call must run before printf: {out}");
+        assert!(
+            bl_fib < bl_printf,
+            "the hole's call must run before printf: {out}"
+        );
     }
 
     #[test]
     fn typed_items_have_no_extra_emission_for_the_printf_path() {
         // a struct alongside a printing main: the struct emits nothing, the
         // printf path is unaffected.
-        let out = compile_ok(
-            "struct P { x: i64 }\nfn main() is io { println(\"done\") }",
+        let out = compile_ok("struct P { x: i64 }\nfn main() is io { println(\"done\") }");
+        assert!(
+            out.contains("bl      printf"),
+            "the printf call is missing: {out}"
         );
-        assert!(out.contains("bl      printf"), "the printf call is missing: {out}");
-        assert!(!out.contains("\nP:\n"), "the struct must emit nothing: {out}");
+        assert!(
+            !out.contains("\nP:\n"),
+            "the struct must emit nothing: {out}"
+        );
     }
 
     /// read a snapshot fixture, normalising CRLF to LF. a checked-out file on

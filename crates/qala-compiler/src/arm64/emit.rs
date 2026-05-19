@@ -206,7 +206,10 @@ mod tests {
         let mut asm = Asm::new();
         asm.emit_insn("mov x0, 0");
         let out = asm.finish();
-        assert!(out.contains("\n        mov x0, 0\n"), "missing 8-space indent: {out:?}");
+        assert!(
+            out.contains("\n        mov x0, 0\n"),
+            "missing 8-space indent: {out:?}"
+        );
     }
 
     #[test]
@@ -241,7 +244,10 @@ mod tests {
         assert_eq!(asm.intern_format("done\n"), ".Lfmt_0");
         let out = asm.finish();
         // the label+directive lands inside a .data section.
-        assert!(out.contains("        .data\n"), "missing .data section: {out:?}");
+        assert!(
+            out.contains("        .data\n"),
+            "missing .data section: {out:?}"
+        );
         assert!(
             out.contains(".Lfmt_0:  .string \"done\\n\"\n"),
             "missing the interned format string: {out:?}"
@@ -266,7 +272,10 @@ mod tests {
         let mut asm = Asm::new();
         let first = asm.intern_format("fib(%lld) = %lld\n");
         let second = asm.intern_format("fib(%lld) = %lld\n");
-        assert_eq!(first, second, "an identical format string must reuse its label");
+        assert_eq!(
+            first, second,
+            "an identical format string must reuse its label"
+        );
         assert_eq!(first, ".Lfmt_0");
         let out = asm.finish();
         assert_eq!(
@@ -312,6 +321,9 @@ mod tests {
     #[test]
     fn escape_for_string_directive_leaves_plain_text_untouched() {
         // printable ASCII with no escape-worthy byte passes through unchanged.
-        assert_eq!(escape_for_string_directive("fib(%lld) = %lld"), "fib(%lld) = %lld");
+        assert_eq!(
+            escape_for_string_directive("fib(%lld) = %lld"),
+            "fib(%lld) = %lld"
+        );
     }
 }

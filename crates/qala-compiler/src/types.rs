@@ -113,8 +113,13 @@ impl QalaType {
             // poison is symmetrically equal to anything.
             (Unknown, _) | (_, Unknown) => true,
             // primitives compare by tag only.
-            (I64, I64) | (F64, F64) | (Bool, Bool) | (Str, Str) | (Byte, Byte)
-            | (Void, Void) | (FileHandle, FileHandle) => true,
+            (I64, I64)
+            | (F64, F64)
+            | (Bool, Bool)
+            | (Str, Str)
+            | (Byte, Byte)
+            | (Void, Void)
+            | (FileHandle, FileHandle) => true,
             // arrays compare by element AND length kind (Some(n) only matches
             // the same Some(n); None only matches None).
             (Array(a, asize), Array(b, bsize)) => asize == bsize && a.types_match(b),
@@ -124,8 +129,14 @@ impl QalaType {
             }
             // function types compare param count, param types pairwise, return.
             (
-                Function { params: ap, returns: ar },
-                Function { params: bp, returns: br },
+                Function {
+                    params: ap,
+                    returns: ar,
+                },
+                Function {
+                    params: bp,
+                    returns: br,
+                },
             ) => {
                 ap.len() == bp.len()
                     && ap.iter().zip(bp.iter()).all(|(x, y)| x.types_match(y))
@@ -281,10 +292,22 @@ mod tests {
 
     #[test]
     fn function_types_compare_params_in_order_and_return() {
-        let f_i64_to_i64 = QalaType::Function { params: vec![QalaType::I64], returns: b(QalaType::I64) };
-        let f_i64_to_i64_again = QalaType::Function { params: vec![QalaType::I64], returns: b(QalaType::I64) };
-        let f_str_to_i64 = QalaType::Function { params: vec![QalaType::Str], returns: b(QalaType::I64) };
-        let f_i64_to_str = QalaType::Function { params: vec![QalaType::I64], returns: b(QalaType::Str) };
+        let f_i64_to_i64 = QalaType::Function {
+            params: vec![QalaType::I64],
+            returns: b(QalaType::I64),
+        };
+        let f_i64_to_i64_again = QalaType::Function {
+            params: vec![QalaType::I64],
+            returns: b(QalaType::I64),
+        };
+        let f_str_to_i64 = QalaType::Function {
+            params: vec![QalaType::Str],
+            returns: b(QalaType::I64),
+        };
+        let f_i64_to_str = QalaType::Function {
+            params: vec![QalaType::I64],
+            returns: b(QalaType::Str),
+        };
         let f_i64_i64_to_i64 = QalaType::Function {
             params: vec![QalaType::I64, QalaType::I64],
             returns: b(QalaType::I64),
@@ -307,7 +330,10 @@ mod tests {
         assert!(!ty_match(&shape, &point));
         // nominal equality means structurally-identical-but-named-differently
         // types are still distinct.
-        assert!(!ty_match(&shape, &QalaType::Named(Symbol("shape".to_string()))));
+        assert!(!ty_match(
+            &shape,
+            &QalaType::Named(Symbol("shape".to_string()))
+        ));
     }
 
     #[test]
@@ -339,9 +365,15 @@ mod tests {
         ];
         for s in &samples {
             // Unknown on the left matches anything.
-            assert!(ty_match(&QalaType::Unknown, s), "Unknown should match {s:?}");
+            assert!(
+                ty_match(&QalaType::Unknown, s),
+                "Unknown should match {s:?}"
+            );
             // Unknown on the right matches anything.
-            assert!(ty_match(s, &QalaType::Unknown), "{s:?} should match Unknown");
+            assert!(
+                ty_match(s, &QalaType::Unknown),
+                "{s:?} should match Unknown"
+            );
         }
         // Unknown matches Unknown -- explicit so a regression here is loud.
         assert!(ty_match(&QalaType::Unknown, &QalaType::Unknown));
@@ -406,7 +438,11 @@ mod tests {
             "(i64, bool)",
         );
         assert_eq!(
-            QalaType::Function { params: vec![QalaType::I64], returns: b(QalaType::I64) }.display(),
+            QalaType::Function {
+                params: vec![QalaType::I64],
+                returns: b(QalaType::I64)
+            }
+            .display(),
             "fn(i64) -> i64",
         );
         assert_eq!(
@@ -417,7 +453,10 @@ mod tests {
             .display(),
             "fn(i64, bool) -> str",
         );
-        assert_eq!(QalaType::Named(Symbol("Shape".to_string())).display(), "Shape");
+        assert_eq!(
+            QalaType::Named(Symbol("Shape".to_string())).display(),
+            "Shape"
+        );
         assert_eq!(
             QalaType::Result(b(QalaType::I64), b(QalaType::Str)).display(),
             "Result<i64, str>",
@@ -431,11 +470,29 @@ mod tests {
 
     #[test]
     fn from_prim_type_bridges_every_prim_type_variant() {
-        assert!(ty_match(&QalaType::from_prim_type(&PrimType::I64), &QalaType::I64));
-        assert!(ty_match(&QalaType::from_prim_type(&PrimType::F64), &QalaType::F64));
-        assert!(ty_match(&QalaType::from_prim_type(&PrimType::Bool), &QalaType::Bool));
-        assert!(ty_match(&QalaType::from_prim_type(&PrimType::Str), &QalaType::Str));
-        assert!(ty_match(&QalaType::from_prim_type(&PrimType::Byte), &QalaType::Byte));
-        assert!(ty_match(&QalaType::from_prim_type(&PrimType::Void), &QalaType::Void));
+        assert!(ty_match(
+            &QalaType::from_prim_type(&PrimType::I64),
+            &QalaType::I64
+        ));
+        assert!(ty_match(
+            &QalaType::from_prim_type(&PrimType::F64),
+            &QalaType::F64
+        ));
+        assert!(ty_match(
+            &QalaType::from_prim_type(&PrimType::Bool),
+            &QalaType::Bool
+        ));
+        assert!(ty_match(
+            &QalaType::from_prim_type(&PrimType::Str),
+            &QalaType::Str
+        ));
+        assert!(ty_match(
+            &QalaType::from_prim_type(&PrimType::Byte),
+            &QalaType::Byte
+        ));
+        assert!(ty_match(
+            &QalaType::from_prim_type(&PrimType::Void),
+            &QalaType::Void
+        ));
     }
 }

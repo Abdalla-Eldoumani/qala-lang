@@ -219,14 +219,8 @@ mod tests {
     #[test]
     fn union_with_pure_returns_the_other_set() {
         // pure() is the lattice bottom; unioning with it is the identity.
-        assert_eq!(
-            EffectSet::pure().union(EffectSet::io()),
-            EffectSet::io(),
-        );
-        assert_eq!(
-            EffectSet::io().union(EffectSet::pure()),
-            EffectSet::io(),
-        );
+        assert_eq!(EffectSet::pure().union(EffectSet::io()), EffectSet::io(),);
+        assert_eq!(EffectSet::io().union(EffectSet::pure()), EffectSet::io(),);
         assert_eq!(
             EffectSet::pure().union(EffectSet::full()),
             EffectSet::full(),
@@ -253,7 +247,11 @@ mod tests {
             (EffectSet::pure(), EffectSet::full()),
         ];
         for (a, b) in pairs {
-            assert_eq!(a.union(b), b.union(a), "union not commutative on {a:?} and {b:?}");
+            assert_eq!(
+                a.union(b),
+                b.union(a),
+                "union not commutative on {a:?} and {b:?}"
+            );
         }
     }
 
@@ -381,16 +379,15 @@ mod tests {
         while e != target {
             e = e.union(target);
             rounds += 1;
-            assert!(rounds <= 3, "should converge within 3 rounds; took {rounds}");
+            assert!(
+                rounds <= 3,
+                "should converge within 3 rounds; took {rounds}"
+            );
         }
         assert!(rounds <= 3);
 
         // also verify the worst-case chain: ascend one flag per round.
-        let chain = [
-            EffectSet::io(),
-            EffectSet::alloc(),
-            EffectSet::panic(),
-        ];
+        let chain = [EffectSet::io(), EffectSet::alloc(), EffectSet::panic()];
         let mut e = EffectSet::pure();
         let mut rounds = 0;
         for step in chain {

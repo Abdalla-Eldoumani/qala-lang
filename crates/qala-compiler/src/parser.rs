@@ -292,27 +292,45 @@ impl<'t> Parser<'t> {
             // primitive type names: each is its own token.
             TokenKind::I64Ty => {
                 let span = self.advance().span;
-                Ok(TypeExpr::Primitive { kind: PrimType::I64, span })
+                Ok(TypeExpr::Primitive {
+                    kind: PrimType::I64,
+                    span,
+                })
             }
             TokenKind::F64Ty => {
                 let span = self.advance().span;
-                Ok(TypeExpr::Primitive { kind: PrimType::F64, span })
+                Ok(TypeExpr::Primitive {
+                    kind: PrimType::F64,
+                    span,
+                })
             }
             TokenKind::BoolTy => {
                 let span = self.advance().span;
-                Ok(TypeExpr::Primitive { kind: PrimType::Bool, span })
+                Ok(TypeExpr::Primitive {
+                    kind: PrimType::Bool,
+                    span,
+                })
             }
             TokenKind::StrTy => {
                 let span = self.advance().span;
-                Ok(TypeExpr::Primitive { kind: PrimType::Str, span })
+                Ok(TypeExpr::Primitive {
+                    kind: PrimType::Str,
+                    span,
+                })
             }
             TokenKind::ByteTy => {
                 let span = self.advance().span;
-                Ok(TypeExpr::Primitive { kind: PrimType::Byte, span })
+                Ok(TypeExpr::Primitive {
+                    kind: PrimType::Byte,
+                    span,
+                })
             }
             TokenKind::VoidTy => {
                 let span = self.advance().span;
-                Ok(TypeExpr::Primitive { kind: PrimType::Void, span })
+                Ok(TypeExpr::Primitive {
+                    kind: PrimType::Void,
+                    span,
+                })
             }
             // named or generic: `Foo` or `Foo<T1, T2>`. `<` is unambiguous in
             // type position (we never enter `parse_type` from expression
@@ -320,19 +338,20 @@ impl<'t> Parser<'t> {
             TokenKind::Ident(name) => {
                 let name_span = self.advance().span;
                 if self.check(&TokenKind::Lt) {
-                    let (args, close) = self.delimited_list(
-                        TokenKind::Lt,
-                        TokenKind::Gt,
-                        TokenKind::Comma,
-                        |p| p.parse_type(),
-                    )?;
+                    let (args, close) =
+                        self.delimited_list(TokenKind::Lt, TokenKind::Gt, TokenKind::Comma, |p| {
+                            p.parse_type()
+                        })?;
                     Ok(TypeExpr::Generic {
                         name,
                         args,
                         span: name_span.to(close),
                     })
                 } else {
-                    Ok(TypeExpr::Named { name, span: name_span })
+                    Ok(TypeExpr::Named {
+                        name,
+                        span: name_span,
+                    })
                 }
             }
             // `[T; N]` or `[T]`. the size form requires an `Int` literal; this
@@ -597,8 +616,7 @@ impl<'t> Parser<'t> {
             // names the rule.
             return Err(QalaError::Parse {
                 span,
-                message: "`self` is only legal as the first parameter of a method"
-                    .to_string(),
+                message: "`self` is only legal as the first parameter of a method".to_string(),
             });
         }
         let (name, name_span) = self.expect_ident()?;
@@ -889,7 +907,10 @@ impl<'t> Parser<'t> {
             // the parser just needs to not reject it with UnexpectedToken.
             TokenKind::SelfKw => {
                 let span = self.advance().span;
-                Ok(Expr::Ident { name: "self".to_string(), span })
+                Ok(Expr::Ident {
+                    name: "self".to_string(),
+                    span,
+                })
             }
             // unary prefixes: `!`, `-`, `comptime`.
             TokenKind::Bang | TokenKind::Minus | TokenKind::Comptime => self.parse_prefix(),
@@ -1142,7 +1163,10 @@ impl<'t> Parser<'t> {
             let expr_span = expr.span();
             if self.eat(&TokenKind::Semi) {
                 // `expr;` -- definitely a statement.
-                stmts.push(Stmt::Expr { expr, span: expr_span });
+                stmts.push(Stmt::Expr {
+                    expr,
+                    span: expr_span,
+                });
                 continue;
             }
             if self.check(&TokenKind::RBrace) {
@@ -1154,7 +1178,10 @@ impl<'t> Parser<'t> {
             // the next token starts another statement (a keyword head, or
             // another expression). discard this expression's value and keep
             // going.
-            stmts.push(Stmt::Expr { expr, span: expr_span });
+            stmts.push(Stmt::Expr {
+                expr,
+                span: expr_span,
+            });
         }
         if !self.check(&TokenKind::RBrace) {
             self.open_delims.pop();
@@ -1237,7 +1264,13 @@ impl<'t> Parser<'t> {
         self.expect(&TokenKind::Eq)?;
         let init = self.parse_expr()?;
         let span = kw_span.to(init.span());
-        Ok(Stmt::Let { is_mut, name, ty, init, span })
+        Ok(Stmt::Let {
+            is_mut,
+            name,
+            ty,
+            init,
+            span,
+        })
     }
 
     /// `if COND { ... } [else if COND { ... }]* [else { ... }]`. `if`/`else`
@@ -1292,7 +1325,12 @@ impl<'t> Parser<'t> {
         let iter = self.parse_expr_no_struct()?;
         let body = self.parse_block()?;
         let span = kw_span.to(body.span);
-        Ok(Stmt::For { var, iter, body, span })
+        Ok(Stmt::For {
+            var,
+            iter,
+            body,
+            span,
+        })
     }
 
     /// `return` or `return EXPR`. bare `return` (in a `void` function) is
@@ -1307,11 +1345,17 @@ impl<'t> Parser<'t> {
             || matches!(self.peek(), TokenKind::Eof)
             || is_stmt_head(self.peek())
         {
-            return Ok(Stmt::Return { value: None, span: kw_span });
+            return Ok(Stmt::Return {
+                value: None,
+                span: kw_span,
+            });
         }
         let value = self.parse_expr()?;
         let span = kw_span.to(value.span());
-        Ok(Stmt::Return { value: Some(value), span })
+        Ok(Stmt::Return {
+            value: Some(value),
+            span,
+        })
     }
 
     /// `defer EXPR` -- run `EXPR` at scope exit, LIFO with other defers. in
@@ -1639,8 +1683,7 @@ impl<'t> Parser<'t> {
             }
             _ => Err(QalaError::Parse {
                 span: self.peek_span(),
-                message: "internal: postfix_bp returned Some for a non-postfix token"
-                    .to_string(),
+                message: "internal: postfix_bp returned Some for a non-postfix token".to_string(),
             }),
         }
     }
@@ -1720,8 +1763,7 @@ impl<'t> Parser<'t> {
             }
             _ => Err(QalaError::Parse {
                 span: op_tok.span,
-                message: "internal: infix_bp returned Some for an unhandled token"
-                    .to_string(),
+                message: "internal: infix_bp returned Some for an unhandled token".to_string(),
             }),
         }
     }
@@ -1741,10 +1783,7 @@ impl<'t> Parser<'t> {
         // once postfix operators fold in; a bare `(expr)` that is not callable
         // reaches the is_callable_shape check below and is rejected there with
         // the same |> span.
-        if !matches!(
-            self.peek(),
-            TokenKind::Ident(_) | TokenKind::LParen
-        ) {
+        if !matches!(self.peek(), TokenKind::Ident(_) | TokenKind::LParen) {
             return Err(QalaError::Parse {
                 span: pipe_span,
                 message: "expected a call after `|>`".to_string(),
@@ -1782,10 +1821,9 @@ enum ExprCtx {
 /// "no rhs" marker -- postfix operators do not have a right-binding power.
 fn postfix_bp(k: &TokenKind) -> Option<(u8, ())> {
     match k {
-        TokenKind::Dot
-        | TokenKind::LParen
-        | TokenKind::LBracket
-        | TokenKind::Question => Some((100, ())),
+        TokenKind::Dot | TokenKind::LParen | TokenKind::LBracket | TokenKind::Question => {
+            Some((100, ()))
+        }
         _ => None,
     }
 }
@@ -1881,10 +1919,7 @@ fn binop_of(k: &TokenKind) -> Option<BinOp> {
 fn is_callable_shape(e: &Expr) -> bool {
     matches!(
         e,
-        Expr::Ident { .. }
-            | Expr::Call { .. }
-            | Expr::FieldAccess { .. }
-            | Expr::MethodCall { .. }
+        Expr::Ident { .. } | Expr::Call { .. } | Expr::FieldAccess { .. } | Expr::MethodCall { .. }
     )
 }
 
@@ -1943,7 +1978,9 @@ mod tests {
             depth: 0,
             open_delims: Vec::new(),
         };
-        let e = p.parse_expr().expect("expected a successful expression parse");
+        let e = p
+            .parse_expr()
+            .expect("expected a successful expression parse");
         assert!(
             matches!(p.peek(), TokenKind::Eof),
             "expr_of left tokens unconsumed: next = {:?}",
@@ -1962,7 +1999,8 @@ mod tests {
             depth: 0,
             open_delims: Vec::new(),
         };
-        p.parse_expr().expect_err("expected an expression parse error")
+        p.parse_expr()
+            .expect_err("expected an expression parse error")
     }
 
     // ---- skeleton + parse() entry point -------------------------------------
@@ -1987,7 +2025,11 @@ mod tests {
         // expected set. (a `fn ...` succeeds now -- the items wave is wired.)
         let err = parse_err("let x = 5");
         match err {
-            QalaError::UnexpectedToken { ref expected, ref found, .. } => {
+            QalaError::UnexpectedToken {
+                ref expected,
+                ref found,
+                ..
+            } => {
                 assert!(expected.contains(&TokenKind::Fn));
                 assert!(expected.contains(&TokenKind::Struct));
                 assert!(expected.contains(&TokenKind::Enum));
@@ -2043,7 +2085,13 @@ mod tests {
     fn a_fixed_array_type_carries_its_int_size() {
         match type_of("[i64; 5]") {
             TypeExpr::Array { elem, size, .. } => {
-                assert!(matches!(*elem, TypeExpr::Primitive { kind: PrimType::I64, .. }));
+                assert!(matches!(
+                    *elem,
+                    TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        ..
+                    }
+                ));
                 assert_eq!(size, 5);
             }
             other => panic!("expected Array, got {other:?}"),
@@ -2054,7 +2102,13 @@ mod tests {
     fn a_dyn_array_type_has_no_size() {
         match type_of("[i64]") {
             TypeExpr::DynArray { elem, .. } => {
-                assert!(matches!(*elem, TypeExpr::Primitive { kind: PrimType::I64, .. }));
+                assert!(matches!(
+                    *elem,
+                    TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected DynArray, got {other:?}"),
         }
@@ -2079,7 +2133,10 @@ mod tests {
         }
         // `(i64)` -- a parenthesised type, equivalent to `i64`.
         match type_of("(i64)") {
-            TypeExpr::Primitive { kind: PrimType::I64, .. } => {}
+            TypeExpr::Primitive {
+                kind: PrimType::I64,
+                ..
+            } => {}
             other => panic!("expected unwrapped i64, got {other:?}"),
         }
     }
@@ -2089,9 +2146,27 @@ mod tests {
         match type_of("fn(i64, bool) -> str") {
             TypeExpr::Fn { params, ret, .. } => {
                 assert_eq!(params.len(), 2);
-                assert!(matches!(params[0], TypeExpr::Primitive { kind: PrimType::I64, .. }));
-                assert!(matches!(params[1], TypeExpr::Primitive { kind: PrimType::Bool, .. }));
-                assert!(matches!(*ret, TypeExpr::Primitive { kind: PrimType::Str, .. }));
+                assert!(matches!(
+                    params[0],
+                    TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    params[1],
+                    TypeExpr::Primitive {
+                        kind: PrimType::Bool,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    *ret,
+                    TypeExpr::Primitive {
+                        kind: PrimType::Str,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected Fn, got {other:?}"),
         }
@@ -2118,17 +2193,30 @@ mod tests {
                 assert_eq!(name, "Result");
                 assert_eq!(args.len(), 2);
                 match &args[0] {
-                    TypeExpr::Generic { name: inner_name, args: inner_args, .. } => {
+                    TypeExpr::Generic {
+                        name: inner_name,
+                        args: inner_args,
+                        ..
+                    } => {
                         assert_eq!(inner_name, "Option");
                         assert_eq!(inner_args.len(), 1);
                         assert!(matches!(
                             inner_args[0],
-                            TypeExpr::Primitive { kind: PrimType::I64, .. }
+                            TypeExpr::Primitive {
+                                kind: PrimType::I64,
+                                ..
+                            }
                         ));
                     }
                     other => panic!("expected nested Generic, got {other:?}"),
                 }
-                assert!(matches!(args[1], TypeExpr::Primitive { kind: PrimType::Str, .. }));
+                assert!(matches!(
+                    args[1],
+                    TypeExpr::Primitive {
+                        kind: PrimType::Str,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected outer Generic, got {other:?}"),
         }
@@ -2170,7 +2258,10 @@ mod tests {
                 }
                 assert!(matches!(
                     d.ret_ty,
-                    Some(TypeExpr::Primitive { kind: PrimType::I64, .. })
+                    Some(TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        ..
+                    })
                 ));
                 assert_eq!(d.effect, Some(Effect::Pure));
             }
@@ -2265,18 +2356,16 @@ mod tests {
         // not a statement. MethodCall whose receiver is Expr::Ident { name: "self" }.
         let ast = parse_ok("fn Point.go(self) { self.foo() }");
         match &ast[0] {
-            Item::Fn(d) => {
-                match d.body.value.as_deref() {
-                    Some(Expr::MethodCall { receiver, name, .. }) => {
-                        assert!(
-                            matches!(**receiver, Expr::Ident { ref name, .. } if name == "self"),
-                            "expected Ident(\"self\") as receiver, got {receiver:?}"
-                        );
-                        assert_eq!(name, "foo");
-                    }
-                    other => panic!("expected MethodCall trailing value, got {other:?}"),
+            Item::Fn(d) => match d.body.value.as_deref() {
+                Some(Expr::MethodCall { receiver, name, .. }) => {
+                    assert!(
+                        matches!(**receiver, Expr::Ident { ref name, .. } if name == "self"),
+                        "expected Ident(\"self\") as receiver, got {receiver:?}"
+                    );
+                    assert_eq!(name, "foo");
                 }
-            }
+                other => panic!("expected MethodCall trailing value, got {other:?}"),
+            },
             other => panic!("expected Fn, got {other:?}"),
         }
     }
@@ -2291,7 +2380,10 @@ mod tests {
                 assert_eq!(d.fields[0].name, "x");
                 assert!(matches!(
                     d.fields[0].ty,
-                    TypeExpr::Primitive { kind: PrimType::F64, .. }
+                    TypeExpr::Primitive {
+                        kind: PrimType::F64,
+                        ..
+                    }
                 ));
                 assert_eq!(d.fields[1].name, "y");
             }
@@ -2310,9 +2402,7 @@ mod tests {
 
     #[test]
     fn an_enum_with_data_carrying_variants_parses() {
-        let ast = parse_ok(
-            "enum Shape { Circle(f64), Rect(f64, f64), Triangle(f64, f64, f64) }",
-        );
+        let ast = parse_ok("enum Shape { Circle(f64), Rect(f64, f64), Triangle(f64, f64, f64) }");
         match &ast[0] {
             Item::Enum(d) => {
                 assert_eq!(d.name, "Shape");
@@ -2354,7 +2444,10 @@ mod tests {
                 assert!(d.methods[0].params[0].is_self);
                 assert!(matches!(
                     d.methods[0].ret_ty,
-                    Some(TypeExpr::Primitive { kind: PrimType::Str, .. })
+                    Some(TypeExpr::Primitive {
+                        kind: PrimType::Str,
+                        ..
+                    })
                 ));
             }
             other => panic!("expected Interface, got {other:?}"),
@@ -2447,7 +2540,8 @@ mod tests {
         assert!(!p.check(&TokenKind::Minus));
         assert!(p.eat(&TokenKind::Plus));
         assert!(!p.eat(&TokenKind::Plus)); // already consumed
-        p.expect(&TokenKind::Minus).expect("the `-` should be there");
+        p.expect(&TokenKind::Minus)
+            .expect("the `-` should be there");
         p.expect(&TokenKind::Semi).expect("the `;` should be there");
         assert!(matches!(p.peek(), TokenKind::Eof));
     }
@@ -2464,7 +2558,11 @@ mod tests {
             open_delims: Vec::new(),
         };
         match p.expect(&TokenKind::RParen) {
-            Err(QalaError::UnexpectedToken { span, expected, found }) => {
+            Err(QalaError::UnexpectedToken {
+                span,
+                expected,
+                found,
+            }) => {
                 assert_eq!(span, Span::new(0, 1));
                 assert_eq!(expected, vec![TokenKind::RParen]);
                 assert_eq!(found, TokenKind::Comma);
@@ -2617,9 +2715,12 @@ mod tests {
             open_delims: Vec::new(),
         };
         let (items, close): (Vec<(String, Span)>, Span) = p
-            .delimited_list(TokenKind::LParen, TokenKind::RParen, TokenKind::Comma, |q| {
-                q.expect_ident()
-            })
+            .delimited_list(
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Comma,
+                |q| q.expect_ident(),
+            )
             .expect("empty list parses");
         assert!(items.is_empty());
         assert_eq!(close, Span::new(1, 1));
@@ -2633,9 +2734,12 @@ mod tests {
             open_delims: Vec::new(),
         };
         let (items, _): (Vec<(String, Span)>, Span) = p
-            .delimited_list(TokenKind::LParen, TokenKind::RParen, TokenKind::Comma, |q| {
-                q.expect_ident()
-            })
+            .delimited_list(
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::Comma,
+                |q| q.expect_ident(),
+            )
             .expect("trailing comma OK");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].0, "a");
@@ -2658,7 +2762,11 @@ mod tests {
             TokenKind::Comma,
             |q| q.expect_ident(),
         ) {
-            Err(QalaError::UnclosedDelimiter { span, opener, found }) => {
+            Err(QalaError::UnclosedDelimiter {
+                span,
+                opener,
+                found,
+            }) => {
                 assert_eq!(span, Span::new(0, 1));
                 assert_eq!(opener, TokenKind::LParen);
                 assert_eq!(found, TokenKind::Eof);
@@ -2683,7 +2791,11 @@ mod tests {
             TokenKind::Comma,
             |q| q.expect_ident(),
         ) {
-            Err(QalaError::UnclosedDelimiter { span, opener, found }) => {
+            Err(QalaError::UnclosedDelimiter {
+                span,
+                opener,
+                found,
+            }) => {
                 assert_eq!(span, Span::new(0, 1));
                 assert_eq!(opener, TokenKind::LParen);
                 assert_eq!(found, TokenKind::RBracket);
@@ -2706,7 +2818,7 @@ mod tests {
         // also stable across a genuine error case: two runs on the same bad
         // input must produce byte-equal errors (no pointer addresses, no OS
         // state, no random salt leaking into the error value).
-        let bad = "fn f(";  // unclosed paren -- a real parse error
+        let bad = "fn f("; // unclosed paren -- a real parse error
         assert_eq!(Parser::parse(&lex(bad)), Parser::parse(&lex(bad)));
     }
 
@@ -2728,10 +2840,20 @@ mod tests {
         // `1 + 2 * 3` -> Binary(Add, Int(1), Binary(Mul, Int(2), Int(3))).
         let e = expr_of("1 + 2 * 3");
         match e {
-            Expr::Binary { op: BinOp::Add, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(*lhs, Expr::Int { value: 1, .. }));
                 match *rhs {
-                    Expr::Binary { op: BinOp::Mul, lhs, rhs, .. } => {
+                    Expr::Binary {
+                        op: BinOp::Mul,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
                         assert!(matches!(*lhs, Expr::Int { value: 2, .. }));
                         assert!(matches!(*rhs, Expr::Int { value: 3, .. }));
                     }
@@ -2743,7 +2865,12 @@ mod tests {
         // `1 * 2 + 3` -> Binary(Add, Binary(Mul, Int(1), Int(2)), Int(3)).
         let e = expr_of("1 * 2 + 3");
         match e {
-            Expr::Binary { op: BinOp::Add, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(*lhs, Expr::Binary { op: BinOp::Mul, .. }));
                 assert!(matches!(*rhs, Expr::Int { value: 3, .. }));
             }
@@ -2756,10 +2883,20 @@ mod tests {
         // `a || b && c` -> Binary(Or, Ident(a), Binary(And, b, c)).
         let e = expr_of("a || b && c");
         match e {
-            Expr::Binary { op: BinOp::Or, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(is_ident(&lhs, "a"));
                 match *rhs {
-                    Expr::Binary { op: BinOp::And, lhs, rhs, .. } => {
+                    Expr::Binary {
+                        op: BinOp::And,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
                         assert!(is_ident(&lhs, "b"));
                         assert!(is_ident(&rhs, "c"));
                     }
@@ -2771,7 +2908,12 @@ mod tests {
         // `a && b || c` -> Binary(Or, Binary(And, a, b), c).
         let e = expr_of("a && b || c");
         match e {
-            Expr::Binary { op: BinOp::Or, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(*lhs, Expr::Binary { op: BinOp::And, .. }));
                 assert!(is_ident(&rhs, "c"));
             }
@@ -2784,7 +2926,12 @@ mod tests {
         // `a == b && c` -> Binary(And, Binary(Eq, a, b), c).
         let e = expr_of("a == b && c");
         match e {
-            Expr::Binary { op: BinOp::And, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::And,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(*lhs, Expr::Binary { op: BinOp::Eq, .. }));
                 assert!(is_ident(&rhs, "c"));
             }
@@ -2797,7 +2944,11 @@ mod tests {
         // `-a.b` -> Unary(Neg, FieldAccess(Ident(a), "b")).
         let e = expr_of("-a.b");
         match e {
-            Expr::Unary { op: UnaryOp::Neg, operand, .. } => match *operand {
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+                ..
+            } => match *operand {
                 Expr::FieldAccess { obj, name, .. } => {
                     assert!(is_ident(&obj, "a"));
                     assert_eq!(name, "b");
@@ -2813,7 +2964,12 @@ mod tests {
         // `comptime a + b` -> Binary(Add, Comptime(Ident(a)), Ident(b)).
         let e = expr_of("comptime a + b");
         match e {
-            Expr::Binary { op: BinOp::Add, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(*lhs, Expr::Comptime { .. }));
                 assert!(is_ident(&rhs, "b"));
                 if let Expr::Comptime { body, .. } = *lhs {
@@ -2918,7 +3074,12 @@ mod tests {
         // `a + b?` -> Binary(Add, a, Try(b)).
         let e = expr_of("a + b?");
         match e {
-            Expr::Binary { op: BinOp::Add, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(is_ident(&lhs, "a"));
                 match *rhs {
                     Expr::Try { expr, .. } => assert!(is_ident(&expr, "b")),
@@ -2940,7 +3101,12 @@ mod tests {
         // `1..n+1` -> Range(Int(1), Binary(Add, Ident(n), Int(1)), false).
         let e = expr_of("1..n+1");
         match e {
-            Expr::Range { start, end, inclusive, .. } => {
+            Expr::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => {
                 assert!(!inclusive);
                 let s = start.expect("start present");
                 assert!(matches!(*s, Expr::Int { value: 1, .. }));
@@ -2971,7 +3137,12 @@ mod tests {
         // `a + b - c` -> Binary(Sub, Binary(Add, a, b), c).
         let e = expr_of("a + b - c");
         match e {
-            Expr::Binary { op: BinOp::Sub, lhs, rhs, .. } => {
+            Expr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+                ..
+            } => {
                 assert!(matches!(*lhs, Expr::Binary { op: BinOp::Add, .. }));
                 assert!(is_ident(&rhs, "c"));
             }
@@ -3018,7 +3189,12 @@ mod tests {
     fn method_call_is_distinct_from_field_access() {
         // `p.area()` -- a method call.
         match expr_of("p.area()") {
-            Expr::MethodCall { receiver, name, args, .. } => {
+            Expr::MethodCall {
+                receiver,
+                name,
+                args,
+                ..
+            } => {
                 assert!(is_ident(&receiver, "p"));
                 assert_eq!(name, "area");
                 assert!(args.is_empty());
@@ -3056,7 +3232,12 @@ mod tests {
                 Expr::Index { obj, index, .. } => {
                     assert!(matches!(*index, Expr::Int { value: 2, .. }));
                     match *obj {
-                        Expr::MethodCall { receiver, name, args, .. } => {
+                        Expr::MethodCall {
+                            receiver,
+                            name,
+                            args,
+                            ..
+                        } => {
                             assert_eq!(name, "g");
                             assert_eq!(args.len(), 1);
                             assert!(matches!(*receiver, Expr::Try { .. }));
@@ -3298,7 +3479,10 @@ mod tests {
         let err = expr_err("match x { }");
         match err {
             QalaError::Parse { message, .. } => {
-                assert!(message.contains("at least one arm"), "message was {message:?}");
+                assert!(
+                    message.contains("at least one arm"),
+                    "message was {message:?}"
+                );
             }
             other => panic!("expected QalaError::Parse, got {other:?}"),
         }
@@ -3456,7 +3640,13 @@ mod tests {
     #[test]
     fn let_without_mut_or_type_parses() {
         match first_stmt_of("let x = 5") {
-            Stmt::Let { is_mut, name, ty, init, .. } => {
+            Stmt::Let {
+                is_mut,
+                name,
+                ty,
+                init,
+                ..
+            } => {
                 assert!(!is_mut);
                 assert_eq!(name, "x");
                 assert!(ty.is_none());
@@ -3483,7 +3673,10 @@ mod tests {
             Stmt::Let { ty, init, .. } => {
                 assert!(matches!(
                     ty,
-                    Some(TypeExpr::Primitive { kind: PrimType::I64, .. })
+                    Some(TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        ..
+                    })
                 ));
                 assert!(matches!(init, Expr::Int { value: 0, .. }));
             }
@@ -3499,7 +3692,11 @@ mod tests {
             err,
             QalaError::UnexpectedToken { .. } | QalaError::UnexpectedEof { .. }
         ));
-        assert!(err.message().contains("`=`"), "message was {}", err.message());
+        assert!(
+            err.message().contains("`=`"),
+            "message was {}",
+            err.message()
+        );
     }
 
     #[test]
@@ -3527,7 +3724,10 @@ mod tests {
         match first_stmt_of("if a { 1 } else if b { 2 } else { 3 }") {
             Stmt::If { else_branch, .. } => match else_branch {
                 Some(ElseBranch::If(boxed)) => match *boxed {
-                    Stmt::If { else_branch: Some(ElseBranch::Block(_)), .. } => {}
+                    Stmt::If {
+                        else_branch: Some(ElseBranch::Block(_)),
+                        ..
+                    } => {}
                     other => panic!("expected If with else-block, got {other:?}"),
                 },
                 other => panic!("expected else-if (ElseBranch::If), got {other:?}"),
@@ -3583,10 +3783,7 @@ mod tests {
     fn return_with_an_expression_carries_it() {
         match first_stmt_of("return n + 1") {
             Stmt::Return { value, .. } => {
-                assert!(matches!(
-                    value,
-                    Some(Expr::Binary { op: BinOp::Add, .. })
-                ));
+                assert!(matches!(value, Some(Expr::Binary { op: BinOp::Add, .. })));
             }
             other => panic!("expected Return, got {other:?}"),
         }
@@ -3757,7 +3954,11 @@ mod tests {
         let err = parse_err("fn f() { let x = ( a + b } }");
         let msg = err.message();
         match &err {
-            QalaError::UnclosedDelimiter { span, opener, found } => {
+            QalaError::UnclosedDelimiter {
+                span,
+                opener,
+                found,
+            } => {
                 assert_eq!(*opener, TokenKind::LParen);
                 assert_eq!(span.len, 1, "the `(` span is one byte wide");
                 assert_eq!(*found, TokenKind::RBrace);
@@ -3880,11 +4081,7 @@ mod tests {
         );
         // 5000 nested types: the depth guard around `parse_type` covers this.
         // `[[[...i64...]]]` -- one bracket per nesting level.
-        let deep_types = format!(
-            "fn f(x: {}i64{}) {{}}",
-            "[".repeat(5000),
-            "]".repeat(5000)
-        );
+        let deep_types = format!("fn f(x: {}i64{}) {{}}", "[".repeat(5000), "]".repeat(5000));
         assert!(
             Parser::parse(&lex(&deep_types)).is_err(),
             "deep type nesting should error, not crash"
@@ -3919,7 +4116,10 @@ mod tests {
                 let ret_stmt = &d.body.stmts[0];
                 assert_eq!(ret_stmt.span().slice(src), "return a + b");
                 // the inner `a + b` Binary's span.
-                if let Stmt::Return { value: Some(value), .. } = ret_stmt {
+                if let Stmt::Return {
+                    value: Some(value), ..
+                } = ret_stmt
+                {
                     assert_eq!(value.span().slice(src), "a + b");
                 } else {
                     panic!("expected Stmt::Return with a value, got {ret_stmt:?}");

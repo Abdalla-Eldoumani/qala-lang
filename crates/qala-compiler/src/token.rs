@@ -282,9 +282,8 @@ mod tests {
     fn stdlib_and_result_family_names_are_not_keywords() {
         // the lexer carries no stdlib knowledge: these are ordinary identifiers.
         let not_keywords = [
-            "Result", "Option", "Ok", "Err", "Some", "None", "print", "println",
-            "len", "push", "pop", "sqrt", "abs", "assert", "type_of", "open",
-            "close", "map", "filter", "reduce",
+            "Result", "Option", "Ok", "Err", "Some", "None", "print", "println", "len", "push",
+            "pop", "sqrt", "abs", "assert", "type_of", "open", "close", "map", "filter", "reduce",
         ];
         for name in not_keywords {
             assert_eq!(keyword(name), None, "{name:?} must not be a keyword");
@@ -317,12 +316,18 @@ mod tests {
         assert_eq!(TokenKind::Int(42), TokenKind::Int(42));
         assert_ne!(TokenKind::Int(42), TokenKind::Int(43));
         assert_eq!(TokenKind::Byte(b'A'), TokenKind::Byte(65));
-        assert_eq!(TokenKind::Str("abc".to_string()), TokenKind::Str("abc".to_string()));
+        assert_eq!(
+            TokenKind::Str("abc".to_string()),
+            TokenKind::Str("abc".to_string())
+        );
         assert_eq!(
             TokenKind::StrStart("hi ".to_string()),
             TokenKind::StrStart("hi ".to_string())
         );
-        assert_eq!(TokenKind::Ident("x".to_string()), TokenKind::Ident("x".to_string()));
+        assert_eq!(
+            TokenKind::Ident("x".to_string()),
+            TokenKind::Ident("x".to_string())
+        );
         // float carries an f64; PartialEq works, Eq is intentionally absent.
         assert_eq!(TokenKind::Float(1.5), TokenKind::Float(1.5));
     }

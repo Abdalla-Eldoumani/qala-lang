@@ -82,9 +82,7 @@ const VARIANT_ID_OK: u16 = 0;
 /// both are a clean [`QalaError::Runtime`], never a panic.
 pub fn dispatch(vm: &mut Vm, fn_id: u16, args: &[Value]) -> Result<Value, QalaError> {
     if fn_id < STDLIB_FN_BASE {
-        return Err(vm.runtime_err(&format!(
-            "internal error: fn-id {fn_id} is not a stdlib id"
-        )));
+        return Err(vm.runtime_err(&format!("internal error: fn-id {fn_id} is not a stdlib id")));
     }
     match fn_id {
         40000 => print(vm, args),
@@ -116,10 +114,7 @@ pub fn dispatch(vm: &mut Vm, fn_id: u16, args: &[Value]) -> Result<Value, QalaEr
 fn one_arg(vm: &Vm, args: &[Value], name: &str) -> Result<Value, QalaError> {
     match args {
         [a] => Ok(*a),
-        _ => Err(vm.runtime_err(&format!(
-            "{name} expects 1 argument, got {}",
-            args.len()
-        ))),
+        _ => Err(vm.runtime_err(&format!("{name} expects 1 argument, got {}", args.len()))),
     }
 }
 
@@ -312,10 +307,7 @@ fn push(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let (array, value) = match args {
         [a, v] => (*a, *v),
         _ => {
-            return Err(vm.runtime_err(&format!(
-                "push expects 2 arguments, got {}",
-                args.len()
-            )));
+            return Err(vm.runtime_err(&format!("push expects 2 arguments, got {}", args.len())));
         }
     };
     let slot = array
@@ -419,10 +411,7 @@ fn map(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let (array, callback) = match args {
         [a, c] => (*a, *c),
         _ => {
-            return Err(vm.runtime_err(&format!(
-                "map expects 2 arguments, got {}",
-                args.len()
-            )));
+            return Err(vm.runtime_err(&format!("map expects 2 arguments, got {}", args.len())));
         }
     };
     let elements = heap_array_elements(vm, array, "map")?;
@@ -444,10 +433,7 @@ fn filter(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let (array, callback) = match args {
         [a, c] => (*a, *c),
         _ => {
-            return Err(vm.runtime_err(&format!(
-                "filter expects 2 arguments, got {}",
-                args.len()
-            )));
+            return Err(vm.runtime_err(&format!("filter expects 2 arguments, got {}", args.len())));
         }
     };
     let elements = heap_array_elements(vm, array, "filter")?;
@@ -475,10 +461,7 @@ fn reduce(vm: &mut Vm, args: &[Value]) -> Result<Value, QalaError> {
     let (array, initial, callback) = match args {
         [a, i, c] => (*a, *i, *c),
         _ => {
-            return Err(vm.runtime_err(&format!(
-                "reduce expects 3 arguments, got {}",
-                args.len()
-            )));
+            return Err(vm.runtime_err(&format!("reduce expects 3 arguments, got {}", args.len())));
         }
     };
     let elements = heap_array_elements(vm, array, "reduce")?;
@@ -568,8 +551,7 @@ mod tests {
             .fn_names
             .iter()
             .position(|n| n == name)
-            .unwrap_or_else(|| panic!("no function named {name}"))
-            as u16
+            .unwrap_or_else(|| panic!("no function named {name}")) as u16
     }
 
     /// allocate a heap `Int` in `vm` and return the pointer value.
@@ -767,11 +749,7 @@ mod tests {
         print(&mut vm, &[b]).expect("print b");
         assert_eq!(
             vm.console,
-            vec![
-                "first line\n".to_string(),
-                "a".to_string(),
-                "b".to_string(),
-            ],
+            vec!["first line\n".to_string(), "a".to_string(), "b".to_string(),],
             "println entries end with newline; print entries do not"
         );
     }
@@ -788,7 +766,10 @@ mod tests {
         println(&mut vm, &[b]).expect("println b");
         print(&mut vm, &[c]).expect("print c");
         let joined: String = vm.console.concat();
-        assert_eq!(joined, "a\nb\nc", "two println then print joined is a\\nb\\nc");
+        assert_eq!(
+            joined, "a\nb\nc",
+            "two println then print joined is a\\nb\\nc"
+        );
     }
 
     #[test]
@@ -833,7 +814,11 @@ mod tests {
             }) => {
                 assert_eq!(type_name, "Result", "read_all returns a Result");
                 assert_eq!(variant, "Ok", "the mock read succeeds");
-                assert_eq!(result_str(&vm, payload[0]), "", "the v1 mock content is empty");
+                assert_eq!(
+                    result_str(&vm, payload[0]),
+                    "",
+                    "the v1 mock content is empty"
+                );
             }
             _ => panic!("read_all must return a Result enum variant"),
         }
@@ -903,7 +888,10 @@ mod tests {
         // an fn-id above the table is malformed bytecode -> a clean error.
         match dispatch(&mut vm, 49999, &[]) {
             Err(QalaError::Runtime { message, .. }) => {
-                assert!(message.contains("unknown stdlib function"), "got: {message}");
+                assert!(
+                    message.contains("unknown stdlib function"),
+                    "got: {message}"
+                );
             }
             Err(other) => panic!("expected an unknown-stdlib Runtime error, got {other:?}"),
             Ok(_) => panic!("an unknown fn-id must error"),
@@ -932,7 +920,10 @@ mod tests {
         // a wrong-type argument is likewise a clean error, never a panic.
         match len(&mut vm, &[Value::bool(true)]) {
             Err(QalaError::Runtime { message, .. }) => {
-                assert!(message.contains("expected an array or string"), "got: {message}");
+                assert!(
+                    message.contains("expected an array or string"),
+                    "got: {message}"
+                );
             }
             Err(other) => panic!("expected a wrong-type Runtime error, got {other:?}"),
             Ok(_) => panic!("len of a bool must error"),
@@ -1009,7 +1000,10 @@ mod tests {
         // hello: string interpolation -> "hello, world!".
         let hello = run_example("hello");
         assert!(
-            hello.console.iter().any(|l| l.trim_end_matches('\n') == "hello, world!"),
+            hello
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "hello, world!"),
             "hello.qala console: {:?}",
             hello.console,
         );
@@ -1018,17 +1012,26 @@ mod tests {
         // lines fib(0)=0 .. fib(14)=377.
         let fibonacci = run_example("fibonacci");
         assert!(
-            fibonacci.console.iter().any(|l| l.trim_end_matches('\n') == "fib(0) = 0"),
+            fibonacci
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "fib(0) = 0"),
             "fibonacci.qala console: {:?}",
             fibonacci.console,
         );
         assert!(
-            fibonacci.console.iter().any(|l| l.trim_end_matches('\n') == "fib(10) = 55"),
+            fibonacci
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "fib(10) = 55"),
             "fibonacci.qala must print fib(10) = 55, console: {:?}",
             fibonacci.console,
         );
         assert!(
-            fibonacci.console.iter().any(|l| l.trim_end_matches('\n') == "fib(14) = 377"),
+            fibonacci
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "fib(14) = 377"),
             "fibonacci.qala must print fib(14) = 377, console: {:?}",
             fibonacci.console,
         );
@@ -1036,7 +1039,10 @@ mod tests {
         // effects: a pure function called from an io function -> "7 squared: 49".
         let effects = run_example("effects");
         assert!(
-            effects.console.iter().any(|l| l.trim_end_matches('\n') == "7 squared: 49"),
+            effects
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "7 squared: 49"),
             "effects.qala console: {:?}",
             effects.console,
         );
@@ -1049,17 +1055,26 @@ mod tests {
             "pattern-matching.qala must print something",
         );
         assert!(
-            pattern_matching.console.iter().any(|l| l.trim_end_matches('\n') == "positive"),
+            pattern_matching
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "positive"),
             "pattern-matching.qala classify(42) must print positive, console: {:?}",
             pattern_matching.console,
         );
         assert!(
-            pattern_matching.console.iter().any(|l| l.trim_end_matches('\n') == "negative"),
+            pattern_matching
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "negative"),
             "pattern-matching.qala classify(-7) must print negative, console: {:?}",
             pattern_matching.console,
         );
         assert!(
-            pattern_matching.console.iter().any(|l| l.trim_end_matches('\n') == "zero"),
+            pattern_matching
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "zero"),
             "pattern-matching.qala classify(0) must print zero, console: {:?}",
             pattern_matching.console,
         );
@@ -1069,15 +1084,15 @@ mod tests {
         // 4, 8, 12, 16, 20.
         let pipeline = run_example("pipeline");
         assert!(
-            pipeline
-                .console
-                .iter()
-                .any(|l| l.contains("= 22")),
+            pipeline.console.iter().any(|l| l.contains("= 22")),
             "pipeline.qala must print the pipeline result 22, console: {:?}",
             pipeline.console,
         );
         assert!(
-            pipeline.console.iter().any(|l| l.trim_end_matches('\n') == "20"),
+            pipeline
+                .console
+                .iter()
+                .any(|l| l.trim_end_matches('\n') == "20"),
             "pipeline.qala filter+map must print the doubled even 20, console: {:?}",
             pipeline.console,
         );

@@ -220,8 +220,7 @@ pub fn compile_program(ast: &TypedAst, src: &str) -> Result<Program, Vec<QalaErr
         }
     }
     if !cg.errors.is_empty() {
-        cg.errors
-            .sort_by_key(|e| (e.span().start, e.span().len));
+        cg.errors.sort_by_key(|e| (e.span().start, e.span().len));
         return Err(cg.errors);
     }
     Ok(cg.program)
@@ -242,8 +241,7 @@ impl<'a> Codegen<'a> {
         let mut enum_variant_table: BTreeMap<(String, String), u16> = BTreeMap::new();
         let mut enum_variant_payload_count: HashMap<(String, String), u8> = HashMap::new();
         for (i, (enum_name, variant_name, _)) in BUILTIN_VARIANTS.iter().enumerate() {
-            enum_variant_table
-                .insert((enum_name.to_string(), variant_name.to_string()), i as u16);
+            enum_variant_table.insert((enum_name.to_string(), variant_name.to_string()), i as u16);
             // Ok / Err / Some carry one payload; None carries zero.
             let payload = if *variant_name == "None" { 0 } else { 1 };
             enum_variant_payload_count
@@ -300,10 +298,8 @@ impl<'a> Codegen<'a> {
                 }
                 TypedItem::Struct(decl) => {
                     for (i, field) in decl.fields.iter().enumerate() {
-                        self.struct_field_index.insert(
-                            (decl.name.clone(), field.name.clone()),
-                            i as u16,
-                        );
+                        self.struct_field_index
+                            .insert((decl.name.clone(), field.name.clone()), i as u16);
                     }
                 }
                 TypedItem::Enum(decl) => {
@@ -312,10 +308,8 @@ impl<'a> Codegen<'a> {
                         self.program
                             .enum_variant_names
                             .push((decl.name.clone(), variant.name.clone()));
-                        self.enum_variant_table.insert(
-                            (decl.name.clone(), variant.name.clone()),
-                            variant_id,
-                        );
+                        self.enum_variant_table
+                            .insert((decl.name.clone(), variant.name.clone()), variant_id);
                         self.enum_variant_payload_count.insert(
                             (decl.name.clone(), variant.name.clone()),
                             variant.fields.len() as u8,
@@ -351,7 +345,10 @@ impl<'a> Codegen<'a> {
                     .copied()
                     .ok_or_else(|| QalaError::Type {
                         span: decl.span,
-                        message: format!("codegen: function `{}` was not pre-registered", decl.name),
+                        message: format!(
+                            "codegen: function `{}` was not pre-registered",
+                            decl.name
+                        ),
                     })?;
                 self.current_fn_id = fn_id;
                 // a fresh function: the slot-to-name accumulator starts empty.
@@ -571,7 +568,9 @@ impl<'a> Codegen<'a> {
     /// the surrounding block (`return` / `break` / `continue`).
     fn compile_stmt(&mut self, stmt: &TypedStmt) -> Result<bool, QalaError> {
         match stmt {
-            TypedStmt::Let { name, init, span, .. } => {
+            TypedStmt::Let {
+                name, init, span, ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_expr(init)?;
                 let slot = self.next_slot();
@@ -580,15 +579,20 @@ impl<'a> Codegen<'a> {
                 self.chunk_mut().write_u16(slot, line);
                 Ok(false)
             }
-            TypedStmt::If { cond, then_block, else_branch, span } => {
-                self.compile_if(cond, then_block, else_branch.as_ref(), *span)
-            }
-            TypedStmt::While { cond, body, span } => {
-                self.compile_while(cond, body, *span)
-            }
-            TypedStmt::For { var, iter, body, span, .. } => {
-                self.compile_for(var, iter, body, *span)
-            }
+            TypedStmt::If {
+                cond,
+                then_block,
+                else_branch,
+                span,
+            } => self.compile_if(cond, then_block, else_branch.as_ref(), *span),
+            TypedStmt::While { cond, body, span } => self.compile_while(cond, body, *span),
+            TypedStmt::For {
+                var,
+                iter,
+                body,
+                span,
+                ..
+            } => self.compile_for(var, iter, body, *span),
             TypedStmt::Return { value, span } => {
                 let line = self.line_at(*span);
                 if let Some(v) = value {
@@ -871,9 +875,7 @@ impl<'a> Codegen<'a> {
         }
         let a_idx = chunk.read_u16(lhs_start + 1);
         let b_idx = chunk.read_u16(rhs_start + 1);
-        if a_idx as usize >= chunk.constants.len()
-            || b_idx as usize >= chunk.constants.len()
-        {
+        if a_idx as usize >= chunk.constants.len() || b_idx as usize >= chunk.constants.len() {
             return Ok(false);
         }
         let a = chunk.constants[a_idx as usize].clone();
@@ -995,7 +997,9 @@ impl<'a> Codegen<'a> {
                 Ok(())
             }
             TypedExpr::Paren { inner, .. } => self.compile_expr(inner),
-            TypedExpr::Unary { op, operand, span, .. } => {
+            TypedExpr::Unary {
+                op, operand, span, ..
+            } => {
                 let operand_start = self.chunk_mut().code.len();
                 self.compile_expr(operand)?;
                 let line = self.line_at(*span);
@@ -1004,7 +1008,9 @@ impl<'a> Codegen<'a> {
                 }
                 Ok(())
             }
-            TypedExpr::Binary { op, lhs, rhs, span, .. } => {
+            TypedExpr::Binary {
+                op, lhs, rhs, span, ..
+            } => {
                 let line = self.line_at(*span);
                 if matches!(op, BinOp::And | BinOp::Or) {
                     // short-circuit: compile lhs, DUP it, conditionally jump
@@ -1037,11 +1043,15 @@ impl<'a> Codegen<'a> {
                     Ok(())
                 }
             }
-            TypedExpr::Call { callee, args, span, .. } => {
+            TypedExpr::Call {
+                callee, args, span, ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_call(callee, args, line, *span)
             }
-            TypedExpr::Pipeline { lhs, call, span, .. } => {
+            TypedExpr::Pipeline {
+                lhs, call, span, ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_pipeline(lhs, call, line, *span)
             }
@@ -1053,15 +1063,28 @@ impl<'a> Codegen<'a> {
                 let line = self.line_at(*span);
                 self.compile_try(expr, line, *span)
             }
-            TypedExpr::OrElse { expr, fallback, span, .. } => {
+            TypedExpr::OrElse {
+                expr,
+                fallback,
+                span,
+                ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_or_else(expr, fallback, line, *span)
             }
-            TypedExpr::MethodCall { receiver, name, args, span, .. } => {
+            TypedExpr::MethodCall {
+                receiver,
+                name,
+                args,
+                span,
+                ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_method_call(receiver, name, args, line, *span)
             }
-            TypedExpr::FieldAccess { obj, name, span, .. } => {
+            TypedExpr::FieldAccess {
+                obj, name, span, ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_expr(obj)?;
                 // resolve the struct + field to the FIELD operand index.
@@ -1070,7 +1093,9 @@ impl<'a> Codegen<'a> {
                 self.chunk_mut().write_u16(field_idx, line);
                 Ok(())
             }
-            TypedExpr::Index { obj, index, span, .. } => {
+            TypedExpr::Index {
+                obj, index, span, ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_expr(obj)?;
                 self.compile_expr(index)?;
@@ -1095,11 +1120,15 @@ impl<'a> Codegen<'a> {
                 self.chunk_mut().write_u16(elems.len() as u16, line);
                 Ok(())
             }
-            TypedExpr::ArrayRepeat { value, count, span, .. } => {
+            TypedExpr::ArrayRepeat {
+                value, count, span, ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_array_repeat(value, count, line, *span)
             }
-            TypedExpr::StructLit { name, fields, span, .. } => {
+            TypedExpr::StructLit {
+                name, fields, span, ..
+            } => {
                 let line = self.line_at(*span);
                 // emit field values in declaration order. the typechecker
                 // already verified the field set; codegen trusts it.
@@ -1114,7 +1143,13 @@ impl<'a> Codegen<'a> {
                 self.chunk_mut().write_u16(struct_id, line);
                 Ok(())
             }
-            TypedExpr::Range { start, end, inclusive, span, .. } => {
+            TypedExpr::Range {
+                start,
+                end,
+                inclusive,
+                span,
+                ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_range(start.as_deref(), end.as_deref(), *inclusive, line, *span)
             }
@@ -1124,7 +1159,12 @@ impl<'a> Codegen<'a> {
                 self.compile_block(block)?;
                 Ok(())
             }
-            TypedExpr::Match { scrutinee, arms, span, .. } => {
+            TypedExpr::Match {
+                scrutinee,
+                arms,
+                span,
+                ..
+            } => {
                 let line = self.line_at(*span);
                 self.compile_match(scrutinee, arms, line, *span)
             }
@@ -1151,9 +1191,7 @@ impl<'a> Codegen<'a> {
     ) -> Result<bool, QalaError> {
         // the lhs must have emitted exactly one 3-byte CONST.
         let rhs_start = self.chunk_mut().code.len();
-        if rhs_start - lhs_start != 3
-            || self.chunk_mut().code[lhs_start] != Opcode::Const as u8
-        {
+        if rhs_start - lhs_start != 3 || self.chunk_mut().code[lhs_start] != Opcode::Const as u8 {
             return Ok(false);
         }
         self.compile_expr(rhs)?;
@@ -1420,12 +1458,7 @@ impl<'a> Codegen<'a> {
     /// `Option`; on the success variant the payload is unwrapped to the
     /// stack, on the failure variant the scope's defers fire and the original
     /// `Err` / `None` is returned.
-    fn compile_try(
-        &mut self,
-        inner: &TypedExpr,
-        line: u32,
-        span: Span,
-    ) -> Result<(), QalaError> {
+    fn compile_try(&mut self, inner: &TypedExpr, line: u32, span: Span) -> Result<(), QalaError> {
         self.compile_expr(inner)?;
         // the success-variant id: Ok (0) for Result, Some (2) for Option.
         let ok_id = match inner.ty() {
@@ -1649,8 +1682,7 @@ impl<'a> Codegen<'a> {
         if count > 1024 {
             return Err(QalaError::Parse {
                 span,
-                message: "range too large to materialize (v1 limit is 1024 elements)"
-                    .to_string(),
+                message: "range too large to materialize (v1 limit is 1024 elements)".to_string(),
             });
         }
         for v in lo..=last {
@@ -1901,9 +1933,7 @@ impl<'a> Codegen<'a> {
                     // variant (`Triangle`, `None`). when the scrutinee's enum
                     // has a variant by this name, treat it as a variant
                     // pattern -- a MATCH_VARIANT test -- not a binding.
-                    if let Some(variant_id) =
-                        self.maybe_variant_id(enum_name.as_deref(), name)
-                    {
+                    if let Some(variant_id) = self.maybe_variant_id(enum_name.as_deref(), name) {
                         if !is_last {
                             self.chunk_mut().write_op(Opcode::Dup, line);
                         }
@@ -1974,16 +2004,25 @@ impl<'a> Codegen<'a> {
                     }
                 }
                 Pattern::Int { value, .. } => {
-                    fail_jumps
-                        .push(self.emit_literal_pattern_test(ConstValue::I64(*value), is_last, line));
+                    fail_jumps.push(self.emit_literal_pattern_test(
+                        ConstValue::I64(*value),
+                        is_last,
+                        line,
+                    ));
                 }
                 Pattern::Bool { value, .. } => {
-                    fail_jumps
-                        .push(self.emit_literal_pattern_test(ConstValue::Bool(*value), is_last, line));
+                    fail_jumps.push(self.emit_literal_pattern_test(
+                        ConstValue::Bool(*value),
+                        is_last,
+                        line,
+                    ));
                 }
                 Pattern::Byte { value, .. } => {
-                    fail_jumps
-                        .push(self.emit_literal_pattern_test(ConstValue::Byte(*value), is_last, line));
+                    fail_jumps.push(self.emit_literal_pattern_test(
+                        ConstValue::Byte(*value),
+                        is_last,
+                        line,
+                    ));
                 }
                 Pattern::Str { value, .. } => {
                     fail_jumps.push(self.emit_literal_pattern_test(
@@ -1993,8 +2032,11 @@ impl<'a> Codegen<'a> {
                     ));
                 }
                 Pattern::Float { value, .. } => {
-                    fail_jumps
-                        .push(self.emit_literal_pattern_test(ConstValue::F64(*value), is_last, line));
+                    fail_jumps.push(self.emit_literal_pattern_test(
+                        ConstValue::F64(*value),
+                        is_last,
+                        line,
+                    ));
                 }
             }
             // the arm body runs in its own scope so an arm-local `defer`
@@ -2116,34 +2158,55 @@ fn fold_binary_value(
     operand_ty: &QalaType,
     span: Span,
 ) -> Result<Option<ConstValue>, QalaError> {
-    let overflow = |op: BinOp, lhs: i64, rhs: i64| QalaError::IntegerOverflow {
-        span,
-        op,
-        lhs,
-        rhs,
-    };
+    let overflow =
+        |op: BinOp, lhs: i64, rhs: i64| QalaError::IntegerOverflow { span, op, lhs, rhs };
     let folded = match (a, b, op) {
         // ---- i64 arithmetic: checked, overflow is an error ----
-        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Add) if matches!(operand_ty, QalaType::I64) => {
-            ConstValue::I64(x.checked_add(*y).ok_or_else(|| overflow(BinOp::Add, *x, *y))?)
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Add)
+            if matches!(operand_ty, QalaType::I64) =>
+        {
+            ConstValue::I64(
+                x.checked_add(*y)
+                    .ok_or_else(|| overflow(BinOp::Add, *x, *y))?,
+            )
         }
-        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Sub) if matches!(operand_ty, QalaType::I64) => {
-            ConstValue::I64(x.checked_sub(*y).ok_or_else(|| overflow(BinOp::Sub, *x, *y))?)
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Sub)
+            if matches!(operand_ty, QalaType::I64) =>
+        {
+            ConstValue::I64(
+                x.checked_sub(*y)
+                    .ok_or_else(|| overflow(BinOp::Sub, *x, *y))?,
+            )
         }
-        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Mul) if matches!(operand_ty, QalaType::I64) => {
-            ConstValue::I64(x.checked_mul(*y).ok_or_else(|| overflow(BinOp::Mul, *x, *y))?)
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Mul)
+            if matches!(operand_ty, QalaType::I64) =>
+        {
+            ConstValue::I64(
+                x.checked_mul(*y)
+                    .ok_or_else(|| overflow(BinOp::Mul, *x, *y))?,
+            )
         }
-        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Div) if matches!(operand_ty, QalaType::I64) => {
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Div)
+            if matches!(operand_ty, QalaType::I64) =>
+        {
             if *y == 0 {
                 return Ok(None);
             }
-            ConstValue::I64(x.checked_div(*y).ok_or_else(|| overflow(BinOp::Div, *x, *y))?)
+            ConstValue::I64(
+                x.checked_div(*y)
+                    .ok_or_else(|| overflow(BinOp::Div, *x, *y))?,
+            )
         }
-        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Rem) if matches!(operand_ty, QalaType::I64) => {
+        (ConstValue::I64(x), ConstValue::I64(y), BinOp::Rem)
+            if matches!(operand_ty, QalaType::I64) =>
+        {
             if *y == 0 {
                 return Ok(None);
             }
-            ConstValue::I64(x.checked_rem(*y).ok_or_else(|| overflow(BinOp::Rem, *x, *y))?)
+            ConstValue::I64(
+                x.checked_rem(*y)
+                    .ok_or_else(|| overflow(BinOp::Rem, *x, *y))?,
+            )
         }
         // ---- f64 arithmetic: IEEE 754, no overflow error ----
         (ConstValue::F64(x), ConstValue::F64(y), BinOp::Add) => ConstValue::F64(x + y),
@@ -2582,7 +2645,12 @@ impl<'a> ComptimeInterpreter<'a> {
     /// evaluate an arithmetic opcode on two values. i64 ops are checked --
     /// an overflow is an error; division / remainder by zero is an error.
     /// f64 ops follow IEEE 754.
-    fn eval_arith(&self, op: Opcode, a: ConstValue, b: ConstValue) -> Result<ConstValue, QalaError> {
+    fn eval_arith(
+        &self,
+        op: Opcode,
+        a: ConstValue,
+        b: ConstValue,
+    ) -> Result<ConstValue, QalaError> {
         let int_overflow = |bin: BinOp, x: i64, y: i64| QalaError::IntegerOverflow {
             span: self.block_span,
             op: bin,
@@ -2591,20 +2659,24 @@ impl<'a> ComptimeInterpreter<'a> {
         };
         match (op, a, b) {
             (Opcode::Add, ConstValue::I64(x), ConstValue::I64(y)) => Ok(ConstValue::I64(
-                x.checked_add(y).ok_or_else(|| int_overflow(BinOp::Add, x, y))?,
+                x.checked_add(y)
+                    .ok_or_else(|| int_overflow(BinOp::Add, x, y))?,
             )),
             (Opcode::Sub, ConstValue::I64(x), ConstValue::I64(y)) => Ok(ConstValue::I64(
-                x.checked_sub(y).ok_or_else(|| int_overflow(BinOp::Sub, x, y))?,
+                x.checked_sub(y)
+                    .ok_or_else(|| int_overflow(BinOp::Sub, x, y))?,
             )),
             (Opcode::Mul, ConstValue::I64(x), ConstValue::I64(y)) => Ok(ConstValue::I64(
-                x.checked_mul(y).ok_or_else(|| int_overflow(BinOp::Mul, x, y))?,
+                x.checked_mul(y)
+                    .ok_or_else(|| int_overflow(BinOp::Mul, x, y))?,
             )),
             (Opcode::Div, ConstValue::I64(x), ConstValue::I64(y)) => {
                 if y == 0 {
                     return Err(self.type_error("division by zero"));
                 }
                 Ok(ConstValue::I64(
-                    x.checked_div(y).ok_or_else(|| int_overflow(BinOp::Div, x, y))?,
+                    x.checked_div(y)
+                        .ok_or_else(|| int_overflow(BinOp::Div, x, y))?,
                 ))
             }
             (Opcode::Mod, ConstValue::I64(x), ConstValue::I64(y)) => {
@@ -2612,7 +2684,8 @@ impl<'a> ComptimeInterpreter<'a> {
                     return Err(self.type_error("remainder by zero"));
                 }
                 Ok(ConstValue::I64(
-                    x.checked_rem(y).ok_or_else(|| int_overflow(BinOp::Rem, x, y))?,
+                    x.checked_rem(y)
+                        .ok_or_else(|| int_overflow(BinOp::Rem, x, y))?,
                 ))
             }
             (Opcode::FAdd, ConstValue::F64(x), ConstValue::F64(y)) => Ok(ConstValue::F64(x + y)),
@@ -2757,7 +2830,11 @@ mod tests {
                 scope.locals.push((param.name.clone(), i as u16));
             }
         }
-        let value = decl.body.value.as_ref().expect("body has no trailing value");
+        let value = decl
+            .body
+            .value
+            .as_ref()
+            .expect("body has no trailing value");
         cg.compile_expr(value)
             .expect_err("expected a codegen error")
     }
@@ -2799,7 +2876,10 @@ mod tests {
         assert_eq!(p.main_index, 0);
         assert_eq!(p.fn_names, vec!["main".to_string()]);
         // the fall-through completion emits at least a RETURN byte.
-        assert!(!p.chunks[0].code.is_empty(), "main chunk should have a RETURN");
+        assert!(
+            !p.chunks[0].code.is_empty(),
+            "main chunk should have a RETURN"
+        );
         assert_eq!(p.chunks[0].code[0], Opcode::Return as u8);
     }
 
@@ -2887,7 +2967,10 @@ mod tests {
         let id1 = cg1.enum_variant_lookup("Done").copied();
         let id2 = cg2.enum_variant_lookup("Done").copied();
         assert!(id1.is_some(), "lookup should find a variant named Done");
-        assert_eq!(id1, id2, "variant id must be deterministic across instances");
+        assert_eq!(
+            id1, id2,
+            "variant id must be deterministic across instances"
+        );
     }
 
     // Test 5: stdlib fn-ids live in the STDLIB_FN_BASE namespace; user fns
@@ -3118,10 +3201,7 @@ mod tests {
     // Test 10: `i64::MAX + 1` is a fold-time IntegerOverflow.
     #[test]
     fn compile_expr_fold_add_overflow_is_an_error() {
-        let err = compile_expr_err(
-            "fn f() -> i64 is pure { 9223372036854775807 + 1 }",
-            "f",
-        );
+        let err = compile_expr_err("fn f() -> i64 is pure { 9223372036854775807 + 1 }", "f");
         match err {
             QalaError::IntegerOverflow { op, lhs, rhs, .. } => {
                 assert_eq!(op, BinOp::Add);
@@ -3135,10 +3215,7 @@ mod tests {
     // Test 11: `i64::MAX * 2` overflows on fold.
     #[test]
     fn compile_expr_fold_mul_overflow_is_an_error() {
-        let err = compile_expr_err(
-            "fn f() -> i64 is pure { 9223372036854775807 * 2 }",
-            "f",
-        );
+        let err = compile_expr_err("fn f() -> i64 is pure { 9223372036854775807 * 2 }", "f");
         match err {
             QalaError::IntegerOverflow { op, lhs, rhs, .. } => {
                 assert_eq!(op, BinOp::Mul);
@@ -3253,7 +3330,10 @@ mod tests {
         // CALL operand: fn-id of `add` (0), argc 2.
         let call_off = 6; // two CONSTs (3 bytes each) precede CALL.
         assert_eq!(code[call_off], Opcode::Call as u8);
-        assert_eq!(u16::from_le_bytes([code[call_off + 1], code[call_off + 2]]), 0);
+        assert_eq!(
+            u16::from_le_bytes([code[call_off + 1], code[call_off + 2]]),
+            0
+        );
         assert_eq!(code[call_off + 3], 2);
     }
 
@@ -3264,10 +3344,7 @@ mod tests {
         assert_eq!(opcodes(&code), vec![Opcode::Const, Opcode::Call]);
         // the CALL fn-id is println's stdlib id (STDLIB_FN_BASE + 1).
         assert_eq!(code[3], Opcode::Call as u8);
-        assert_eq!(
-            u16::from_le_bytes([code[4], code[5]]),
-            STDLIB_FN_BASE + 1
-        );
+        assert_eq!(u16::from_le_bytes([code[4], code[5]]), STDLIB_FN_BASE + 1);
         assert_eq!(code[6], 1);
     }
 
@@ -3382,17 +3459,24 @@ mod tests {
         let (code, _) = compile_expr_of(src, "f");
         assert_eq!(
             opcodes(&code),
-            vec![Opcode::Const, Opcode::GetLocal, Opcode::ToStr, Opcode::ConcatN]
+            vec![
+                Opcode::Const,
+                Opcode::GetLocal,
+                Opcode::ToStr,
+                Opcode::ConcatN
+            ]
         );
     }
 
     // Test 6: an all-literal "interpolation" folds to a single CONST.
     #[test]
     fn compile_expr_all_literal_string_is_one_const() {
-        let (code, consts) =
-            compile_expr_of("fn f() -> str is pure { \"hello, world!\" }", "f");
+        let (code, consts) = compile_expr_of("fn f() -> str is pure { \"hello, world!\" }", "f");
         assert_eq!(opcodes(&code), vec![Opcode::Const]);
-        assert_eq!(consts.last(), Some(&ConstValue::Str("hello, world!".to_string())));
+        assert_eq!(
+            consts.last(),
+            Some(&ConstValue::Str("hello, world!".to_string()))
+        );
     }
 
     // Test 7: `?` propagation emits MATCH_VARIANT + RETURN. it does NOT DUP --
@@ -3405,8 +3489,14 @@ mod tests {
         let p = compile_ok(src);
         let f_id = p.fn_names.iter().position(|n| n == "f").unwrap();
         let ops = opcodes(&p.chunks[f_id].code);
-        assert!(ops.contains(&Opcode::MatchVariant), "try should MATCH_VARIANT");
-        assert!(ops.contains(&Opcode::Return), "try should RETURN on the err path");
+        assert!(
+            ops.contains(&Opcode::MatchVariant),
+            "try should MATCH_VARIANT"
+        );
+        assert!(
+            ops.contains(&Opcode::Return),
+            "try should RETURN on the err path"
+        );
     }
 
     // Test 8: `or` fallback emits MATCH_VARIANT + the fallback. like `?`, no
@@ -3579,7 +3669,10 @@ mod tests {
         let ops = opcodes(&code);
         // the literal arm uses DUP + CONST + EQ; the wildcard uses POP.
         assert!(ops.contains(&Opcode::Eq), "literal arm should test via EQ");
-        assert!(ops.contains(&Opcode::Pop), "wildcard arm should POP scrutinee");
+        assert!(
+            ops.contains(&Opcode::Pop),
+            "wildcard arm should POP scrutinee"
+        );
     }
 
     // Test 19: a match with guards (the classify example shape) compiles.
@@ -3595,7 +3688,10 @@ mod tests {
         let (code, _) = compile_expr_of(src, "classify");
         let ops = opcodes(&code);
         // each guard compiles to a comparison + JUMP_IF_FALSE.
-        assert!(ops.contains(&Opcode::JumpIfFalse), "guards emit JUMP_IF_FALSE");
+        assert!(
+            ops.contains(&Opcode::JumpIfFalse),
+            "guards emit JUMP_IF_FALSE"
+        );
         assert!(!code.is_empty());
     }
 
@@ -3698,7 +3794,10 @@ mod tests {
     // indexed-walk pattern (LEN + LT + INDEX).
     #[test]
     fn stmt_for_emits_indexed_walk() {
-        let ops = fn_ops("fn main() is io { for i in 0..3 { println(\"{i}\") } }", "main");
+        let ops = fn_ops(
+            "fn main() is io { for i in 0..3 { println(\"{i}\") } }",
+            "main",
+        );
         assert!(ops.contains(&Opcode::MakeArray), "the range materializes");
         assert!(ops.contains(&Opcode::Len), "the bounds check uses LEN");
         assert!(ops.contains(&Opcode::Index), "the element load uses INDEX");
@@ -3812,7 +3911,10 @@ mod tests {
             }
             off += 1 + op.operand_bytes() as usize;
         }
-        assert!(cleanup_calls >= 1, "the per-iteration defer body is emitted");
+        assert!(
+            cleanup_calls >= 1,
+            "the per-iteration defer body is emitted"
+        );
     }
 
     // Test 15: DCE -- statements after a `return` are not compiled. a void
@@ -3839,7 +3941,10 @@ mod tests {
         let code = &p.chunks[main_id].code;
         let ops = opcodes(code);
         // no JUMP_IF_FALSE -- the constant condition was eliminated.
-        assert!(!ops.contains(&Opcode::JumpIfFalse), "constant if needs no jump");
+        assert!(
+            !ops.contains(&Opcode::JumpIfFalse),
+            "constant if needs no jump"
+        );
         // do_a is called, do_b is not.
         let mut calls = Vec::new();
         let mut off = 0;
@@ -3885,7 +3990,10 @@ mod tests {
                    fn do_b() is io { }\n\
                    fn main(x: i64) is io { if x > 0 { do_a() } else { do_b() } }";
         let ops = fn_ops(src, "main");
-        assert!(ops.contains(&Opcode::JumpIfFalse), "runtime if keeps its jump");
+        assert!(
+            ops.contains(&Opcode::JumpIfFalse),
+            "runtime if keeps its jump"
+        );
     }
 
     // Test 19: the six bundled examples each compile to non-empty bytecode.
@@ -3903,10 +4011,9 @@ mod tests {
                 "{}/../../playground/public/examples/{name}.qala",
                 env!("CARGO_MANIFEST_DIR"),
             );
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
-            let tokens = Lexer::tokenize(&src)
-                .unwrap_or_else(|e| panic!("{name}.qala: lex error: {e:?}"));
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let tokens =
+                Lexer::tokenize(&src).unwrap_or_else(|e| panic!("{name}.qala: lex error: {e:?}"));
             let ast = Parser::parse(&tokens)
                 .unwrap_or_else(|e| panic!("{name}.qala: parse error: {e:?}"));
             let (typed, terrors, _) = check_program(&ast, &src);
@@ -3929,10 +4036,7 @@ mod tests {
                 );
             }
             let disassembly = program.disassemble();
-            assert!(
-                !disassembly.is_empty(),
-                "{name}.qala: disassembly is empty"
-            );
+            assert!(!disassembly.is_empty(), "{name}.qala: disassembly is empty");
         }
     }
 
@@ -4085,7 +4189,11 @@ mod tests {
     fn comptime_string_result() {
         let src = "fn f() -> str is pure { comptime { \"hello\" } }";
         let p = compile_ok(src);
-        assert!(p.chunks[0].constants.contains(&ConstValue::Str("hello".to_string())));
+        assert!(
+            p.chunks[0]
+                .constants
+                .contains(&ConstValue::Str("hello".to_string()))
+        );
     }
 
     // Test 3: `comptime { let x = 2; x * x }` evaluates to I64(4).
@@ -4163,7 +4271,9 @@ mod tests {
         ]);
         let mut interp = ComptimeInterpreter::new(&program, &effects, Span::new(3, 1));
         match interp.run(body) {
-            Err(QalaError::ComptimeEffectViolation { fn_name, effect, .. }) => {
+            Err(QalaError::ComptimeEffectViolation {
+                fn_name, effect, ..
+            }) => {
                 assert_eq!(fn_name, "do_io");
                 assert_eq!(effect, "io");
             }
@@ -4332,7 +4442,10 @@ mod tests {
         let id = p.fn_names.iter().position(|n| n == "main").unwrap();
         let names = &p.chunks[id].local_names;
         // the loop variable `n` and the body `let doubled` are real names.
-        assert!(names.iter().any(|n| n == "n"), "the for variable `n` is named");
+        assert!(
+            names.iter().any(|n| n == "n"),
+            "the for variable `n` is named"
+        );
         assert!(
             names.iter().any(|n| n == "doubled"),
             "the body `let doubled` is named"

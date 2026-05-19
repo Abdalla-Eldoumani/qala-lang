@@ -86,7 +86,11 @@ impl Arm64Backend {
             }
             TypedExpr::Bool { value, .. } => {
                 // a bool is 1 (true) or 0 (false) in x0.
-                self.asm.emit_insn(if *value { "mov     x0, 1" } else { "mov     x0, 0" });
+                self.asm.emit_insn(if *value {
+                    "mov     x0, 1"
+                } else {
+                    "mov     x0, 0"
+                });
                 Ok(())
             }
             TypedExpr::Ident { name, span, .. } => {
@@ -115,9 +119,9 @@ impl Arm64Backend {
             // scope-aware version in stmt.rs).
             TypedExpr::Block { block, .. } => self.compile_block(block),
             // a call to a user function: AAPCS64 argument passing and a bl.
-            TypedExpr::Call { callee, args, span, .. } => {
-                self.compile_call(callee, args, *span)
-            }
+            TypedExpr::Call {
+                callee, args, span, ..
+            } => self.compile_call(callee, args, *span),
             // a Range only appears as a `for` iterable -- `stmt.rs`'s For arm
             // matches it directly. a Range reaching `compile_expr` is a Range
             // used as a value, which the integer core does not support.
@@ -334,8 +338,7 @@ impl Arm64Backend {
             _ => {
                 return Err(QalaError::Type {
                     span,
-                    message: "the arm64 backend does not yet support computed callees"
-                        .to_string(),
+                    message: "the arm64 backend does not yet support computed callees".to_string(),
                 });
             }
         };
@@ -357,9 +360,7 @@ impl Arm64Backend {
             // beyond v2's integer slice, so reject it cleanly.
             return Err(QalaError::Type {
                 span,
-                message: format!(
-                    "the arm64 backend does not yet support the `{name}` function"
-                ),
+                message: format!("the arm64 backend does not yet support the `{name}` function"),
             });
         }
         // at most eight arguments -- AAPCS64 passes the rest on the stack,
@@ -393,10 +394,8 @@ impl Arm64Backend {
             self.compile_expr(arg)?;
             // now claim this argument's persistent slot and spill x0 into it.
             let slot = self.frame_mut().claim_scratch();
-            self.asm.emit_insn_commented(
-                &format!("str     x0, [fp, {slot}]"),
-                &format!("arg {i}"),
-            );
+            self.asm
+                .emit_insn_commented(&format!("str     x0, [fp, {slot}]"), &format!("arg {i}"));
             arg_offsets.push(slot);
         }
         // every argument is now in a slot -- load them into x0..x{n-1}.
@@ -513,8 +512,10 @@ fn unsupported_expr_name(expr: &TypedExpr) -> &'static str {
         | TypedExpr::Binary { .. }
         | TypedExpr::Block { .. }
         | TypedExpr::Call { .. }
-        | TypedExpr::Range { .. } => "this construct (arm64 backend bug: a \
-            supported expression reached the unsupported-construct path)",
+        | TypedExpr::Range { .. } => {
+            "this construct (arm64 backend bug: a \
+            supported expression reached the unsupported-construct path)"
+        }
     }
 }
 
@@ -613,7 +614,10 @@ mod tests {
             asm.contains(&format!("ldr     x0, ={}", i64::MAX)),
             "the i64::MAX magnitude must use the literal pool: {asm}"
         );
-        assert!(asm.contains("neg     x0, x0"), "the unary minus must negate: {asm}");
+        assert!(
+            asm.contains("neg     x0, x0"),
+            "the unary minus must negate: {asm}"
+        );
     }
 
     #[test]
@@ -661,8 +665,14 @@ mod tests {
     #[test]
     fn modulo_emits_the_sdiv_msub_idiom() {
         let asm = emit_expr("fn f() -> i64 { 9 % 4 }", "f");
-        assert!(asm.contains("sdiv    x10, x9, x0"), "missing quotient: {asm}");
-        assert!(asm.contains("msub    x0, x10, x0, x9"), "missing msub: {asm}");
+        assert!(
+            asm.contains("sdiv    x10, x9, x0"),
+            "missing quotient: {asm}"
+        );
+        assert!(
+            asm.contains("msub    x0, x10, x0, x9"),
+            "missing msub: {asm}"
+        );
     }
 
     #[test]
@@ -676,7 +686,10 @@ mod tests {
             ("fn f() -> bool { 1 >= 2 }", "cset    x0, ge"),
         ] {
             let asm = emit_expr(src, "f");
-            assert!(asm.contains("cmp     x9, x0"), "missing cmp for {src}: {asm}");
+            assert!(
+                asm.contains("cmp     x9, x0"),
+                "missing cmp for {src}: {asm}"
+            );
             assert!(asm.contains(cond), "missing `{cond}` for {src}: {asm}");
         }
     }
@@ -695,7 +708,10 @@ mod tests {
         let asm = emit_expr("fn f() -> bool { true && false }", "f");
         assert!(asm.contains(".Land_false_"), "missing settle label: {asm}");
         assert!(asm.contains(".Land_done_"), "missing done label: {asm}");
-        assert!(asm.contains("cbz "), "&& must short-circuit with cbz: {asm}");
+        assert!(
+            asm.contains("cbz "),
+            "&& must short-circuit with cbz: {asm}"
+        );
     }
 
     #[test]
@@ -703,7 +719,10 @@ mod tests {
         let asm = emit_expr("fn f() -> bool { true || false }", "f");
         assert!(asm.contains(".Lor_true_"), "missing settle label: {asm}");
         assert!(asm.contains(".Lor_done_"), "missing done label: {asm}");
-        assert!(asm.contains("cbnz"), "|| must short-circuit with cbnz: {asm}");
+        assert!(
+            asm.contains("cbnz"),
+            "|| must short-circuit with cbnz: {asm}"
+        );
     }
 
     #[test]
@@ -763,8 +782,7 @@ mod tests {
         let ast = Parser::parse(&tokens).expect("parse failed");
         let (typed, terrors, _) = check_program(&ast, src);
         assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
-        super::super::compile_arm64(&typed, src)
-            .unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
+        super::super::compile_arm64(&typed, src).unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
     }
 
     /// the instruction lines of `caller`'s emitted function body -- the lines
@@ -790,9 +808,18 @@ mod tests {
         let spills = body.lines().filter(|l| l.contains("// arg ")).count();
         assert_eq!(spills, 3, "three arguments -> three spills: {body}");
         // the loads into the AAPCS64 argument registers.
-        assert!(body.contains("ldr     x0, [fp, "), "missing x0 load: {body}");
-        assert!(body.contains("ldr     x1, [fp, "), "missing x1 load: {body}");
-        assert!(body.contains("ldr     x2, [fp, "), "missing x2 load: {body}");
+        assert!(
+            body.contains("ldr     x0, [fp, "),
+            "missing x0 load: {body}"
+        );
+        assert!(
+            body.contains("ldr     x1, [fp, "),
+            "missing x1 load: {body}"
+        );
+        assert!(
+            body.contains("ldr     x2, [fp, "),
+            "missing x2 load: {body}"
+        );
         assert!(body.contains("bl      add3"), "missing the bl: {body}");
     }
 
@@ -828,7 +855,10 @@ mod tests {
         );
         let body = caller_body(&asm).join("\n");
         assert!(body.contains("bl      answer"), "missing the bl: {body}");
-        assert!(!body.contains("// arg "), "a no-arg call spills nothing: {body}");
+        assert!(
+            !body.contains("// arg "),
+            "a no-arg call spills nothing: {body}"
+        );
     }
 
     #[test]
@@ -851,7 +881,10 @@ mod tests {
             .iter()
             .position(|l| l.contains("bl      outer"))
             .expect("missing bl outer");
-        assert!(inner_bl < outer_bl, "the inner call must run first: {body:?}");
+        assert!(
+            inner_bl < outer_bl,
+            "the inner call must run first: {body:?}"
+        );
         // every argument spill: the inner call's own argument (5) spills
         // BEFORE `bl inner`; the outer call's argument -- the inner call's x0
         // result -- spills AFTER `bl inner`. the FIRST spill after `bl inner`
@@ -860,9 +893,7 @@ mod tests {
             .iter()
             .enumerate()
             .find(|(idx, l)| {
-                *idx > inner_bl
-                    && l.contains("str     x0, [fp, ")
-                    && l.contains("// arg ")
+                *idx > inner_bl && l.contains("str     x0, [fp, ") && l.contains("// arg ")
             })
             .map(|(idx, _)| idx)
             .expect("missing the outer-call argument spill after bl inner");
@@ -884,8 +915,8 @@ mod tests {
         let ast = Parser::parse(&tokens).expect("parse failed");
         let (typed, terrors, _) = check_program(&ast, src);
         assert!(terrors.is_empty(), "typecheck errors: {terrors:?}");
-        let err = super::super::compile_arm64(&typed, src)
-            .expect_err("a stdlib call must be rejected");
+        let err =
+            super::super::compile_arm64(&typed, src).expect_err("a stdlib call must be rejected");
         assert!(
             err[0].message().contains("abs"),
             "message: {:?}",
@@ -1028,7 +1059,9 @@ mod tests {
         // and the inner call genuinely runs in between -- the test would be
         // vacuous if `id(7)` were folded away.
         assert!(
-            body[mov_100 + 2..bl_h].iter().any(|l| l.trim() == "bl      id"),
+            body[mov_100 + 2..bl_h]
+                .iter()
+                .any(|l| l.trim() == "bl      id"),
             "the nested `id(7)` call must run between the two outer arguments: {body:?}"
         );
     }

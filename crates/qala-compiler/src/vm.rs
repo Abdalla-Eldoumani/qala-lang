@@ -241,7 +241,11 @@ impl Heap {
     /// as the documented extension point without triggering a compiler warning.
     #[allow(dead_code)]
     pub fn inc(&mut self, slot: u32) {
-        if let Some(s) = self.objects.get_mut(slot as usize).filter(|s| s.refcount > 0) {
+        if let Some(s) = self
+            .objects
+            .get_mut(slot as usize)
+            .filter(|s| s.refcount > 0)
+        {
             s.refcount = s.refcount.saturating_add(1);
         }
     }
@@ -564,7 +568,9 @@ impl Vm {
             .ok()
             .and_then(|f| {
                 let ip = f.ip;
-                self.chunk().ok().and_then(|c| c.source_lines.get(ip).copied())
+                self.chunk()
+                    .ok()
+                    .and_then(|c| c.source_lines.get(ip).copied())
             })
             .unwrap_or(0);
         if line == 0 {
@@ -1055,11 +1061,7 @@ impl Vm {
     /// pulled out of [`Vm::op_compare`] so the kind dispatch is one place. a
     /// pointer is resolved to its heap object before comparison; a kind
     /// mismatch is a [`QalaError::Runtime`].
-    fn compare_values(
-        &self,
-        lhs: Value,
-        rhs: Value,
-    ) -> Result<std::cmp::Ordering, QalaError> {
+    fn compare_values(&self, lhs: Value, rhs: Value) -> Result<std::cmp::Ordering, QalaError> {
         // both bools: order false < true.
         if let (Some(a), Some(b)) = (lhs.as_bool(), rhs.as_bool()) {
             return Ok(a.cmp(&b));
@@ -1338,9 +1340,7 @@ impl Vm {
         // a stdlib fn-id as a callback is not supported in v1: the callbacks
         // map/filter/reduce receive are user functions.
         if fn_id >= STDLIB_FN_BASE {
-            return Err(self.runtime_err(
-                "a stdlib function cannot be used as a callback in v1",
-            ));
+            return Err(self.runtime_err("a stdlib function cannot be used as a callback in v1"));
         }
         let chunk_idx = fn_id as usize;
         if self.program.chunks.get(chunk_idx).is_none() {
@@ -1597,7 +1597,11 @@ impl Vm {
         }
         // a tagged scalar: bool / byte / void / function decode directly.
         if let Some(b) = v.as_bool() {
-            return if b { "true".to_string() } else { "false".to_string() };
+            return if b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            };
         }
         if let Some(b) = v.as_byte() {
             return b.to_string();
@@ -2005,21 +2009,19 @@ impl Vm {
         // returns the error WITHOUT touching `repl_history`.
         let tokens = crate::lexer::Lexer::tokenize(&combined)?;
         let ast = crate::parser::Parser::parse(&tokens)?;
-        let (typed, type_errors, _warnings) =
-            crate::typechecker::check_program(&ast, &combined);
+        let (typed, type_errors, _warnings) = crate::typechecker::check_program(&ast, &combined);
         if let Some(first) = type_errors.into_iter().next() {
             return Err(first);
         }
-        let program = crate::codegen::compile_program(&typed, &combined)
-            .map_err(|errors| {
-                errors
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| QalaError::Runtime {
-                        span: Span::new(0, 0),
-                        message: "codegen failed".to_string(),
-                    })
-            })?;
+        let program = crate::codegen::compile_program(&typed, &combined).map_err(|errors| {
+            errors
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| QalaError::Runtime {
+                    span: Span::new(0, 0),
+                    message: "codegen failed".to_string(),
+                })
+        })?;
 
         // run the freshly built program against a reset executable state --
         // a fresh value stack, a fresh heap, a frame at the entry point --
@@ -2390,7 +2392,10 @@ mod tests {
         let slot = h.alloc(HeapObject::Int(7)).expect("alloc"); // refcount 1
         h.inc(slot); // refcount 2
         // a dec from 2 -> 1 leaves the slot alive and returns None.
-        assert!(h.dec(slot).is_none(), "dec to a positive count returns None");
+        assert!(
+            h.dec(slot).is_none(),
+            "dec to a positive count returns None"
+        );
         assert!(h.get(slot) == Some(&HeapObject::Int(7)), "slot still alive");
     }
 
@@ -2437,7 +2442,10 @@ mod tests {
         // a slot freed once cannot be freed again.
         let slot = h.alloc(HeapObject::Int(1)).expect("alloc");
         assert!(h.dec(slot).is_some(), "first dec frees it");
-        assert!(h.dec(slot).is_none(), "a second dec of a freed slot is None");
+        assert!(
+            h.dec(slot).is_none(),
+            "a second dec of a freed slot is None"
+        );
     }
 
     #[test]
@@ -2447,7 +2455,10 @@ mod tests {
         // free it, then allocate again -- the new object must reuse the slot.
         h.dec(first);
         let reused = h.alloc(HeapObject::Int(2)).expect("alloc reused");
-        assert_eq!(reused, first, "a freed slot index is reused by the next alloc");
+        assert_eq!(
+            reused, first,
+            "a freed slot index is reused by the next alloc"
+        );
         assert!(h.get(reused) == Some(&HeapObject::Int(2)));
     }
 
@@ -3176,7 +3187,11 @@ mod tests {
         vm.step().expect("step the CONST");
         assert_eq!(vm.frame().expect("frame").ip, 3, "ip after CONST is 3");
         vm.step().expect("step the JUMP");
-        assert_eq!(vm.frame().expect("frame").ip, 0, "the backward JUMP lands at 0");
+        assert_eq!(
+            vm.frame().expect("frame").ip,
+            0,
+            "the backward JUMP lands at 0"
+        );
     }
 
     #[test]
@@ -3187,7 +3202,10 @@ mod tests {
         chunk.write_i16(1000, 1); // fall-through 3, target 1003 -- out of range
         match run_chunk(chunk, "x") {
             Err(QalaError::Runtime { message, .. }) => {
-                assert!(message.contains("jump target out of range"), "got: {message}");
+                assert!(
+                    message.contains("jump target out of range"),
+                    "got: {message}"
+                );
             }
             Err(other) => panic!("expected a Runtime jump-out-of-range error, got {other:?}"),
             Ok(_) => panic!("expected a jump-out-of-range error, the program ran clean"),
@@ -3748,7 +3766,11 @@ fn main() -> i64 is pure {
         let mut vm = Vm::new(program_with(Chunk::new()), "x".to_string());
         // tagged scalars.
         assert_eq!(vm.value_to_string(Value::bool(false)), "false");
-        assert_eq!(vm.value_to_string(Value::byte(65)), "65", "a byte is decimal");
+        assert_eq!(
+            vm.value_to_string(Value::byte(65)),
+            "65",
+            "a byte is decimal"
+        );
         assert_eq!(vm.value_to_string(Value::void()), "()");
         assert_eq!(vm.value_to_string(Value::function(7)), "fn#7");
         assert_eq!(vm.value_to_string(Value::from_f64(2.0)), "2");
@@ -3910,7 +3932,11 @@ fn main() -> i64 is pure {
         vm.run().expect("match_variant miss");
         // a miss left the scrutinee and branched past the CONST 777, so the
         // stack holds exactly the one scrutinee pointer.
-        assert_eq!(vm.stack.len(), 1, "the scrutinee stays, the CONST was skipped");
+        assert_eq!(
+            vm.stack.len(),
+            1,
+            "the scrutinee stays, the CONST was skipped"
+        );
         let top = *vm.stack.last().expect("the scrutinee");
         let slot = top.as_pointer().expect("the scrutinee is an enum pointer");
         assert!(
@@ -3972,7 +3998,9 @@ fn main() -> i64 is pure { return run() }
         let mut call_ids: Vec<u16> = Vec::new();
         let mut ip = 0;
         while ip < code.len() {
-            let Some(op) = Opcode::from_u8(code[ip]) else { break };
+            let Some(op) = Opcode::from_u8(code[ip]) else {
+                break;
+            };
             if op == Opcode::Call {
                 call_ids.push(u16::from_le_bytes([code[ip + 1], code[ip + 2]]));
             }
@@ -3988,7 +4016,11 @@ fn main() -> i64 is pure { return run() }
         // and the VM runs the whole program (defer bytecode included) clean.
         let mut vm = Vm::new(program, src.to_string());
         vm.run().expect("the program with two defers runs clean");
-        assert_eq!(program_result_i64(&vm), 0, "run returns 0; the defers ran for effect");
+        assert_eq!(
+            program_result_i64(&vm),
+            0,
+            "run returns 0; the defers ran for effect"
+        );
     }
 
     // ---- get_state + single-step inspection ----
@@ -4139,7 +4171,10 @@ fn main() -> i64 is pure { return run() }
         vm.run().expect("the program runs clean");
         // after run() the frame stack is empty; get_state handles it.
         let state = vm.get_state();
-        assert!(state.variables.is_empty(), "a finished program has no frame");
+        assert!(
+            state.variables.is_empty(),
+            "a finished program has no frame"
+        );
         // the result value (42) is still on the stack -- get_state shows it.
         assert!(
             state.stack.iter().any(|s| s.rendered == "42"),
@@ -4256,7 +4291,10 @@ fn main() -> i64 is pure {
         let s = vm.heap.alloc(HeapObject::Str("k".to_string())).expect("s");
         let tup = vm
             .heap
-            .alloc(HeapObject::Tuple(vec![Value::pointer(int_slot), Value::pointer(s)]))
+            .alloc(HeapObject::Tuple(vec![
+                Value::pointer(int_slot),
+                Value::pointer(s),
+            ]))
             .expect("alloc tuple");
         assert_eq!(vm.runtime_type_name(Value::pointer(tup)), "(i64, str)");
     }
@@ -4332,10 +4370,10 @@ fn main() -> i64 is pure {
         // helpers produce. evaluate `let x = 5` then `x + 1` -- the result is
         // the i64 6, which renders as ("6", "i64").
         let mut vm = Vm::new_repl();
-        vm.repl_eval ("let x = 5")
+        vm.repl_eval("let x = 5")
             .expect("the let binding compiles and runs");
         let result = vm
-            .repl_eval ("x + 1")
+            .repl_eval("x + 1")
             .expect("the expression sees the prior binding");
         let (display, type_name) = vm.render_value(result);
         assert_eq!(display, "6", "x (5) + 1 displays as 6");
@@ -4352,12 +4390,15 @@ fn main() -> i64 is pure {
         // a first call establishes a binding and a real program.
         vm.repl_eval("let x = 1").expect("first call");
         // a real println REPL line: the native stdlib writes the console.
-        vm.repl_eval("println(\"output one\")").expect("println call");
+        vm.repl_eval("println(\"output one\")")
+            .expect("println call");
         // a later REPL call rebuilds and re-runs the whole accumulated program.
         vm.repl_eval("let y = 2").expect("a later call");
         // the console entry from before the later call survived it.
         assert!(
-            vm.console.iter().any(|line| line.trim_end_matches('\n') == "output one"),
+            vm.console
+                .iter()
+                .any(|line| line.trim_end_matches('\n') == "output one"),
             "a repl call must not clear the console -- output accumulates"
         );
     }
@@ -4368,7 +4409,8 @@ fn main() -> i64 is pure {
         // the history -- a SUBSEQUENT valid line that uses an earlier binding
         // still succeeds.
         let mut vm = Vm::new_repl();
-        vm.repl_eval("let x = 10").expect("the first binding is fine");
+        vm.repl_eval("let x = 10")
+            .expect("the first binding is fine");
         // a line referencing an undefined name: a typecheck error.
         match vm.repl_eval("let bad = no_such_name") {
             Err(_) => {} // expected -- the bad line is rejected.
@@ -4396,7 +4438,9 @@ fn main() -> i64 is pure {
             Ok(_) => panic!("a malformed line must not compile"),
         }
         // a later valid line still sees `a`.
-        let r = vm.repl_eval("a").expect("the binding survives the parse error");
+        let r = vm
+            .repl_eval("a")
+            .expect("the binding survives the parse error");
         assert_eq!(repl_result_i64(&vm, r), 7);
     }
 
@@ -4462,7 +4506,9 @@ fn main() -> i64 is pure {
         let mut vm = Vm::new(program, src.to_string());
         vm.run().expect("a program that calls println runs clean");
         assert!(
-            vm.console.iter().any(|line| line.trim_end_matches('\n') == "hi from qala"),
+            vm.console
+                .iter()
+                .any(|line| line.trim_end_matches('\n') == "hi from qala"),
             "println wrote its argument to the console, got: {:?}",
             vm.console
         );
@@ -4487,7 +4533,8 @@ fn main() -> i64 is pure {
         let src = "fn main() is io {\n    let f = open(\"data.txt\")\n}\n";
         let program = compile_qala(src);
         let mut vm = Vm::new(program, src.to_string());
-        vm.run().expect("the program itself runs clean -- a leak is not an error");
+        vm.run()
+            .expect("the program itself runs clean -- a leak is not an error");
         assert!(
             !vm.leak_log.is_empty(),
             "an open handle dropped without close must be logged as a leak"

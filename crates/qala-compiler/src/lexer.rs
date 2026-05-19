@@ -97,8 +97,10 @@ impl<'src> Lexer<'src> {
                 // token -- an interpolated one is several.
                 Some(b'"') => {
                     lx.pos += 1; // consume the opening quote
-                    lx.mode_stack
-                        .push(Mode::StrText { open_quote: start, saw_interp: false });
+                    lx.mode_stack.push(Mode::StrText {
+                        open_quote: start,
+                        saw_interp: false,
+                    });
                 }
                 Some(b) => {
                     let kind = lx.scan_token(b, start)?;
@@ -186,27 +188,67 @@ impl<'src> Lexer<'src> {
             return self.scan_number(start);
         }
         // a brace while an interpolation is on top does brace-depth bookkeeping.
-        if (b == b'{' || b == b'}')
-            && matches!(self.mode_stack.last(), Some(Mode::Interp { .. }))
-        {
+        if (b == b'{' || b == b'}') && matches!(self.mode_stack.last(), Some(Mode::Interp { .. })) {
             return Ok(self.scan_brace_in_interp(b));
         }
         match b {
-            b'(' => { self.pos += 1; Ok(TokenKind::LParen) }
-            b')' => { self.pos += 1; Ok(TokenKind::RParen) }
-            b'[' => { self.pos += 1; Ok(TokenKind::LBracket) }
-            b']' => { self.pos += 1; Ok(TokenKind::RBracket) }
-            b'{' => { self.pos += 1; Ok(TokenKind::LBrace) }
-            b'}' => { self.pos += 1; Ok(TokenKind::RBrace) }
-            b',' => { self.pos += 1; Ok(TokenKind::Comma) }
-            b':' => { self.pos += 1; Ok(TokenKind::Colon) }
-            b';' => { self.pos += 1; Ok(TokenKind::Semi) }
-            b'+' => { self.pos += 1; Ok(TokenKind::Plus) }
-            b'*' => { self.pos += 1; Ok(TokenKind::Star) }
-            b'%' => { self.pos += 1; Ok(TokenKind::Percent) }
-            b'?' => { self.pos += 1; Ok(TokenKind::Question) }
+            b'(' => {
+                self.pos += 1;
+                Ok(TokenKind::LParen)
+            }
+            b')' => {
+                self.pos += 1;
+                Ok(TokenKind::RParen)
+            }
+            b'[' => {
+                self.pos += 1;
+                Ok(TokenKind::LBracket)
+            }
+            b']' => {
+                self.pos += 1;
+                Ok(TokenKind::RBracket)
+            }
+            b'{' => {
+                self.pos += 1;
+                Ok(TokenKind::LBrace)
+            }
+            b'}' => {
+                self.pos += 1;
+                Ok(TokenKind::RBrace)
+            }
+            b',' => {
+                self.pos += 1;
+                Ok(TokenKind::Comma)
+            }
+            b':' => {
+                self.pos += 1;
+                Ok(TokenKind::Colon)
+            }
+            b';' => {
+                self.pos += 1;
+                Ok(TokenKind::Semi)
+            }
+            b'+' => {
+                self.pos += 1;
+                Ok(TokenKind::Plus)
+            }
+            b'*' => {
+                self.pos += 1;
+                Ok(TokenKind::Star)
+            }
+            b'%' => {
+                self.pos += 1;
+                Ok(TokenKind::Percent)
+            }
+            b'?' => {
+                self.pos += 1;
+                Ok(TokenKind::Question)
+            }
             // `/` here is always division: `//` was consumed by skip_trivia.
-            b'/' => { self.pos += 1; Ok(TokenKind::Slash) }
+            b'/' => {
+                self.pos += 1;
+                Ok(TokenKind::Slash)
+            }
             // `.` `..` `..=` -- never the start of a float (a number only starts
             // on a digit), so this is unambiguous.
             b'.' => {
@@ -235,8 +277,14 @@ impl<'src> Lexer<'src> {
             b'=' => {
                 self.pos += 1;
                 match self.peek() {
-                    Some(b'=') => { self.pos += 1; Ok(TokenKind::EqEq) }
-                    Some(b'>') => { self.pos += 1; Ok(TokenKind::FatArrow) }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Ok(TokenKind::EqEq)
+                    }
+                    Some(b'>') => {
+                        self.pos += 1;
+                        Ok(TokenKind::FatArrow)
+                    }
                     _ => Ok(TokenKind::Eq),
                 }
             }
@@ -282,8 +330,14 @@ impl<'src> Lexer<'src> {
             // `||` and `|>` are the only `|` forms; a lone `|` is rejected (no
             // bitwise `|`, no pattern alternatives in v1).
             b'|' => match self.peek2() {
-                Some(b'|') => { self.pos += 2; Ok(TokenKind::PipePipe) }
-                Some(b'>') => { self.pos += 2; Ok(TokenKind::PipeGt) }
+                Some(b'|') => {
+                    self.pos += 2;
+                    Ok(TokenKind::PipePipe)
+                }
+                Some(b'>') => {
+                    self.pos += 2;
+                    Ok(TokenKind::PipeGt)
+                }
                 _ => {
                     let span = Span::new(start, 1);
                     self.pos += 1;
@@ -305,7 +359,10 @@ impl<'src> Lexer<'src> {
             _ => {
                 let span = Span::new(start, 1);
                 self.pos += 1;
-                Err(QalaError::UnexpectedChar { span, ch: b as char })
+                Err(QalaError::UnexpectedChar {
+                    span,
+                    ch: b as char,
+                })
             }
         }
     }
@@ -426,14 +483,20 @@ impl<'src> Lexer<'src> {
         // also reject a trailing alphanumeric like `0xG` or `0b2`: such a byte
         // right after the body is the user's mistake, not the start of a new
         // identifier. consume the whole offending tail so the error span covers it.
-        if self.peek().is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
+        if self
+            .peek()
+            .is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric())
+        {
             self.consume_alnum_tail();
             malformed = true;
         }
         if malformed || !saw_digit || last_was_underscore {
             return Err(self.malformed_number(start));
         }
-        let digits: String = self.src[body_start..self.pos].chars().filter(|&c| c != '_').collect();
+        let digits: String = self.src[body_start..self.pos]
+            .chars()
+            .filter(|&c| c != '_')
+            .collect();
         match i64::from_str_radix(&digits, radix) {
             Ok(value) => Ok(TokenKind::Int(value)),
             Err(e) => Err(self.int_parse_error(start, e.kind())),
@@ -494,12 +557,18 @@ impl<'src> Lexer<'src> {
 
         // a stray alphanumeric byte right after the literal (`1abc`, `0x` after a
         // decimal, ...) is the user's mistake, not the start of a new token.
-        if self.peek().is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric()) {
+        if self
+            .peek()
+            .is_some_and(|b| b == b'_' || b.is_ascii_alphanumeric())
+        {
             self.consume_alnum_tail();
             return Err(self.malformed_number(start));
         }
 
-        let text: String = self.src[start..self.pos].chars().filter(|&c| c != '_').collect();
+        let text: String = self.src[start..self.pos]
+            .chars()
+            .filter(|&c| c != '_')
+            .collect();
         if is_float {
             match text.parse::<f64>() {
                 Ok(value) => Ok(TokenKind::Float(value)),
@@ -583,11 +652,9 @@ impl<'src> Lexer<'src> {
     /// magnitude) -> [`QalaError::IntOverflow`]; anything else -> malformed.
     fn int_parse_error(&self, literal_start: usize, kind: &IntErrorKind) -> QalaError {
         match kind {
-            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
-                QalaError::IntOverflow {
-                    span: Span::new(literal_start, self.pos - literal_start),
-                }
-            }
+            IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => QalaError::IntOverflow {
+                span: Span::new(literal_start, self.pos - literal_start),
+            },
             _ => self.malformed_number(literal_start),
         }
     }
@@ -606,7 +673,9 @@ impl<'src> Lexer<'src> {
             // empty: `b''`.
             Some(b'\'') => {
                 self.pos += 1;
-                return Err(self.bad_byte_literal(start, "expected one character between `b'` and `'`"));
+                return Err(
+                    self.bad_byte_literal(start, "expected one character between `b'` and `'`")
+                );
             }
             // an escape: `b'\X'`.
             Some(b'\\') => {
@@ -635,7 +704,9 @@ impl<'src> Lexer<'src> {
                 if self.peek() == Some(b'\'') {
                     self.pos += 1;
                 }
-                return Err(self.bad_byte_literal(start, "byte literal must be a single ASCII character"));
+                return Err(
+                    self.bad_byte_literal(start, "byte literal must be a single ASCII character")
+                );
             }
             // a raw newline or EOF before any content.
             Some(b'\n') | None => {
@@ -710,7 +781,10 @@ impl<'src> Lexer<'src> {
         // unterminated-string span; `saw_interp` decides Str-vs-StrEnd and
         // StrStart-vs-StrMid.
         let (open_quote, saw_interp) = match self.mode_stack.last() {
-            Some(Mode::StrText { open_quote, saw_interp }) => (*open_quote, *saw_interp),
+            Some(Mode::StrText {
+                open_quote,
+                saw_interp,
+            }) => (*open_quote, *saw_interp),
             _ => return Ok(()), // not in a string; nothing to do
         };
         let text_start = self.pos;
@@ -756,7 +830,10 @@ impl<'src> Lexer<'src> {
                     // emit the InterpStart for the `{` and enter Interp mode.
                     self.pos += 1; // consume the `{`
                     out.push(Token::new(TokenKind::InterpStart, Span::new(brace_pos, 1)));
-                    self.mode_stack.push(Mode::Interp { brace_depth: 0, open_brace: brace_pos });
+                    self.mode_stack.push(Mode::Interp {
+                        brace_depth: 0,
+                        open_brace: brace_pos,
+                    });
                     return Ok(());
                 }
                 // backslash: an escape sequence.
@@ -851,9 +928,9 @@ impl<'src> Lexer<'src> {
     /// at the `{`. the `StrText` arm is a defensive backstop.
     fn unterminated_at_eof(&self) -> Option<QalaError> {
         match self.mode_stack.last() {
-            Some(Mode::StrText { open_quote, .. }) => {
-                Some(QalaError::UnterminatedString { span: Span::new(*open_quote, 1) })
-            }
+            Some(Mode::StrText { open_quote, .. }) => Some(QalaError::UnterminatedString {
+                span: Span::new(*open_quote, 1),
+            }),
             Some(Mode::Interp { open_brace, .. }) => Some(QalaError::UnterminatedInterpolation {
                 span: Span::new(*open_brace, 1),
             }),
@@ -966,7 +1043,11 @@ mod tests {
             ("self", TokenKind::SelfKw),
         ];
         for (src, kind) in cases {
-            assert_eq!(kinds(src), vec![kind.clone(), TokenKind::Eof], "keyword {src:?}");
+            assert_eq!(
+                kinds(src),
+                vec![kind.clone(), TokenKind::Eof],
+                "keyword {src:?}"
+            );
         }
     }
 
@@ -989,8 +1070,8 @@ mod tests {
     #[test]
     fn stdlib_and_result_family_names_lex_as_identifiers() {
         for name in [
-            "Result", "Option", "Ok", "Err", "Some", "None", "println", "open", "map",
-            "filter", "reduce", "print", "len", "push", "pop", "sqrt", "abs", "assert",
+            "Result", "Option", "Ok", "Err", "Some", "None", "println", "open", "map", "filter",
+            "reduce", "print", "len", "push", "pop", "sqrt", "abs", "assert",
         ] {
             assert_eq!(
                 kinds(name),
@@ -1025,7 +1106,11 @@ mod tests {
             ("?", TokenKind::Question),
         ];
         for (src, kind) in cases {
-            assert_eq!(kinds(src), vec![kind.clone(), TokenKind::Eof], "operator {src:?}");
+            assert_eq!(
+                kinds(src),
+                vec![kind.clone(), TokenKind::Eof],
+                "operator {src:?}"
+            );
         }
     }
 
@@ -1045,7 +1130,11 @@ mod tests {
             ("||", TokenKind::PipePipe),
         ];
         for (src, kind) in cases {
-            assert_eq!(kinds(src), vec![kind.clone(), TokenKind::Eof], "operator {src:?}");
+            assert_eq!(
+                kinds(src),
+                vec![kind.clone(), TokenKind::Eof],
+                "operator {src:?}"
+            );
         }
         // `a -> b` is Ident, Arrow, Ident -- not Minus, Gt.
         assert_eq!(
@@ -1083,7 +1172,11 @@ mod tests {
         // a lone `/` is Slash; there are no block comments.
         assert_eq!(
             kinds("/x"),
-            vec![TokenKind::Slash, TokenKind::Ident("x".to_string()), TokenKind::Eof]
+            vec![
+                TokenKind::Slash,
+                TokenKind::Ident("x".to_string()),
+                TokenKind::Eof
+            ]
         );
         assert_eq!(
             kinds("a / b"),
@@ -1106,7 +1199,10 @@ mod tests {
             other => panic!("expected UnexpectedChar, got {other:?}"),
         }
         // bare `&` too.
-        assert!(matches!(err("&"), QalaError::UnexpectedChar { ch: '&', .. }));
+        assert!(matches!(
+            err("&"),
+            QalaError::UnexpectedChar { ch: '&', .. }
+        ));
     }
 
     #[test]
@@ -1119,8 +1215,14 @@ mod tests {
             other => panic!("expected UnexpectedChar, got {other:?}"),
         }
         // bare `|` and `|x` (not `||` or `|>`).
-        assert!(matches!(err("|"), QalaError::UnexpectedChar { ch: '|', .. }));
-        assert!(matches!(err("|x"), QalaError::UnexpectedChar { ch: '|', .. }));
+        assert!(matches!(
+            err("|"),
+            QalaError::UnexpectedChar { ch: '|', .. }
+        ));
+        assert!(matches!(
+            err("|x"),
+            QalaError::UnexpectedChar { ch: '|', .. }
+        ));
     }
 
     #[test]
@@ -1172,9 +1274,17 @@ mod tests {
     /// the single kind of a one-token source (plus the trailing Eof).
     fn one(src: &str) -> TokenKind {
         let mut k = kinds(src);
-        assert_eq!(k.last(), Some(&TokenKind::Eof), "stream should end in Eof: {src:?}");
+        assert_eq!(
+            k.last(),
+            Some(&TokenKind::Eof),
+            "stream should end in Eof: {src:?}"
+        );
         k.pop();
-        assert_eq!(k.len(), 1, "expected exactly one token in {src:?}, got {k:?}");
+        assert_eq!(
+            k.len(),
+            1,
+            "expected exactly one token in {src:?}, got {k:?}"
+        );
         k.pop().unwrap()
     }
 
@@ -1220,7 +1330,10 @@ mod tests {
         // overflow inside a larger source still points at the digits.
         match err("let x = 99999999999999999999\n") {
             QalaError::IntOverflow { span } => {
-                assert_eq!(span.slice("let x = 99999999999999999999\n"), "99999999999999999999");
+                assert_eq!(
+                    span.slice("let x = 99999999999999999999\n"),
+                    "99999999999999999999"
+                );
             }
             other => panic!("expected IntOverflow, got {other:?}"),
         }
@@ -1228,9 +1341,10 @@ mod tests {
 
     #[test]
     fn malformed_numbers_span_the_literal() {
-        for src in ["1_", "1__0", "0x", "0xG", "0b2", "1_.0", "1._5", "1e_5", "1e",
-                    "1e+", "1e-", "0b",
-                    "0x_FF", "0b_1", "0xFF_"] {
+        for src in [
+            "1_", "1__0", "0x", "0xG", "0b2", "1_.0", "1._5", "1e_5", "1e", "1e+", "1e-", "0b",
+            "0x_FF", "0b_1", "0xFF_",
+        ] {
             match Lexer::tokenize(src) {
                 Err(QalaError::MalformedNumber { span, .. }) => {
                     assert_eq!(
@@ -1272,11 +1386,21 @@ mod tests {
         );
         assert_eq!(
             kinds("0..5"),
-            vec![TokenKind::Int(0), TokenKind::DotDot, TokenKind::Int(5), TokenKind::Eof]
+            vec![
+                TokenKind::Int(0),
+                TokenKind::DotDot,
+                TokenKind::Int(5),
+                TokenKind::Eof
+            ]
         );
         assert_eq!(
             kinds("0..=5"),
-            vec![TokenKind::Int(0), TokenKind::DotDotEq, TokenKind::Int(5), TokenKind::Eof]
+            vec![
+                TokenKind::Int(0),
+                TokenKind::DotDotEq,
+                TokenKind::Int(5),
+                TokenKind::Eof
+            ]
         );
         assert_eq!(
             kinds("x.0"),
@@ -1290,14 +1414,24 @@ mod tests {
         // the fibonacci example's range.
         assert_eq!(
             kinds("0..15"),
-            vec![TokenKind::Int(0), TokenKind::DotDot, TokenKind::Int(15), TokenKind::Eof]
+            vec![
+                TokenKind::Int(0),
+                TokenKind::DotDot,
+                TokenKind::Int(15),
+                TokenKind::Eof
+            ]
         );
         // `1.0` is still a float -- the `.` here IS followed by a digit.
         assert_eq!(one("1.0"), TokenKind::Float(1.0));
         // `1..2` is a range over integers, not `1.` then `.2`.
         assert_eq!(
             kinds("1..2"),
-            vec![TokenKind::Int(1), TokenKind::DotDot, TokenKind::Int(2), TokenKind::Eof]
+            vec![
+                TokenKind::Int(1),
+                TokenKind::DotDot,
+                TokenKind::Int(2),
+                TokenKind::Eof
+            ]
         );
     }
 
@@ -1336,9 +1470,16 @@ mod tests {
         );
         assert_eq!(
             kinds("b 1"),
-            vec![TokenKind::Ident("b".to_string()), TokenKind::Int(1), TokenKind::Eof]
+            vec![
+                TokenKind::Ident("b".to_string()),
+                TokenKind::Int(1),
+                TokenKind::Eof
+            ]
         );
-        assert_eq!(kinds("b"), vec![TokenKind::Ident("b".to_string()), TokenKind::Eof]);
+        assert_eq!(
+            kinds("b"),
+            vec![TokenKind::Ident("b".to_string()), TokenKind::Eof]
+        );
         // `byte` is still the keyword, not `b` + `yte`.
         assert_eq!(kinds("byte"), vec![TokenKind::ByteTy, TokenKind::Eof]);
     }
@@ -1392,8 +1533,12 @@ mod tests {
 
     /// shorthand for `TokenKind::Str(s.to_string())` and friends, to keep the
     /// expected streams readable.
-    fn s(text: &str) -> TokenKind { TokenKind::Str(text.to_string()) }
-    fn id(text: &str) -> TokenKind { TokenKind::Ident(text.to_string()) }
+    fn s(text: &str) -> TokenKind {
+        TokenKind::Str(text.to_string())
+    }
+    fn id(text: &str) -> TokenKind {
+        TokenKind::Ident(text.to_string())
+    }
 
     #[test]
     fn interpolation_free_strings() {
@@ -1422,7 +1567,10 @@ mod tests {
         assert_eq!(one("\"\\u{41}\""), s("A"));
         assert_eq!(one("\"\\u{1F600}\""), s("\u{1F600}"));
         // a mix: "line1\nline2 \u{2764}" -> "line1", newline, "line2 ", heart.
-        assert_eq!(one("\"line1\\nline2 \\u{2764}\""), s("line1\nline2 \u{2764}"));
+        assert_eq!(
+            one("\"line1\\nline2 \\u{2764}\""),
+            s("line1\nline2 \u{2764}")
+        );
         // escaped braces do NOT open an interpolation.
         assert_eq!(one("\"a \\{not interp\\} b\""), s("a {not interp} b"));
     }
@@ -1437,7 +1585,13 @@ mod tests {
             other => panic!("expected InvalidEscape, got {other:?}"),
         }
         // bad \u{...} forms: empty, out of range, surrogate, no closing brace.
-        for src in ["\"\\u{}\"", "\"\\u{110000}\"", "\"\\u{D800}\"", "\"\\u{41\"", "\"\\uABCD\""] {
+        for src in [
+            "\"\\u{}\"",
+            "\"\\u{110000}\"",
+            "\"\\u{D800}\"",
+            "\"\\u{41\"",
+            "\"\\uABCD\"",
+        ] {
             assert!(
                 matches!(Lexer::tokenize(src), Err(QalaError::InvalidEscape { .. })),
                 "expected InvalidEscape for {src:?}"
@@ -1686,7 +1840,14 @@ mod tests {
         // a smoke test that the token set is complete: every bundled example
         // lexes cleanly. the path is relative to this crate's manifest, so it
         // works regardless of the test runner's cwd; a missing file fails loudly.
-        for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
+        for name in [
+            "hello",
+            "fibonacci",
+            "effects",
+            "pattern-matching",
+            "pipeline",
+            "defer-demo",
+        ] {
             let path = format!(
                 "{}/../../playground/public/examples/{}.qala",
                 env!("CARGO_MANIFEST_DIR"),
@@ -1701,7 +1862,10 @@ mod tests {
                 Some(&TokenKind::Eof),
                 "example {name}.qala should end in Eof"
             );
-            assert!(toks.len() > 1, "example {name}.qala should produce real tokens");
+            assert!(
+                toks.len() > 1,
+                "example {name}.qala should produce real tokens"
+            );
         }
     }
 

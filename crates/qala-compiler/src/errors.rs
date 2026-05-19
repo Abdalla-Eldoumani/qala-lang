@@ -59,19 +59,30 @@ pub enum QalaError {
     /// offending token, or, when `found` is [`TokenKind::Eof`], a zero-width
     /// point just after the last real token. `expected` is the set of token
     /// kinds the parser could have accepted here.
-    UnexpectedToken { span: Span, expected: Vec<TokenKind>, found: TokenKind },
+    UnexpectedToken {
+        span: Span,
+        expected: Vec<TokenKind>,
+        found: TokenKind,
+    },
 
     /// an opening delimiter (`(` / `[` / `{`) was closed by the wrong delimiter
     /// or never closed at all. span = the *opening* delimiter, not the surprising
     /// closer, because the opener is where the reader needs to look. `found` is
     /// the wrong closer, or [`TokenKind::Eof`] if the input ran out first.
-    UnclosedDelimiter { span: Span, opener: TokenKind, found: TokenKind },
+    UnclosedDelimiter {
+        span: Span,
+        opener: TokenKind,
+        found: TokenKind,
+    },
 
     /// the input ended while the parser was still expecting more. span = a
     /// zero-width point immediately after the last valid token (offset = end of
     /// that token, length 0), not `src.len()` unless that is where the last
     /// token ends. `expected` is what would have been legal next.
-    UnexpectedEof { span: Span, expected: Vec<TokenKind> },
+    UnexpectedEof {
+        span: Span,
+        expected: Vec<TokenKind>,
+    },
 
     /// a parse failure that does not fit the structured variants above: the
     /// recursion-depth limit ("expression nests too deeply"), a malformed
@@ -86,14 +97,22 @@ pub enum QalaError {
     /// sub-expression. `expected` and `found` are rendered via
     /// `QalaType::display()` so the wording is always the canonical form (`i64`,
     /// `Result<i64, str>`, `?` for the poison type, and so on).
-    TypeMismatch { span: Span, expected: String, found: String },
+    TypeMismatch {
+        span: Span,
+        expected: String,
+        found: String,
+    },
 
     /// a function declared to return a non-`void` type fell off the end of its
     /// body without producing a value. span = the last expression in the body,
     /// or the closing brace of an empty body, because that is where the missing
     /// value should appear. `expected` is the canonical form of the declared
     /// return type.
-    MissingReturn { span: Span, fn_name: String, expected: String },
+    MissingReturn {
+        span: Span,
+        fn_name: String,
+        expected: String,
+    },
 
     /// a name is used that the type checker cannot resolve to a local, a
     /// parameter, a top-level function, or a stdlib entry. span = the
@@ -120,7 +139,11 @@ pub enum QalaError {
     /// attention belongs). `missing` is alphabetically sorted by the type
     /// checker before this variant is constructed; the message stores the
     /// already-sorted list verbatim so the output is deterministic.
-    NonExhaustiveMatch { span: Span, enum_name: String, missing: Vec<String> },
+    NonExhaustiveMatch {
+        span: Span,
+        enum_name: String,
+        missing: Vec<String>,
+    },
 
     /// a named type used in an interface position does not satisfy the
     /// interface: one or more required methods are missing, and one or more
@@ -179,7 +202,12 @@ pub enum QalaError {
     /// message like `integer overflow: 9223372036854775807 * 2 does not fit
     /// in i64`. comparison and logical [`BinOp`] variants (`Eq`, `Lt`, `&&`,
     /// and the rest) never reach this variant -- those folds cannot overflow.
-    IntegerOverflow { span: Span, op: BinOp, lhs: i64, rhs: i64 },
+    IntegerOverflow {
+        span: Span,
+        op: BinOp,
+        lhs: i64,
+        rhs: i64,
+    },
 
     /// the comptime interpreter exhausted its 100000-instruction budget.
     /// emitted at the originating `comptime { ... }` block, not at the
@@ -197,7 +225,11 @@ pub enum QalaError {
     /// callee name; `effect` is `EffectSet::display()` of the callee's
     /// effect (one of `pure`, `io`, `alloc`, `panic`, or a comma-joined
     /// combo like `io, alloc`).
-    ComptimeEffectViolation { span: Span, fn_name: String, effect: String },
+    ComptimeEffectViolation {
+        span: Span,
+        fn_name: String,
+        effect: String,
+    },
 
     /// the comptime block evaluated successfully but its result is not
     /// representable in the constant pool: an array, a struct, an
@@ -266,9 +298,7 @@ impl QalaError {
     /// host paths and no secrets; there are none in scope at this layer.
     pub fn message(&self) -> String {
         match self {
-            QalaError::UnterminatedString { .. } => {
-                "unterminated string literal".to_string()
-            }
+            QalaError::UnterminatedString { .. } => "unterminated string literal".to_string(),
             QalaError::UnterminatedInterpolation { .. } => {
                 "unterminated interpolation: missing `}`".to_string()
             }
@@ -278,29 +308,44 @@ impl QalaError {
             QalaError::UnexpectedChar { ch, .. } => {
                 format!("unexpected character {ch:?}")
             }
-            QalaError::IntOverflow { .. } => {
-                "integer literal is too large for i64".to_string()
-            }
+            QalaError::IntOverflow { .. } => "integer literal is too large for i64".to_string(),
             QalaError::MalformedNumber { message, .. } => {
                 format!("malformed number literal: {message}")
             }
             QalaError::BadByteLiteral { message, .. } => {
                 format!("malformed byte literal: {message}")
             }
-            QalaError::UnexpectedToken { expected, found, .. } => {
-                format!("expected {}, found {}", expected_list(expected), display_kind(found))
+            QalaError::UnexpectedToken {
+                expected, found, ..
+            } => {
+                format!(
+                    "expected {}, found {}",
+                    expected_list(expected),
+                    display_kind(found)
+                )
             }
             QalaError::UnclosedDelimiter { opener, found, .. } => {
-                format!("unclosed {} -- found {}", display_kind(opener), display_kind(found))
+                format!(
+                    "unclosed {} -- found {}",
+                    display_kind(opener),
+                    display_kind(found)
+                )
             }
             QalaError::UnexpectedEof { expected, .. } => {
-                format!("unexpected end of input, expected {}", expected_list(expected))
+                format!(
+                    "unexpected end of input, expected {}",
+                    expected_list(expected)
+                )
             }
             QalaError::Parse { message, .. } => message.clone(),
-            QalaError::TypeMismatch { expected, found, .. } => {
+            QalaError::TypeMismatch {
+                expected, found, ..
+            } => {
                 format!("expected {expected}, found {found}")
             }
-            QalaError::MissingReturn { fn_name, expected, .. } => {
+            QalaError::MissingReturn {
+                fn_name, expected, ..
+            } => {
                 format!(
                     "function `{fn_name}` is declared to return {expected} but its body has no value"
                 )
@@ -314,7 +359,9 @@ impl QalaError {
             QalaError::RecursiveStructByValue { path, .. } => {
                 format!("recursive struct: {}", path.join(" -> "))
             }
-            QalaError::NonExhaustiveMatch { enum_name, missing, .. } => {
+            QalaError::NonExhaustiveMatch {
+                enum_name, missing, ..
+            } => {
                 format!(
                     "non-exhaustive match on enum `{enum_name}`: missing variants: {}",
                     missing.join(", ")
@@ -323,7 +370,13 @@ impl QalaError {
             QalaError::InterfaceNotSatisfied { ty, interface, .. } => {
                 format!("type `{ty}` does not satisfy interface `{interface}`")
             }
-            QalaError::EffectViolation { caller, caller_effect, callee, callee_effect, .. } => {
+            QalaError::EffectViolation {
+                caller,
+                caller_effect,
+                callee,
+                callee_effect,
+                ..
+            } => {
                 format!(
                     "{caller_effect} function `{caller}` calls {callee_effect} function `{callee}`"
                 )
@@ -331,12 +384,17 @@ impl QalaError {
             QalaError::RedundantQuestionOperator { message, .. } => message.clone(),
             QalaError::Type { message, .. } => message.clone(),
             QalaError::IntegerOverflow { op, lhs, rhs, .. } => {
-                format!("integer overflow: {lhs} {} {rhs} does not fit in i64", op_symbol(op))
+                format!(
+                    "integer overflow: {lhs} {} {rhs} does not fit in i64",
+                    op_symbol(op)
+                )
             }
             QalaError::ComptimeBudgetExceeded { .. } => {
                 "comptime evaluation exceeded 100000-instruction budget".to_string()
             }
-            QalaError::ComptimeEffectViolation { fn_name, effect, .. } => {
+            QalaError::ComptimeEffectViolation {
+                fn_name, effect, ..
+            } => {
                 format!("comptime block calls {effect} function `{fn_name}`")
             }
             QalaError::ComptimeResultNotConstable { type_name, .. } => {
@@ -491,19 +549,37 @@ mod tests {
     fn span_returns_the_carried_span_for_every_lex_variant() {
         let cases: Vec<(QalaError, Span)> = vec![
             (QalaError::UnterminatedString { span: sample(1) }, sample(1)),
-            (QalaError::UnterminatedInterpolation { span: sample(2) }, sample(2)),
             (
-                QalaError::InvalidEscape { span: sample(3), message: "\\q".to_string() },
+                QalaError::UnterminatedInterpolation { span: sample(2) },
+                sample(2),
+            ),
+            (
+                QalaError::InvalidEscape {
+                    span: sample(3),
+                    message: "\\q".to_string(),
+                },
                 sample(3),
             ),
-            (QalaError::UnexpectedChar { span: sample(4), ch: '\u{00e9}' }, sample(4)),
+            (
+                QalaError::UnexpectedChar {
+                    span: sample(4),
+                    ch: '\u{00e9}',
+                },
+                sample(4),
+            ),
             (QalaError::IntOverflow { span: sample(5) }, sample(5)),
             (
-                QalaError::MalformedNumber { span: sample(6), message: "1_".to_string() },
+                QalaError::MalformedNumber {
+                    span: sample(6),
+                    message: "1_".to_string(),
+                },
                 sample(6),
             ),
             (
-                QalaError::BadByteLiteral { span: sample(7), message: "b''".to_string() },
+                QalaError::BadByteLiteral {
+                    span: sample(7),
+                    message: "b''".to_string(),
+                },
                 sample(7),
             ),
         ];
@@ -534,11 +610,17 @@ mod tests {
                 sample(2),
             ),
             (
-                QalaError::UnexpectedEof { span: sample(3), expected: vec![TokenKind::Semi] },
+                QalaError::UnexpectedEof {
+                    span: sample(3),
+                    expected: vec![TokenKind::Semi],
+                },
                 sample(3),
             ),
             (
-                QalaError::Parse { span: sample(4), message: "expression nests too deeply".to_string() },
+                QalaError::Parse {
+                    span: sample(4),
+                    message: "expression nests too deeply".to_string(),
+                },
                 sample(4),
             ),
         ];
@@ -567,11 +649,17 @@ mod tests {
                 sample(2),
             ),
             (
-                QalaError::UndefinedName { span: sample(3), name: "x".to_string() },
+                QalaError::UndefinedName {
+                    span: sample(3),
+                    name: "x".to_string(),
+                },
                 sample(3),
             ),
             (
-                QalaError::UnknownType { span: sample(4), name: "Shape".to_string() },
+                QalaError::UnknownType {
+                    span: sample(4),
+                    name: "Shape".to_string(),
+                },
                 sample(4),
             ),
             (
@@ -617,7 +705,10 @@ mod tests {
                 sample(9),
             ),
             (
-                QalaError::Type { span: sample(10), message: "literal pattern cannot match an enum value".to_string() },
+                QalaError::Type {
+                    span: sample(10),
+                    message: "literal pattern cannot match an enum value".to_string(),
+                },
                 sample(10),
             ),
         ];
@@ -662,11 +753,23 @@ mod tests {
         let errs = [
             QalaError::UnterminatedString { span: sample(0) },
             QalaError::UnterminatedInterpolation { span: sample(0) },
-            QalaError::InvalidEscape { span: sample(0), message: "\\q".to_string() },
-            QalaError::UnexpectedChar { span: sample(0), ch: '@' },
+            QalaError::InvalidEscape {
+                span: sample(0),
+                message: "\\q".to_string(),
+            },
+            QalaError::UnexpectedChar {
+                span: sample(0),
+                ch: '@',
+            },
             QalaError::IntOverflow { span: sample(0) },
-            QalaError::MalformedNumber { span: sample(0), message: "1e".to_string() },
-            QalaError::BadByteLiteral { span: sample(0), message: "b''".to_string() },
+            QalaError::MalformedNumber {
+                span: sample(0),
+                message: "1e".to_string(),
+            },
+            QalaError::BadByteLiteral {
+                span: sample(0),
+                message: "b''".to_string(),
+            },
             QalaError::UnexpectedToken {
                 span: sample(0),
                 expected: vec![TokenKind::Comma, TokenKind::RParen],
@@ -677,8 +780,14 @@ mod tests {
                 opener: TokenKind::LParen,
                 found: TokenKind::Eof,
             },
-            QalaError::UnexpectedEof { span: sample(0), expected: vec![TokenKind::Ident(String::new())] },
-            QalaError::Parse { span: sample(0), message: "expression nests too deeply".to_string() },
+            QalaError::UnexpectedEof {
+                span: sample(0),
+                expected: vec![TokenKind::Ident(String::new())],
+            },
+            QalaError::Parse {
+                span: sample(0),
+                message: "expression nests too deeply".to_string(),
+            },
             QalaError::TypeMismatch {
                 span: sample(0),
                 expected: "i64".to_string(),
@@ -689,8 +798,14 @@ mod tests {
                 fn_name: "f".to_string(),
                 expected: "i64".to_string(),
             },
-            QalaError::UndefinedName { span: sample(0), name: "x".to_string() },
-            QalaError::UnknownType { span: sample(0), name: "Shape".to_string() },
+            QalaError::UndefinedName {
+                span: sample(0),
+                name: "x".to_string(),
+            },
+            QalaError::UnknownType {
+                span: sample(0),
+                name: "Shape".to_string(),
+            },
             QalaError::RecursiveStructByValue {
                 span: sample(0),
                 path: vec!["A".to_string(), "B".to_string(), "A".to_string()],
@@ -784,7 +899,10 @@ mod tests {
             path: vec!["A".to_string(), "B".to_string(), "A".to_string()],
         };
         let m = e.message();
-        assert!(m.contains("A -> B -> A"), "missing arrow-joined path: {m:?}");
+        assert!(
+            m.contains("A -> B -> A"),
+            "missing arrow-joined path: {m:?}"
+        );
         // the literal "recursive struct" prefix is the locked wording.
         assert!(m.starts_with("recursive struct: "), "missing prefix: {m:?}");
     }
@@ -824,7 +942,11 @@ mod tests {
         // the carried `missing` and `mismatched` lists round-trip verbatim
         // (the type checker pre-sorts; nothing here re-orders them).
         match &e {
-            QalaError::InterfaceNotSatisfied { missing, mismatched, .. } => {
+            QalaError::InterfaceNotSatisfied {
+                missing,
+                mismatched,
+                ..
+            } => {
                 assert_eq!(missing, &vec!["to_string".to_string()]);
                 assert_eq!(mismatched.len(), 1);
                 assert_eq!(mismatched[0].0, "render");
@@ -875,7 +997,10 @@ mod tests {
 
     #[test]
     fn eof_is_named_end_of_input_in_messages() {
-        let e = QalaError::UnexpectedEof { span: sample(0), expected: vec![TokenKind::Semi] };
+        let e = QalaError::UnexpectedEof {
+            span: sample(0),
+            expected: vec![TokenKind::Semi],
+        };
         let m = e.message();
         assert!(m.contains("end of input"), "{m:?}");
         assert!(m.contains("`;`"), "{m:?}");
@@ -887,7 +1012,10 @@ mod tests {
         assert_eq!(display_kind(&TokenKind::LBrace), "`{`");
         assert_eq!(display_kind(&TokenKind::Plus), "`+`");
         assert_eq!(display_kind(&TokenKind::Eof), "end of input");
-        assert_eq!(display_kind(&TokenKind::Ident("x".to_string())), "an identifier");
+        assert_eq!(
+            display_kind(&TokenKind::Ident("x".to_string())),
+            "an identifier"
+        );
         assert_eq!(display_kind(&TokenKind::Int(7)), "an integer literal");
         assert_eq!(display_kind(&TokenKind::Fn), "`fn`");
     }
@@ -895,7 +1023,10 @@ mod tests {
     #[test]
     fn expected_list_joins_one_two_or_many() {
         assert_eq!(expected_list(&[TokenKind::RParen]), "`)`");
-        assert_eq!(expected_list(&[TokenKind::Comma, TokenKind::RParen]), "`,` or `)`");
+        assert_eq!(
+            expected_list(&[TokenKind::Comma, TokenKind::RParen]),
+            "`,` or `)`"
+        );
         assert_eq!(
             expected_list(&[TokenKind::Comma, TokenKind::RParen, TokenKind::RBracket]),
             "`,`, `)`, or `]`"
@@ -916,7 +1047,10 @@ mod tests {
                 },
                 sample(1),
             ),
-            (QalaError::ComptimeBudgetExceeded { span: sample(2) }, sample(2)),
+            (
+                QalaError::ComptimeBudgetExceeded { span: sample(2) },
+                sample(2),
+            ),
             (
                 QalaError::ComptimeEffectViolation {
                     span: sample(3),

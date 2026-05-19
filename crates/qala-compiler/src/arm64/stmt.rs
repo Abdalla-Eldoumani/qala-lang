@@ -101,14 +101,23 @@ impl Arm64Backend {
     /// carrying the offending span, never a panic.
     pub(super) fn compile_stmt(&mut self, stmt: &TypedStmt) -> Result<(), QalaError> {
         match stmt {
-            TypedStmt::Let { name, init, span, .. } => self.compile_let(name, init, *span),
-            TypedStmt::If { cond, then_block, else_branch, .. } => {
-                self.compile_if(cond, then_block, else_branch.as_ref())
-            }
+            TypedStmt::Let {
+                name, init, span, ..
+            } => self.compile_let(name, init, *span),
+            TypedStmt::If {
+                cond,
+                then_block,
+                else_branch,
+                ..
+            } => self.compile_if(cond, then_block, else_branch.as_ref()),
             TypedStmt::While { cond, body, .. } => self.compile_while(cond, body),
-            TypedStmt::For { var, iter, body, span, .. } => {
-                self.compile_for(var, iter, body, *span)
-            }
+            TypedStmt::For {
+                var,
+                iter,
+                body,
+                span,
+                ..
+            } => self.compile_for(var, iter, body, *span),
             // `return` or `return expr`: evaluate the value into x0, then jump
             // to the function's single epilogue block.
             TypedStmt::Return { value, span } => {
@@ -140,9 +149,7 @@ impl Arm64Backend {
                     .loops
                     .last()
                     .map(|l| l.continue_target.clone())
-                    .ok_or_else(|| {
-                        self.unsupported_stmt(*span, "continue outside a loop")
-                    })?;
+                    .ok_or_else(|| self.unsupported_stmt(*span, "continue outside a loop"))?;
                 self.asm.emit_insn(&format!("b       {target}"));
                 Ok(())
             }
@@ -164,12 +171,7 @@ impl Arm64Backend {
     /// `binding_cursor` and advances the cursor. a shadowing `let` of the same
     /// name records a second `(name, slot)` pair in the scope; `resolve_name`'s
     /// top-down search then finds the newest.
-    fn compile_let(
-        &mut self,
-        name: &str,
-        init: &TypedExpr,
-        span: Span,
-    ) -> Result<(), QalaError> {
+    fn compile_let(&mut self, name: &str, init: &TypedExpr, span: Span) -> Result<(), QalaError> {
         // the initializer result lands in x0.
         self.compile_expr(init)?;
         let slot = self.next_binding_slot(span)?;
@@ -229,11 +231,7 @@ impl Arm64Backend {
     /// iteration -- is one fewer branch per iteration than a test-at-top loop.
     /// `break` branches to the end label, `continue` to the test label, so the
     /// loop-label record's `continue` target is the test label.
-    fn compile_while(
-        &mut self,
-        cond: &TypedExpr,
-        body: &TypedBlock,
-    ) -> Result<(), QalaError> {
+    fn compile_while(&mut self, cond: &TypedExpr, body: &TypedBlock) -> Result<(), QalaError> {
         let body_label = self.labels.fresh("while_body");
         let test_label = self.labels.fresh("while_test");
         let end_label = self.labels.fresh("while_end");
@@ -281,20 +279,23 @@ impl Arm64Backend {
     ) -> Result<(), QalaError> {
         // the integer core supports a range iterable only.
         let (start, end, inclusive) = match iter {
-            TypedExpr::Range { start, end, inclusive, .. } => (start, end, *inclusive),
+            TypedExpr::Range {
+                start,
+                end,
+                inclusive,
+                ..
+            } => (start, end, *inclusive),
             _ => {
-                return Err(
-                    self.unsupported_stmt(span, "for over a non-range iterable")
-                );
+                return Err(self.unsupported_stmt(span, "for over a non-range iterable"));
             }
         };
         // a `for` range must have both bounds -- `for i in ..n` is unsupported.
-        let start = start.as_ref().ok_or_else(|| {
-            self.unsupported_stmt(span, "a for range with no start bound")
-        })?;
-        let end = end.as_ref().ok_or_else(|| {
-            self.unsupported_stmt(span, "a for range with no end bound")
-        })?;
+        let start = start
+            .as_ref()
+            .ok_or_else(|| self.unsupported_stmt(span, "a for range with no start bound"))?;
+        let end = end
+            .as_ref()
+            .ok_or_else(|| self.unsupported_stmt(span, "a for range with no end bound"))?;
 
         // plan_frame reserved two slots for this `for`: the loop variable
         // first, then the `end` bound. claim them in that order.
@@ -333,19 +334,15 @@ impl Arm64Backend {
 
         // the increment: var = var + 1. the body falls through to here.
         self.asm.emit_label(&incr_label);
-        self.asm
-            .emit_insn(&format!("ldr     x0, [fp, {var_slot}]"));
+        self.asm.emit_insn(&format!("ldr     x0, [fp, {var_slot}]"));
         self.asm.emit_insn("add     x0, x0, 1");
-        self.asm
-            .emit_insn(&format!("str     x0, [fp, {var_slot}]"));
+        self.asm.emit_insn(&format!("str     x0, [fp, {var_slot}]"));
 
         // the test: load var and end, compare, branch back into the body. an
         // inclusive `..=` range uses `b.le`, an exclusive `..` uses `b.lt`.
         self.asm.emit_label(&test_label);
-        self.asm
-            .emit_insn(&format!("ldr     x0, [fp, {var_slot}]"));
-        self.asm
-            .emit_insn(&format!("ldr     x9, [fp, {end_slot}]"));
+        self.asm.emit_insn(&format!("ldr     x0, [fp, {var_slot}]"));
+        self.asm.emit_insn(&format!("ldr     x9, [fp, {end_slot}]"));
         self.asm.emit_insn("cmp     x0, x9");
         let branch = if inclusive { "b.le" } else { "b.lt" };
         self.asm.emit_insn(&format!("{branch}    {body_label}"));
@@ -361,10 +358,13 @@ impl Arm64Backend {
     /// backend bug, surfaced as a [`QalaError`] rather than a panic.
     fn next_binding_slot(&mut self, span: Span) -> Result<i64, QalaError> {
         let index = self.binding_cursor;
-        let slot = self.frame().binding_slot(index).ok_or_else(|| QalaError::Type {
-            span,
-            message: format!("arm64 backend: binding occurrence {index} has no slot"),
-        })?;
+        let slot = self
+            .frame()
+            .binding_slot(index)
+            .ok_or_else(|| QalaError::Type {
+                span,
+                message: format!("arm64 backend: binding occurrence {index} has no slot"),
+            })?;
         self.binding_cursor += 1;
         Ok(slot)
     }
@@ -492,8 +492,7 @@ mod tests {
     /// compile `src` to assembly, panicking on any backend error.
     fn compile_ok(src: &str) -> String {
         let typed = typecheck(src);
-        super::super::compile_arm64(&typed, src)
-            .unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
+        super::super::compile_arm64(&typed, src).unwrap_or_else(|e| panic!("arm64 errors: {e:?}"))
     }
 
     /// the source of snapshot program `name`, from [`SNAPSHOT_PROGRAMS`].
@@ -550,7 +549,10 @@ mod tests {
         // `let x = 7` evaluates 7 into x0 then stores it to the binding slot.
         let out = compile_ok("fn f() -> i64 { let x = 7\nx }");
         assert!(out.contains("mov     x0, 7"), "{out}");
-        assert!(out.contains("str     x0, [fp,"), "missing the let store: {out}");
+        assert!(
+            out.contains("str     x0, [fp,"),
+            "missing the let store: {out}"
+        );
     }
 
     #[test]
@@ -569,7 +571,10 @@ mod tests {
         // both lines reference the same [fp, N] -- compare the bracketed slot.
         let store_slot = &store[store.find("[fp,").unwrap()..store.find(']').unwrap()];
         let load_slot = &load[load.find("[fp,").unwrap()..load.find(']').unwrap()];
-        assert_eq!(store_slot, load_slot, "let store and ident load slots differ");
+        assert_eq!(
+            store_slot, load_slot,
+            "let store and ident load slots differ"
+        );
     }
 
     #[test]
@@ -592,7 +597,10 @@ mod tests {
             .find(|l| l.contains("ldr     x0, [fp,"))
             .expect("no load");
         let load_slot = &load[load.find("[fp,").unwrap()..load.find(']').unwrap()];
-        assert_eq!(load_slot, second_slot, "ident must resolve to the shadowing let");
+        assert_eq!(
+            load_slot, second_slot,
+            "ident must resolve to the shadowing let"
+        );
     }
 
     #[test]
@@ -609,11 +617,17 @@ mod tests {
         // an `if`/`else` is a statement, not an expression -- each arm uses an
         // explicit `return` and the function has a trailing fallback value.
         let out = compile_ok("fn f(c: bool) -> i64 { if c { return 1 } else { return 2 }\n0 }");
-        assert!(out.contains("cbz     x0, .Lif_else_"), "missing cbz to else: {out}");
+        assert!(
+            out.contains("cbz     x0, .Lif_else_"),
+            "missing cbz to else: {out}"
+        );
         assert!(out.contains(".Lif_else_"), "missing else label: {out}");
         assert!(out.contains(".Lif_end_"), "missing end label: {out}");
         // the then-block ends with a jump over the else arm.
-        assert!(out.contains("b       .Lif_end_"), "missing jump over else: {out}");
+        assert!(
+            out.contains("b       .Lif_end_"),
+            "missing jump over else: {out}"
+        );
     }
 
     #[test]
@@ -628,7 +642,11 @@ mod tests {
             .lines()
             .filter(|l| l.trim_start().starts_with(".Lif_else_"))
             .collect();
-        assert_eq!(else_labels.len(), 2, "an else-if chain has two else labels: {out}");
+        assert_eq!(
+            else_labels.len(),
+            2,
+            "an else-if chain has two else labels: {out}"
+        );
     }
 
     #[test]
@@ -641,9 +659,7 @@ mod tests {
     fn a_let_inside_an_if_gets_its_own_slot() {
         // the body has an outer let and a let inside the if-block; both must
         // store, and into different slots.
-        let out = compile_ok(
-            "fn f(c: bool) -> i64 { let a = 1\nif c { let b = 2\nreturn b }\na }",
-        );
+        let out = compile_ok("fn f(c: bool) -> i64 { let a = 1\nif c { let b = 2\nreturn b }\na }");
         let stores: Vec<&str> = out
             .lines()
             .filter(|l| l.contains("str     x0, [fp,"))
@@ -681,7 +697,9 @@ mod tests {
         // the typechecker normally rejects this; the backend is defensive --
         // an empty loop-label stack yields a QalaError, never a panic.
         // build the typed AST directly so the typecheck guard does not fire.
-        let stmt = TypedStmt::Break { span: Span::new(0, 1) };
+        let stmt = TypedStmt::Break {
+            span: Span::new(0, 1),
+        };
         let mut backend = Arm64Backend::new("");
         let err = backend
             .compile_stmt(&stmt)
@@ -699,18 +717,27 @@ mod tests {
         // the test-at-bottom shape: `b while_test`, the body label, the test
         // label, a `cbnz` back to the body.
         let out = compile_ok("fn f(c: bool) { while c { } }");
-        assert!(out.contains("b       .Lwhile_test_"), "missing jump to test: {out}");
         assert!(
-            out.lines().any(|l| l.trim_start().starts_with(".Lwhile_body_")),
+            out.contains("b       .Lwhile_test_"),
+            "missing jump to test: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.trim_start().starts_with(".Lwhile_body_")),
             "missing body label: {out}"
         );
         assert!(
-            out.lines().any(|l| l.trim_start().starts_with(".Lwhile_test_")),
+            out.lines()
+                .any(|l| l.trim_start().starts_with(".Lwhile_test_")),
             "missing test label: {out}"
         );
-        assert!(out.contains("cbnz    x0, .Lwhile_body_"), "missing cbnz: {out}");
         assert!(
-            out.lines().any(|l| l.trim_start().starts_with(".Lwhile_end_")),
+            out.contains("cbnz    x0, .Lwhile_body_"),
+            "missing cbnz: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.trim_start().starts_with(".Lwhile_end_")),
             "missing end label: {out}"
         );
     }
@@ -725,9 +752,8 @@ mod tests {
             .lines()
             .find_map(|l| {
                 let t = l.trim();
-                t.strip_prefix(".Lwhile_end_").map(|n| {
-                    format!(".Lwhile_end_{}", n.trim_end_matches(':'))
-                })
+                t.strip_prefix(".Lwhile_end_")
+                    .map(|n| format!(".Lwhile_end_{}", n.trim_end_matches(':')))
             })
             .expect("no while end label");
         assert!(
@@ -745,9 +771,8 @@ mod tests {
             .lines()
             .find_map(|l| {
                 let t = l.trim();
-                t.strip_prefix(".Lwhile_test_").map(|n| {
-                    format!(".Lwhile_test_{}", n.trim_end_matches(':'))
-                })
+                t.strip_prefix(".Lwhile_test_")
+                    .map(|n| format!(".Lwhile_test_{}", n.trim_end_matches(':')))
             })
             .expect("no while test label");
         // the `continue` is one `b` to the test label; the loop entry is the
@@ -756,30 +781,52 @@ mod tests {
             .lines()
             .filter(|l| l.contains(&format!("b       {test_target}")))
             .count();
-        assert_eq!(branches, 2, "loop entry + continue both branch to the test: {out}");
+        assert_eq!(
+            branches, 2,
+            "loop entry + continue both branch to the test: {out}"
+        );
     }
 
     #[test]
     fn a_for_over_an_exclusive_range_emits_b_lt() {
         // `for i in 0..n` -- an exclusive range -- tests with `b.lt`.
         let out = compile_ok("fn f(n: i64) { for i in 0..n { } }");
-        assert!(out.contains("b       .Lfor_test_"), "missing jump to test: {out}");
         assert!(
-            out.lines().any(|l| l.trim_start().starts_with(".Lfor_incr_")),
+            out.contains("b       .Lfor_test_"),
+            "missing jump to test: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.trim_start().starts_with(".Lfor_incr_")),
             "missing increment label: {out}"
         );
-        assert!(out.contains("add     x0, x0, 1"), "missing the increment: {out}");
+        assert!(
+            out.contains("add     x0, x0, 1"),
+            "missing the increment: {out}"
+        );
         assert!(out.contains("cmp     x0, x9"), "missing the compare: {out}");
-        assert!(out.contains("b.lt    .Lfor_body_"), "exclusive range -> b.lt: {out}");
-        assert!(!out.contains("b.le"), "an exclusive range must not use b.le: {out}");
+        assert!(
+            out.contains("b.lt    .Lfor_body_"),
+            "exclusive range -> b.lt: {out}"
+        );
+        assert!(
+            !out.contains("b.le"),
+            "an exclusive range must not use b.le: {out}"
+        );
     }
 
     #[test]
     fn a_for_over_an_inclusive_range_emits_b_le() {
         // `for i in 0..=n` -- an inclusive range -- tests with `b.le`.
         let out = compile_ok("fn f(n: i64) { for i in 0..=n { } }");
-        assert!(out.contains("b.le    .Lfor_body_"), "inclusive range -> b.le: {out}");
-        assert!(!out.contains("b.lt"), "an inclusive range must not use b.lt: {out}");
+        assert!(
+            out.contains("b.le    .Lfor_body_"),
+            "inclusive range -> b.le: {out}"
+        );
+        assert!(
+            !out.contains("b.lt"),
+            "an inclusive range must not use b.lt: {out}"
+        );
     }
 
     #[test]
@@ -791,9 +838,8 @@ mod tests {
             .lines()
             .find_map(|l| {
                 let t = l.trim();
-                t.strip_prefix(".Lfor_incr_").map(|n| {
-                    format!(".Lfor_incr_{}", n.trim_end_matches(':'))
-                })
+                t.strip_prefix(".Lfor_incr_")
+                    .map(|n| format!(".Lfor_incr_{}", n.trim_end_matches(':')))
             })
             .expect("no for increment label");
         assert!(
@@ -811,7 +857,10 @@ mod tests {
             .lines()
             .filter(|l| l.contains("str     x0, [fp,") && l.contains("// for end"))
             .count();
-        assert_eq!(end_stores, 1, "the for end bound is stored exactly once: {out}");
+        assert_eq!(
+            end_stores, 1,
+            "the for end bound is stored exactly once: {out}"
+        );
     }
 
     #[test]
@@ -819,8 +868,8 @@ mod tests {
         // `for x in arr` -- an array iterable -- is outside the integer core.
         // a clean QalaError, never a panic.
         let typed = typecheck("fn f() { let arr = [1, 2, 3]\nfor x in arr { } }");
-        let err = super::super::compile_arm64(&typed, "")
-            .expect_err("a non-range for must be rejected");
+        let err =
+            super::super::compile_arm64(&typed, "").expect_err("a non-range for must be rejected");
         match &err[0] {
             QalaError::Type { message, .. } => {
                 assert!(

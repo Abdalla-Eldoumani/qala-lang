@@ -201,11 +201,15 @@ fn try_match(chunk: &Chunk, i: usize) -> Option<Rewrite> {
             // user-facing IntegerOverflow path; if a fold reaches peephole
             // and overflows, v1 leaves the bytes rather than erroring (an
             // error here would break the build silently).
-            (Some(ConstValue::I64(x)), Some(ConstValue::I64(y)), op_byte) if op_byte == add_byte => {
+            (Some(ConstValue::I64(x)), Some(ConstValue::I64(y)), op_byte)
+                if op_byte == add_byte =>
+            {
                 x.checked_add(*y).map(ConstValue::I64)
             }
             // f64 + f64: IEEE 754 add. inf / NaN are valid fold results.
-            (Some(ConstValue::F64(x)), Some(ConstValue::F64(y)), op_byte) if op_byte == fadd_byte => {
+            (Some(ConstValue::F64(x)), Some(ConstValue::F64(y)), op_byte)
+                if op_byte == fadd_byte =>
+            {
                 Some(ConstValue::F64(x + y))
             }
             // any other type pair (or opcode/type mismatch): no fold.
@@ -786,12 +790,11 @@ mod tests {
                 "{}/../../playground/public/examples/{name}.qala",
                 env!("CARGO_MANIFEST_DIR"),
             );
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
-            let tokens = Lexer::tokenize(&src)
-                .unwrap_or_else(|e| panic!("{name}.qala: lex: {e:?}"));
-            let ast = Parser::parse(&tokens)
-                .unwrap_or_else(|e| panic!("{name}.qala: parse: {e:?}"));
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let tokens =
+                Lexer::tokenize(&src).unwrap_or_else(|e| panic!("{name}.qala: lex: {e:?}"));
+            let ast =
+                Parser::parse(&tokens).unwrap_or_else(|e| panic!("{name}.qala: parse: {e:?}"));
             let (typed, terrors, _) = check_program(&ast, &src);
             assert!(terrors.is_empty(), "{name}.qala: typecheck: {terrors:?}");
             let mut program = crate::codegen::compile_program(&typed, &src)

@@ -4,17 +4,17 @@
 //! this file declares the modules in dependency order. the `wasm-bindgen`
 //! bridge that exposes the pipeline to JavaScript lives in `wasm.rs`.
 
-pub mod span;
-pub mod errors;
-pub mod token;
-pub mod lexer;
 pub mod ast;
-pub mod parser;
-pub mod types;
-pub mod effects;
-pub mod typed_ast;
-pub mod typechecker;
 pub mod diagnostics;
+pub mod effects;
+pub mod errors;
+pub mod lexer;
+pub mod parser;
+pub mod span;
+pub mod token;
+pub mod typechecker;
+pub mod typed_ast;
+pub mod types;
 // constant-pool value enum -- shared by chunk, codegen, vm
 pub mod value;
 // bytecode opcode enum -- consumed by chunk, codegen, optimizer, vm

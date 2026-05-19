@@ -217,17 +217,33 @@ pub enum Stmt {
     /// `let name = init` or `let mut name = init`, with an optional `: ty`. the
     /// initializer is required (no uninitialized bindings); the type is inferred
     /// from `init` when omitted.
-    Let { is_mut: bool, name: String, ty: Option<TypeExpr>, init: Expr, span: Span },
+    Let {
+        is_mut: bool,
+        name: String,
+        ty: Option<TypeExpr>,
+        init: Expr,
+        span: Span,
+    },
     /// `if cond { ... }` with an optional `else` (a block, or another `if` for
     /// an `else if` chain). a statement, not an expression -- there is no
     /// `let x = if c { a } else { b }` in v1.
-    If { cond: Expr, then_block: Block, else_branch: Option<ElseBranch>, span: Span },
+    If {
+        cond: Expr,
+        then_block: Block,
+        else_branch: Option<ElseBranch>,
+        span: Span,
+    },
     /// `while cond { ... }`.
     While { cond: Expr, body: Block, span: Span },
     /// `for var in iter { ... }`. `iter` is any expression that yields an
     /// iterable; a range is just one kind of iterable. kept as a `For` node, not
     /// lowered to a `while`.
-    For { var: String, iter: Expr, body: Block, span: Span },
+    For {
+        var: String,
+        iter: Expr,
+        body: Block,
+        span: Span,
+    },
     /// `return` or `return expr`. the value is optional -- a bare `return` in a
     /// `void` function is legal.
     Return { value: Option<Expr>, span: Span },
@@ -313,41 +329,84 @@ pub enum Expr {
     /// `[ e1, e2, ... ]` -- an array literal listing its elements.
     ArrayLit { elems: Vec<Expr>, span: Span },
     /// `[ value; count ]` -- an array literal repeating `value` `count` times.
-    ArrayRepeat { value: Box<Expr>, count: Box<Expr>, span: Span },
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: Box<Expr>,
+        span: Span,
+    },
     /// `Name { field: e, ... }` -- a struct literal. `name` is the struct's
     /// name; whether it names a real struct is Phase 3's call.
-    StructLit { name: String, fields: Vec<FieldInit>, span: Span },
+    StructLit {
+        name: String,
+        fields: Vec<FieldInit>,
+        span: Span,
+    },
     /// `obj.name` -- field access. distinct from [`Expr::MethodCall`]: this is
     /// the form with no `( ... )` after the `.name`.
-    FieldAccess { obj: Box<Expr>, name: String, span: Span },
+    FieldAccess {
+        obj: Box<Expr>,
+        name: String,
+        span: Span,
+    },
     /// `receiver.name(args)` -- a method call. distinct from a field access
     /// followed by a call; Phase 3 resolves it to `fn Type.name(self, ...)`.
-    MethodCall { receiver: Box<Expr>, name: String, args: Vec<Expr>, span: Span },
+    MethodCall {
+        receiver: Box<Expr>,
+        name: String,
+        args: Vec<Expr>,
+        span: Span,
+    },
     /// `callee(args)` -- a call expression (`callee` is usually an
     /// [`Expr::Ident`], but can be any expression that yields something
     /// callable).
-    Call { callee: Box<Expr>, args: Vec<Expr>, span: Span },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        span: Span,
+    },
     /// `obj[index]` -- an index expression.
-    Index { obj: Box<Expr>, index: Box<Expr>, span: Span },
+    Index {
+        obj: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
     /// `expr?` -- error propagation: if `expr` is an error, return it from the
     /// enclosing function; otherwise unwrap it. binds tightest (with `.`, call,
     /// index), so `f()?.x` is `(f()?).x` and `a + b?` is `a + (b?)`.
     Try { expr: Box<Expr>, span: Span },
     /// a unary-operator application: `!operand` or `-operand`.
-    Unary { op: UnaryOp, operand: Box<Expr>, span: Span },
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
     /// a binary-operator application: `lhs op rhs`. covers arithmetic,
     /// comparison, equality, and the boolean `&&` / `||`. the `or` fallback is
     /// *not* here -- it is [`Expr::OrElse`].
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr>, span: Span },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        span: Span,
+    },
     /// `start .. end` or `start ..= end` -- a range. `start` and `end` are each
     /// optional to leave room for `..end` / `start..` forms; `inclusive` is true
     /// for `..=`. ranges are ordinary expressions (an iterable for `for`).
-    Range { start: Option<Box<Expr>>, end: Option<Box<Expr>>, inclusive: bool, span: Span },
+    Range {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+        span: Span,
+    },
     /// `lhs |> call` -- the pipeline operator. kept as a faithful node, NOT
     /// lowered to `call(lhs, ...)`; that desugaring is Phase 4 codegen. `call`
     /// is whatever expression followed `|>` (typically a call or a bare function
     /// name); the parser does not rewrite it.
-    Pipeline { lhs: Box<Expr>, call: Box<Expr>, span: Span },
+    Pipeline {
+        lhs: Box<Expr>,
+        call: Box<Expr>,
+        span: Span,
+    },
     /// `comptime body` -- evaluate `body` during compilation, embed the result
     /// as a constant. a prefix operator at unary precedence, so `comptime a + b`
     /// is `(comptime a) + b`; `body` may also be a block expression
@@ -360,12 +419,20 @@ pub enum Expr {
     /// `match scrutinee { arm, ... }` -- pattern matching with at least one arm.
     /// kept as a faithful node. each arm has a pattern, an optional `if` guard,
     /// and a body (an expression or a block); Phase 3 checks exhaustiveness.
-    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm>, span: Span },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
     /// `expr or fallback` -- inline fallback for a `Result`/`Option`: the value
     /// of `expr` if it is `Ok`/`Some`, else `fallback`. modelled as its own
     /// node (not a [`BinOp`]) because it is faithful surface syntax with the
     /// loosest precedence, left-associative; `a or b or c` is `(a or b) or c`.
-    OrElse { expr: Box<Expr>, fallback: Box<Expr>, span: Span },
+    OrElse {
+        expr: Box<Expr>,
+        fallback: Box<Expr>,
+        span: Span,
+    },
     /// a string with `{expr}` interpolations -- `parts` alternates literal text
     /// and embedded expressions, in source order. NOT desugared to a `+` chain;
     /// the conversion-and-concatenation happens in Phase 4 codegen.
@@ -484,7 +551,11 @@ pub enum Pattern {
     /// `Name(sub, ...)` -- destructure an enum variant; `sub` is the
     /// sub-patterns for its fields (empty for a no-data variant matched as
     /// `Name`). whether `Name` is a real variant is Phase 3's call.
-    Variant { name: String, sub: Vec<Pattern>, span: Span },
+    Variant {
+        name: String,
+        sub: Vec<Pattern>,
+        span: Span,
+    },
     /// `_` -- matches anything, binds nothing.
     Wildcard { span: Span },
     /// `name` -- matches anything, binds it to `name`.
@@ -559,17 +630,29 @@ pub enum TypeExpr {
     /// distinguish; Phase 3 resolves it).
     Named { name: String, span: Span },
     /// `[ elem; size ]` -- a fixed-size array. `size` is the literal length.
-    Array { elem: Box<TypeExpr>, size: u64, span: Span },
+    Array {
+        elem: Box<TypeExpr>,
+        size: u64,
+        span: Span,
+    },
     /// `[ elem ]` -- a dynamic array.
     DynArray { elem: Box<TypeExpr>, span: Span },
     /// `( T1, T2, ... )` -- a tuple type.
     Tuple { elems: Vec<TypeExpr>, span: Span },
     /// `fn( T1, T2 ) -> T3` -- a function type.
-    Fn { params: Vec<TypeExpr>, ret: Box<TypeExpr>, span: Span },
+    Fn {
+        params: Vec<TypeExpr>,
+        ret: Box<TypeExpr>,
+        span: Span,
+    },
     /// `Name< T1, T2 >` -- a generic application (used by `Result<T, E>` and
     /// `Option<T>`). the parser allows it on any name; restricting which names
     /// may be generic is Phase 3's job.
-    Generic { name: String, args: Vec<TypeExpr>, span: Span },
+    Generic {
+        name: String,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
 }
 
 impl TypeExpr {
@@ -624,8 +707,14 @@ mod tests {
         // depend on PartialEq, so it must be derived on every node.
         let a = Expr::Binary {
             op: BinOp::Add,
-            lhs: Box::new(Expr::Int { value: 1, span: span(0) }),
-            rhs: Box::new(Expr::Int { value: 2, span: span(2) }),
+            lhs: Box::new(Expr::Int {
+                value: 1,
+                span: span(0),
+            }),
+            rhs: Box::new(Expr::Int {
+                value: 2,
+                span: span(2),
+            }),
             span: span(0),
         };
         let b = a.clone();
@@ -634,37 +723,88 @@ mod tests {
         let _ = format!("{a:?}");
         let c = Expr::Binary {
             op: BinOp::Mul, // different operator
-            lhs: Box::new(Expr::Int { value: 1, span: span(0) }),
-            rhs: Box::new(Expr::Int { value: 2, span: span(2) }),
+            lhs: Box::new(Expr::Int {
+                value: 1,
+                span: span(0),
+            }),
+            rhs: Box::new(Expr::Int {
+                value: 2,
+                span: span(2),
+            }),
             span: span(0),
         };
         assert_ne!(a, c);
         // a float literal node round-trips through clone -- this is why the
         // node enums are PartialEq but not Eq.
-        let f = Expr::Float { value: 3.14, span: span(5) };
+        let f = Expr::Float {
+            value: 3.14,
+            span: span(5),
+        };
         assert_eq!(f.clone(), f);
     }
 
     #[test]
     fn expr_span_returns_the_stored_span_for_a_sample_of_variants() {
         let cases: Vec<(Expr, Span)> = vec![
-            (Expr::Int { value: 0, span: span(1) }, span(1)),
-            (Expr::Float { value: 0.0, span: span(2) }, span(2)),
-            (Expr::Byte { value: 0, span: span(3) }, span(3)),
-            (Expr::Str { value: String::new(), span: span(4) }, span(4)),
-            (Expr::Bool { value: true, span: span(5) }, span(5)),
-            (Expr::Ident { name: "x".to_string(), span: span(6) }, span(6)),
+            (
+                Expr::Int {
+                    value: 0,
+                    span: span(1),
+                },
+                span(1),
+            ),
+            (
+                Expr::Float {
+                    value: 0.0,
+                    span: span(2),
+                },
+                span(2),
+            ),
+            (
+                Expr::Byte {
+                    value: 0,
+                    span: span(3),
+                },
+                span(3),
+            ),
+            (
+                Expr::Str {
+                    value: String::new(),
+                    span: span(4),
+                },
+                span(4),
+            ),
+            (
+                Expr::Bool {
+                    value: true,
+                    span: span(5),
+                },
+                span(5),
+            ),
+            (
+                Expr::Ident {
+                    name: "x".to_string(),
+                    span: span(6),
+                },
+                span(6),
+            ),
             (
                 Expr::Unary {
                     op: UnaryOp::Neg,
-                    operand: Box::new(Expr::Int { value: 1, span: span(8) }),
+                    operand: Box::new(Expr::Int {
+                        value: 1,
+                        span: span(8),
+                    }),
                     span: span(7),
                 },
                 span(7),
             ),
             (
                 Expr::MethodCall {
-                    receiver: Box::new(Expr::Ident { name: "f".to_string(), span: span(10) }),
+                    receiver: Box::new(Expr::Ident {
+                        name: "f".to_string(),
+                        span: span(10),
+                    }),
                     name: "read_all".to_string(),
                     args: vec![],
                     span: span(9),
@@ -673,16 +813,28 @@ mod tests {
             ),
             (
                 Expr::Pipeline {
-                    lhs: Box::new(Expr::Int { value: 5, span: span(12) }),
-                    call: Box::new(Expr::Ident { name: "double".to_string(), span: span(14) }),
+                    lhs: Box::new(Expr::Int {
+                        value: 5,
+                        span: span(12),
+                    }),
+                    call: Box::new(Expr::Ident {
+                        name: "double".to_string(),
+                        span: span(14),
+                    }),
                     span: span(11),
                 },
                 span(11),
             ),
             (
                 Expr::OrElse {
-                    expr: Box::new(Expr::Ident { name: "a".to_string(), span: span(16) }),
-                    fallback: Box::new(Expr::Str { value: "no data".to_string(), span: span(18) }),
+                    expr: Box::new(Expr::Ident {
+                        name: "a".to_string(),
+                        span: span(16),
+                    }),
+                    fallback: Box::new(Expr::Str {
+                        value: "no data".to_string(),
+                        span: span(18),
+                    }),
                     span: span(15),
                 },
                 span(15),
@@ -691,7 +843,10 @@ mod tests {
                 Expr::Interpolation {
                     parts: vec![
                         InterpPart::Literal("fib(".to_string()),
-                        InterpPart::Expr(Expr::Ident { name: "i".to_string(), span: span(20) }),
+                        InterpPart::Expr(Expr::Ident {
+                            name: "i".to_string(),
+                            span: span(20),
+                        }),
                         InterpPart::Literal(")".to_string()),
                     ],
                     span: span(19),
@@ -712,24 +867,43 @@ mod tests {
                     is_mut: false,
                     name: "x".to_string(),
                     ty: None,
-                    init: Expr::Int { value: 1, span: span(1) },
+                    init: Expr::Int {
+                        value: 1,
+                        span: span(1),
+                    },
                     span: span(0),
                 },
                 span(0),
             ),
             (Stmt::Break { span: span(2) }, span(2)),
             (Stmt::Continue { span: span(3) }, span(3)),
-            (Stmt::Return { value: None, span: span(4) }, span(4)),
+            (
+                Stmt::Return {
+                    value: None,
+                    span: span(4),
+                },
+                span(4),
+            ),
             (
                 Stmt::For {
                     var: "i".to_string(),
                     iter: Expr::Range {
-                        start: Some(Box::new(Expr::Int { value: 0, span: span(6) })),
-                        end: Some(Box::new(Expr::Int { value: 15, span: span(8) })),
+                        start: Some(Box::new(Expr::Int {
+                            value: 0,
+                            span: span(6),
+                        })),
+                        end: Some(Box::new(Expr::Int {
+                            value: 15,
+                            span: span(8),
+                        })),
                         inclusive: false,
                         span: span(6),
                     },
-                    body: Block { stmts: vec![], value: None, span: span(9) },
+                    body: Block {
+                        stmts: vec![],
+                        value: None,
+                        span: span(9),
+                    },
                     span: span(5),
                 },
                 span(5),
@@ -748,15 +922,31 @@ mod tests {
             params: vec![],
             ret_ty: None,
             effect: Some(Effect::Io),
-            body: Block { stmts: vec![], value: None, span: span(1) },
+            body: Block {
+                stmts: vec![],
+                value: None,
+                span: span(1),
+            },
             span: span(0),
         });
         assert_eq!(f.span(), span(0));
-        let s = Item::Struct(StructDecl { name: "S".to_string(), fields: vec![], span: span(2) });
+        let s = Item::Struct(StructDecl {
+            name: "S".to_string(),
+            fields: vec![],
+            span: span(2),
+        });
         assert_eq!(s.span(), span(2));
-        let e = Item::Enum(EnumDecl { name: "E".to_string(), variants: vec![], span: span(3) });
+        let e = Item::Enum(EnumDecl {
+            name: "E".to_string(),
+            variants: vec![],
+            span: span(3),
+        });
         assert_eq!(e.span(), span(3));
-        let i = Item::Interface(InterfaceDecl { name: "I".to_string(), methods: vec![], span: span(4) });
+        let i = Item::Interface(InterfaceDecl {
+            name: "I".to_string(),
+            methods: vec![],
+            span: span(4),
+        });
         assert_eq!(i.span(), span(4));
     }
 
@@ -766,18 +956,57 @@ mod tests {
             (
                 Pattern::Variant {
                     name: "Circle".to_string(),
-                    sub: vec![Pattern::Binding { name: "r".to_string(), span: span(1) }],
+                    sub: vec![Pattern::Binding {
+                        name: "r".to_string(),
+                        span: span(1),
+                    }],
                     span: span(0),
                 },
                 span(0),
             ),
             (Pattern::Wildcard { span: span(2) }, span(2)),
-            (Pattern::Binding { name: "v".to_string(), span: span(3) }, span(3)),
-            (Pattern::Int { value: 0, span: span(4) }, span(4)),
-            (Pattern::Float { value: 0.0, span: span(5) }, span(5)),
-            (Pattern::Byte { value: 0, span: span(6) }, span(6)),
-            (Pattern::Str { value: String::new(), span: span(7) }, span(7)),
-            (Pattern::Bool { value: false, span: span(8) }, span(8)),
+            (
+                Pattern::Binding {
+                    name: "v".to_string(),
+                    span: span(3),
+                },
+                span(3),
+            ),
+            (
+                Pattern::Int {
+                    value: 0,
+                    span: span(4),
+                },
+                span(4),
+            ),
+            (
+                Pattern::Float {
+                    value: 0.0,
+                    span: span(5),
+                },
+                span(5),
+            ),
+            (
+                Pattern::Byte {
+                    value: 0,
+                    span: span(6),
+                },
+                span(6),
+            ),
+            (
+                Pattern::Str {
+                    value: String::new(),
+                    span: span(7),
+                },
+                span(7),
+            ),
+            (
+                Pattern::Bool {
+                    value: false,
+                    span: span(8),
+                },
+                span(8),
+            ),
         ];
         for (pat, expected) in cases {
             assert_eq!(pat.span(), expected, "span() mismatch for {pat:?}");
@@ -787,11 +1016,26 @@ mod tests {
     #[test]
     fn type_expr_span_returns_the_stored_span_for_every_variant() {
         let cases: Vec<(TypeExpr, Span)> = vec![
-            (TypeExpr::Primitive { kind: PrimType::I64, span: span(1) }, span(1)),
-            (TypeExpr::Named { name: "Shape".to_string(), span: span(2) }, span(2)),
+            (
+                TypeExpr::Primitive {
+                    kind: PrimType::I64,
+                    span: span(1),
+                },
+                span(1),
+            ),
+            (
+                TypeExpr::Named {
+                    name: "Shape".to_string(),
+                    span: span(2),
+                },
+                span(2),
+            ),
             (
                 TypeExpr::Array {
-                    elem: Box::new(TypeExpr::Primitive { kind: PrimType::I64, span: span(4) }),
+                    elem: Box::new(TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        span: span(4),
+                    }),
                     size: 5,
                     span: span(3),
                 },
@@ -799,7 +1043,10 @@ mod tests {
             ),
             (
                 TypeExpr::DynArray {
-                    elem: Box::new(TypeExpr::Primitive { kind: PrimType::I64, span: span(6) }),
+                    elem: Box::new(TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        span: span(6),
+                    }),
                     span: span(5),
                 },
                 span(5),
@@ -807,8 +1054,14 @@ mod tests {
             (
                 TypeExpr::Tuple {
                     elems: vec![
-                        TypeExpr::Primitive { kind: PrimType::I64, span: span(8) },
-                        TypeExpr::Primitive { kind: PrimType::Bool, span: span(9) },
+                        TypeExpr::Primitive {
+                            kind: PrimType::I64,
+                            span: span(8),
+                        },
+                        TypeExpr::Primitive {
+                            kind: PrimType::Bool,
+                            span: span(9),
+                        },
                     ],
                     span: span(7),
                 },
@@ -816,8 +1069,14 @@ mod tests {
             ),
             (
                 TypeExpr::Fn {
-                    params: vec![TypeExpr::Primitive { kind: PrimType::I64, span: span(11) }],
-                    ret: Box::new(TypeExpr::Primitive { kind: PrimType::I64, span: span(12) }),
+                    params: vec![TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        span: span(11),
+                    }],
+                    ret: Box::new(TypeExpr::Primitive {
+                        kind: PrimType::I64,
+                        span: span(12),
+                    }),
                     span: span(10),
                 },
                 span(10),
@@ -826,8 +1085,14 @@ mod tests {
                 TypeExpr::Generic {
                     name: "Result".to_string(),
                     args: vec![
-                        TypeExpr::Primitive { kind: PrimType::Str, span: span(14) },
-                        TypeExpr::Primitive { kind: PrimType::Str, span: span(15) },
+                        TypeExpr::Primitive {
+                            kind: PrimType::Str,
+                            span: span(14),
+                        },
+                        TypeExpr::Primitive {
+                            kind: PrimType::Str,
+                            span: span(15),
+                        },
                     ],
                     span: span(13),
                 },
@@ -843,14 +1108,26 @@ mod tests {
     fn a_match_arm_holds_a_pattern_an_optional_guard_and_a_body() {
         // an expression-body arm with a guard: `v if v > 0 => "positive"`.
         let arm = MatchArm {
-            pattern: Pattern::Binding { name: "v".to_string(), span: span(0) },
+            pattern: Pattern::Binding {
+                name: "v".to_string(),
+                span: span(0),
+            },
             guard: Some(Expr::Binary {
                 op: BinOp::Gt,
-                lhs: Box::new(Expr::Ident { name: "v".to_string(), span: span(2) }),
-                rhs: Box::new(Expr::Int { value: 0, span: span(4) }),
+                lhs: Box::new(Expr::Ident {
+                    name: "v".to_string(),
+                    span: span(2),
+                }),
+                rhs: Box::new(Expr::Int {
+                    value: 0,
+                    span: span(4),
+                }),
                 span: span(2),
             }),
-            body: MatchArmBody::Expr(Box::new(Expr::Str { value: "positive".to_string(), span: span(6) })),
+            body: MatchArmBody::Expr(Box::new(Expr::Str {
+                value: "positive".to_string(),
+                span: span(6),
+            })),
             span: span(0),
         };
         assert!(arm.guard.is_some());
@@ -858,7 +1135,11 @@ mod tests {
         let arm2 = MatchArm {
             pattern: Pattern::Wildcard { span: span(10) },
             guard: None,
-            body: MatchArmBody::Block(Block { stmts: vec![], value: None, span: span(12) }),
+            body: MatchArmBody::Block(Block {
+                stmts: vec![],
+                value: None,
+                span: span(12),
+            }),
             span: span(10),
         };
         assert!(arm2.guard.is_none());
@@ -873,16 +1154,26 @@ mod tests {
                 is_mut: false,
                 name: "x".to_string(),
                 ty: None,
-                init: Expr::Int { value: 1, span: span(1) },
+                init: Expr::Int {
+                    value: 1,
+                    span: span(1),
+                },
                 span: span(0),
             }],
-            value: Some(Box::new(Expr::Ident { name: "x".to_string(), span: span(3) })),
+            value: Some(Box::new(Expr::Ident {
+                name: "x".to_string(),
+                span: span(3),
+            })),
             span: span(0),
         };
         assert_eq!(block.stmts.len(), 1);
         assert!(block.value.is_some());
         // an empty `{ }` block: no statements, value is void (None).
-        let empty = Block { stmts: vec![], value: None, span: span(5) };
+        let empty = Block {
+            stmts: vec![],
+            value: None,
+            span: span(5),
+        };
         assert!(empty.stmts.is_empty());
         assert!(empty.value.is_none());
     }

@@ -318,7 +318,10 @@ mod tests {
         assert_eq!(ConstValue::I64(42).to_string(), "42");
         // i64::MIN as a literal: the spelling must match the source-text form a
         // negative literal would produce.
-        assert_eq!(ConstValue::I64(i64::MIN).to_string(), "-9223372036854775808");
+        assert_eq!(
+            ConstValue::I64(i64::MIN).to_string(),
+            "-9223372036854775808"
+        );
     }
 
     #[test]
@@ -418,7 +421,10 @@ mod tests {
         assert_eq!(ConstValue::F64(0.0), ConstValue::F64(0.0));
         assert_eq!(ConstValue::Bool(true), ConstValue::Bool(true));
         assert_eq!(ConstValue::Byte(0xab), ConstValue::Byte(0xab));
-        assert_eq!(ConstValue::Str("x".to_string()), ConstValue::Str("x".to_string()));
+        assert_eq!(
+            ConstValue::Str("x".to_string()),
+            ConstValue::Str("x".to_string())
+        );
         assert_eq!(ConstValue::Void, ConstValue::Void);
         assert_eq!(ConstValue::Function(3), ConstValue::Function(3));
         // IEEE 754: a NaN is not equal to itself.
@@ -478,7 +484,10 @@ mod tests {
         let v = Value::from_f64(-0.0);
         assert!(!v.is_tagged());
         let decoded = v.as_f64().expect("-0.0 decodes as an f64");
-        assert!(decoded == 0.0 && decoded.is_sign_negative(), "sign bit lost");
+        assert!(
+            decoded == 0.0 && decoded.is_sign_negative(),
+            "sign bit lost"
+        );
     }
 
     #[test]

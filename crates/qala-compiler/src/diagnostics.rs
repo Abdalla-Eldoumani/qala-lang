@@ -123,8 +123,7 @@ impl Diagnostic {
     /// pure function over `(self, src)` and produces only ASCII text.
     pub fn render(&self, src: &str) -> String {
         let line_index = LineIndex::new(src);
-        let (line, column) =
-            line_index.location(src, self.primary_span.start as usize);
+        let (line, column) = line_index.location(src, self.primary_span.start as usize);
         let line_text = src.lines().nth(line - 1).unwrap_or("");
 
         let header = match self.severity {
@@ -226,7 +225,11 @@ impl From<QalaError> for Diagnostic {
         // only place a reader sees the five "structured" variants
         // listed together.
         match &err {
-            QalaError::EffectViolation { caller_effect, callee_effect, .. } => {
+            QalaError::EffectViolation {
+                caller_effect,
+                callee_effect,
+                ..
+            } => {
                 notes.push(format!(
                     "pure functions cannot call functions with {callee_effect} effects"
                 ));
@@ -237,7 +240,11 @@ impl From<QalaError> for Diagnostic {
             QalaError::NonExhaustiveMatch { missing, .. } if !missing.is_empty() => {
                 notes.push(format!("add an arm for: {}", missing.join(", ")));
             }
-            QalaError::InterfaceNotSatisfied { missing, mismatched, .. } => {
+            QalaError::InterfaceNotSatisfied {
+                missing,
+                mismatched,
+                ..
+            } => {
                 // typechecker pre-sorts both lists; render in that order.
                 for name in missing {
                     notes.push(format!("missing method `{name}`"));
@@ -281,10 +288,7 @@ impl From<&QalaWarning> for Diagnostic {
     /// playground colors yellow. the optional `note` field becomes the
     /// first note line.
     fn from(w: &QalaWarning) -> Self {
-        let notes = w
-            .note
-            .as_ref()
-            .map_or_else(Vec::new, |n| vec![n.clone()]);
+        let notes = w.note.as_ref().map_or_else(Vec::new, |n| vec![n.clone()]);
         Diagnostic {
             severity: Severity::Warning,
             category: Some(w.category.clone()),
@@ -360,7 +364,9 @@ mod tests {
 
     #[test]
     fn from_qala_error_int_overflow_carries_message_and_span() {
-        let err = QalaError::IntOverflow { span: Span::new(5, 4) };
+        let err = QalaError::IntOverflow {
+            span: Span::new(5, 4),
+        };
         let d: Diagnostic = err.into();
         assert!(matches!(d.severity, Severity::Error));
         assert!(d.category.is_none());
@@ -386,9 +392,7 @@ mod tests {
         );
         assert_eq!(
             d.hints,
-            vec![
-                "remove the `is pure` annotation, or refactor to remove the io call".to_string()
-            ]
+            vec!["remove the `is pure` annotation, or refactor to remove the io call".to_string()]
         );
     }
 
@@ -614,10 +618,7 @@ mod tests {
             hints: Vec::new(),
         };
         let out = d.render("x");
-        assert!(
-            out.starts_with("error: oops\n"),
-            "wrong header: {out:?}"
-        );
+        assert!(out.starts_with("error: oops\n"), "wrong header: {out:?}");
     }
 
     #[test]
@@ -720,7 +721,10 @@ mod tests {
         };
         let out = d.render("x");
         let bottom = out.find("   |\n   = note: a fact\n");
-        assert!(bottom.is_some(), "bottom separator and note must be adjacent: {out:?}");
+        assert!(
+            bottom.is_some(),
+            "bottom separator and note must be adjacent: {out:?}"
+        );
         let note_pos = out.find("   = note: a fact\n").unwrap();
         let hint_pos = out.find("   = hint: a suggestion\n").unwrap();
         assert!(note_pos < hint_pos, "note must come before hint: {out:?}");
@@ -793,18 +797,27 @@ mod tests {
         // this paired Plan 05 test asserts rendering those (empty)
         // errors collects to the empty string -- proves the renderer
         // is wired in correctly for the no-error case.
-        for name in ["hello", "fibonacci", "effects", "pattern-matching", "pipeline", "defer-demo"] {
+        for name in [
+            "hello",
+            "fibonacci",
+            "effects",
+            "pattern-matching",
+            "pipeline",
+            "defer-demo",
+        ] {
             let path = format!(
                 "{}/../../playground/public/examples/{}.qala",
                 env!("CARGO_MANIFEST_DIR"),
                 name
             );
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
             let tokens = lexer::Lexer::tokenize(&src).expect("lex");
             let ast = parser::Parser::parse(&tokens).expect("parse");
             let (_, errors, _warnings) = typechecker::check_program(&ast, &src);
-            assert!(errors.is_empty(), "{name}.qala: unexpected errors: {errors:?}");
+            assert!(
+                errors.is_empty(),
+                "{name}.qala: unexpected errors: {errors:?}"
+            );
             let rendered: String = errors
                 .iter()
                 .map(|e| Diagnostic::from(e.clone()).render(&src))
@@ -828,7 +841,10 @@ mod tests {
         let (typed, errors, warnings) = typechecker::check_program(&ast, src);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert!(!warnings.is_empty(), "expected at least one warning");
-        assert!(!typed.is_empty(), "warnings must not block typed-AST construction");
+        assert!(
+            !typed.is_empty(),
+            "warnings must not block typed-AST construction"
+        );
     }
 
     #[test]

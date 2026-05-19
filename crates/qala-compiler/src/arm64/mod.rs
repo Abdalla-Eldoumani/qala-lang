@@ -73,7 +73,9 @@ pub fn compile_arm64(ast: &TypedAst, src: &str) -> Result<String, Vec<QalaError>
         }
     }
     if !backend.errors.is_empty() {
-        backend.errors.sort_by_key(|e| (e.span().start, e.span().len));
+        backend
+            .errors
+            .sort_by_key(|e| (e.span().start, e.span().len));
         return Err(backend.errors);
     }
     Ok(backend.finish())
@@ -242,14 +244,15 @@ impl Arm64Backend {
         // spill the incoming parameters from x0..x7 into their stack slots, so
         // a later Ident load reads a stable slot rather than a clobbered reg.
         for (i, param) in decl.params.iter().enumerate() {
-            let slot = self.frame().slot_of(&param.name).ok_or_else(|| QalaError::Type {
-                span: param.span,
-                message: format!("arm64 backend: parameter `{}` has no slot", param.name),
-            })?;
-            self.asm.emit_insn_commented(
-                &format!("str     x{i}, [fp, {slot}]"),
-                &param.name,
-            );
+            let slot = self
+                .frame()
+                .slot_of(&param.name)
+                .ok_or_else(|| QalaError::Type {
+                    span: param.span,
+                    message: format!("arm64 backend: parameter `{}` has no slot", param.name),
+                })?;
+            self.asm
+                .emit_insn_commented(&format!("str     x{i}, [fp, {slot}]"), &param.name);
         }
 
         // walk the body. its trailing value, if any, lands in x0.
@@ -434,7 +437,10 @@ mod tests {
         assert!(out.contains(".global main"), "{out}");
         assert!(out.contains(".type   main, @function"), "{out}");
         assert!(out.contains("\nmain:\n"), "{out}");
-        assert!(out.contains("stp     fp, lr, [sp, "), "missing prologue: {out}");
+        assert!(
+            out.contains("stp     fp, lr, [sp, "),
+            "missing prologue: {out}"
+        );
         assert!(out.contains("mov     fp, sp"), "{out}");
     }
 
@@ -442,7 +448,10 @@ mod tests {
     fn a_function_emits_one_epilogue_block() {
         let out = compile_ok("fn main() { }");
         assert!(out.contains(".Lmain_epilogue:"), "{out}");
-        assert!(out.contains("ldp     fp, lr, [sp], "), "missing epilogue: {out}");
+        assert!(
+            out.contains("ldp     fp, lr, [sp], "),
+            "missing epilogue: {out}"
+        );
         assert!(out.contains("\n        ret\n"), "{out}");
     }
 
@@ -494,8 +503,11 @@ mod tests {
         // `fn Type.method` is out of the integer core -- a clean error, not a
         // panic and not bad assembly.
         let typed = typecheck("struct P { x: i64 }\nfn P.get(self) -> i64 { self.x }");
-        let err = compile_arm64(&typed, "struct P { x: i64 }\nfn P.get(self) -> i64 { self.x }")
-            .expect_err("a method must be rejected");
+        let err = compile_arm64(
+            &typed,
+            "struct P { x: i64 }\nfn P.get(self) -> i64 { self.x }",
+        )
+        .expect_err("a method must be rejected");
         assert!(err[0].message().contains("method"), "{:?}", err);
     }
 
@@ -512,7 +524,11 @@ mod tests {
         let src = "fn f(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64, i: i64, j: i64) -> i64 { a }";
         let typed = typecheck(src);
         let err = compile_arm64(&typed, src).expect_err(">8 params must be rejected");
-        assert!(err[0].message().contains("at most 8 parameters"), "{:?}", err);
+        assert!(
+            err[0].message().contains("at most 8 parameters"),
+            "{:?}",
+            err
+        );
     }
 
     #[test]
@@ -660,7 +676,10 @@ mod tests {
                 "struct literals",
             ),
             // a match expression.
-            ("fn f(n: i64) -> i64 { match n { _ => 0 } }", "match expressions"),
+            (
+                "fn f(n: i64) -> i64 { match n { _ => 0 } }",
+                "match expressions",
+            ),
             // a comptime block.
             ("fn f() -> i64 { comptime { 1 + 1 } }", "comptime blocks"),
             // a defer statement.

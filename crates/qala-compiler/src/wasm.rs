@@ -582,7 +582,11 @@ mod tests {
     fn compiled(source: &str) -> Qala {
         let mut qala = Qala::new();
         let result = qala.compile_core(source);
-        assert!(result.ok, "fixture compile failed: {:?}", result.diagnostics);
+        assert!(
+            result.ok,
+            "fixture compile failed: {:?}",
+            result.diagnostics
+        );
         qala
     }
 
@@ -596,7 +600,11 @@ mod tests {
     fn compile_core_on_a_clean_program_returns_ok_with_disassembly() {
         let mut qala = Qala::new();
         let result = qala.compile_core("fn main() is io {\n  println(\"hi\")\n}");
-        assert!(result.ok, "expected a clean compile: {:?}", result.diagnostics);
+        assert!(
+            result.ok,
+            "expected a clean compile: {:?}",
+            result.diagnostics
+        );
         let disassembly = result.disassembly.expect("clean compile has disassembly");
         assert!(!disassembly.is_empty(), "disassembly should not be empty");
     }
@@ -608,8 +616,14 @@ mod tests {
         let src = "fn main() is io {\n  let x: i64 = \"not a number\"\n}";
         let result = qala.compile_core(src);
         assert!(!result.ok, "a type error must fail the compile");
-        assert!(result.disassembly.is_none(), "a failed compile has no disassembly");
-        assert!(!result.diagnostics.is_empty(), "the error must surface as a diagnostic");
+        assert!(
+            result.disassembly.is_none(),
+            "a failed compile has no disassembly"
+        );
+        assert!(
+            !result.diagnostics.is_empty(),
+            "the error must surface as a diagnostic"
+        );
         assert_eq!(
             result.diagnostics[0].line, 2,
             "the diagnostic should point at the offending line: {:?}",
@@ -624,7 +638,10 @@ mod tests {
         let src = "fn main() is io {\n  let unused = 1\n  println(\"hi\")\n}";
         let result = qala.compile_core(src);
         assert!(result.ok, "a warning must not block the compile");
-        assert!(result.disassembly.is_some(), "a warning compile still disassembles");
+        assert!(
+            result.disassembly.is_some(),
+            "a warning compile still disassembles"
+        );
         assert!(
             result.diagnostics.iter().any(|d| d.severity == 0),
             "the unused-variable warning should be in the diagnostics: {:?}",
@@ -641,10 +658,20 @@ mod tests {
         // inside the ARM64 backend's shipped integer core.
         let src = "fn main() is io {\n  let x = 1 + 2\n  println(\"{x}\")\n}";
         let result = qala.compile_arm64_core(src);
-        assert!(result.ok, "expected ARM64 success: {:?}", result.diagnostics);
+        assert!(
+            result.ok,
+            "expected ARM64 success: {:?}",
+            result.diagnostics
+        );
         let assembly = result.assembly.expect("a success carries assembly");
-        assert!(!assembly.is_empty(), "the assembly text should not be empty");
-        assert!(result.diagnostics.is_empty(), "a success carries no diagnostics");
+        assert!(
+            !assembly.is_empty(),
+            "the assembly text should not be empty"
+        );
+        assert!(
+            result.diagnostics.is_empty(),
+            "a success carries no diagnostics"
+        );
     }
 
     #[test]
@@ -654,8 +681,14 @@ mod tests {
         // the ARM64 backend rejects it with a clean diagnostic.
         let result = qala.compile_arm64_core("fn main() is io {\n  let x = 1.5\n}");
         assert!(!result.ok, "a float program must fail the ARM64 backend");
-        assert!(result.assembly.is_none(), "a rejected program has no assembly");
-        assert!(!result.diagnostics.is_empty(), "the rejection must surface a diagnostic");
+        assert!(
+            result.assembly.is_none(),
+            "a rejected program has no assembly"
+        );
+        assert!(
+            !result.diagnostics.is_empty(),
+            "the rejection must surface a diagnostic"
+        );
         let message = &result.diagnostics[0].message;
         assert!(
             message.contains("f64") || message.contains("floats"),
@@ -669,8 +702,14 @@ mod tests {
         // a syntactically broken program fails the front end before the backend.
         let result = qala.compile_arm64_core("fn main( {");
         assert!(!result.ok, "a broken program must fail the compile");
-        assert!(result.assembly.is_none(), "a failed compile has no assembly");
-        assert!(!result.diagnostics.is_empty(), "the syntax error must surface a diagnostic");
+        assert!(
+            result.assembly.is_none(),
+            "a failed compile has no assembly"
+        );
+        assert!(
+            !result.diagnostics.is_empty(),
+            "the syntax error must surface a diagnostic"
+        );
     }
 
     // ---- the WASM-05 end-to-end test --------------------------------------
@@ -683,11 +722,18 @@ mod tests {
         let mut qala = Qala::new();
         let src = "fn main() is io {\n  let name = \"world\"\n  println(\"hello, {name}!\")\n}";
         let compiled = qala.compile_core(src);
-        assert!(compiled.ok, "end-to-end compile failed: {:?}", compiled.diagnostics);
+        assert!(
+            compiled.ok,
+            "end-to-end compile failed: {:?}",
+            compiled.diagnostics
+        );
         let run = qala.run_core();
         assert!(run.ok, "end-to-end run failed: {:?}", run.error);
         assert!(
-            run.state.console.iter().any(|l| l.contains("hello, world!")),
+            run.state
+                .console
+                .iter()
+                .any(|l| l.contains("hello, world!")),
             "console did not contain the expected output: {:?}",
             run.state.console,
         );
@@ -700,23 +746,38 @@ mod tests {
         let mut qala = Qala::new();
         let result = qala.run_core();
         assert!(!result.ok, "run before compile must report failure");
-        assert!(result.error.is_some(), "run before compile must carry a diagnostic");
+        assert!(
+            result.error.is_some(),
+            "run before compile must carry a diagnostic"
+        );
     }
 
     #[test]
     fn step_core_before_compile_returns_status_error() {
         let mut qala = Qala::new();
         let result = qala.step_core();
-        assert_eq!(result.status, "error", "step before compile must be an error");
-        assert!(result.error.is_some(), "step before compile must carry a diagnostic");
+        assert_eq!(
+            result.status, "error",
+            "step before compile must be an error"
+        );
+        assert!(
+            result.error.is_some(),
+            "step before compile must carry a diagnostic"
+        );
     }
 
     #[test]
     fn get_state_core_before_compile_returns_an_empty_state() {
         let qala = Qala::new();
         let state = qala.get_state_core();
-        assert!(state.stack.is_empty(), "an un-compiled session has no stack");
-        assert!(state.console.is_empty(), "an un-compiled session has no console");
+        assert!(
+            state.stack.is_empty(),
+            "an un-compiled session has no stack"
+        );
+        assert!(
+            state.console.is_empty(),
+            "an un-compiled session has no console"
+        );
     }
 
     #[test]
@@ -757,9 +818,17 @@ mod tests {
     fn repl_eval_core_persists_a_binding_across_calls() {
         let mut qala = Qala::new();
         let first = qala.repl_eval_core("let x = 5");
-        assert!(first.ok, "the binding line should evaluate: {:?}", first.error);
+        assert!(
+            first.ok,
+            "the binding line should evaluate: {:?}",
+            first.error
+        );
         let second = qala.repl_eval_core("x + 1");
-        assert!(second.ok, "the binding should be visible on the next call: {:?}", second.error);
+        assert!(
+            second.ok,
+            "the binding should be visible on the next call: {:?}",
+            second.error
+        );
         let value = second.value.expect("an expression line has a value");
         assert_eq!(value.rendered, "6", "x + 1 should render as 6");
     }
@@ -768,11 +837,22 @@ mod tests {
     fn repl_eval_core_console_persists_across_calls() {
         let mut qala = Qala::new();
         let first = qala.repl_eval_core("println(\"one\")");
-        assert!(first.ok, "the first println line should evaluate: {:?}", first.error);
+        assert!(
+            first.ok,
+            "the first println line should evaluate: {:?}",
+            first.error
+        );
         let first_len = first.console.len();
-        assert!(first_len > 0, "the first println should produce console output");
+        assert!(
+            first_len > 0,
+            "the first println should produce console output"
+        );
         let second = qala.repl_eval_core("println(\"two\")");
-        assert!(second.ok, "the second println line should evaluate: {:?}", second.error);
+        assert!(
+            second.ok,
+            "the second println line should evaluate: {:?}",
+            second.error
+        );
         assert!(
             second.console.len() > first_len,
             "the console should accumulate across calls: {:?}",

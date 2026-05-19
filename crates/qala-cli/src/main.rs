@@ -18,7 +18,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 /// the qala command-line compiler.
 #[derive(Parser)]
-#[command(name = "qala", version, about = "the qala programming language compiler")]
+#[command(
+    name = "qala",
+    version,
+    about = "the qala programming language compiler"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
