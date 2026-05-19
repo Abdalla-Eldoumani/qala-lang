@@ -47,7 +47,7 @@ function EditorHeader({
         <span className="font-[family-name:var(--font-display)] text-[28px] font-normal leading-[1.2] text-text-primary">
           Qala
         </span>
-        <span className="hidden text-[12px] font-medium leading-[1.4] text-text-secondary min-[768px]:inline">
+        <span className="hidden text-[12px] font-normal leading-[1.4] text-text-secondary min-[768px]:inline">
           a language that means what it says
         </span>
       </div>
@@ -94,11 +94,13 @@ function LoadingSurface() {
 }
 
 // the load-failure surface. it renders fixed plain-language copy -- never
-// the caught error. no stack trace, no error code, no exception text.
+// the caught error. no stack trace, no error code, no exception text. the
+// centered layout carries the surface; there is no border, and no side
+// stripe -- a colored left border on a block is an anti-pattern.
 function ErrorSurface() {
   return (
     <div className="flex h-full flex-col items-center justify-center bg-bg p-[var(--space-6)]">
-      <div className="max-w-[420px] border-l-2 border-error pl-[var(--space-4)]">
+      <div className="max-w-[420px] text-center">
         <p className="text-[14px] font-normal leading-[1.5] text-text-primary">
           the Qala compiler could not load
         </p>
