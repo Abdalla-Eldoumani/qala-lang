@@ -5,6 +5,12 @@ edition = "2024"
 description = "Command-line interface for the Qala programming language"
 license = "MIT"
 rust-version = "1.95.0"
+repository = "https://github.com/Abdalla-Eldoumani/qala-lang"
+homepage = "https://qala-lang.vercel.app"
+documentation = "https://docs.rs/qala-cli"
+readme = "../../README.md"
+keywords = ["compiler", "language", "cli", "repl", "interpreter"]
+categories = ["command-line-utilities", "development-tools", "compilers"]
 
 [[bin]]
 name = "qala"
