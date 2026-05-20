@@ -1,6 +1,6 @@
 [package]
 name = "qala-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Command-line interface for the Qala programming language"
 license = "MIT"
@@ -17,7 +17,7 @@ name = "qala"
 path = "src/main.rs"
 
 [dependencies]
-qala-compiler = { path = "../qala-compiler", version = "0.1.0" }
+qala-compiler = { path = "../qala-compiler", version = "0.1.1" }
 clap = { version = "4.6", features = ["derive"] }
 reedline = "0.47"
 
