@@ -4,7 +4,7 @@ import { ImageResponse } from "next/og";
 // the layout mirrors the playground's codex palette: dark background, the
 // warm accent on the "Qala" wordmark, the muted text token on the tagline.
 
-export const alt = "Qala — a language that means what it says";
+export const alt = "Qala: a language that means what it says";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
