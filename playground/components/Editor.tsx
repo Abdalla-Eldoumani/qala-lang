@@ -195,6 +195,11 @@ export default function QalaEditor({
           lineHeight: 21,
           minimap: { enabled: false },
           scrollBeyondLastLine: false,
+          // wrap long lines to the editor's width. on a 375px phone the
+          // monaco viewport is too narrow for `return fibonacci(n - 1) +
+          // fibonacci(n - 2)` to fit on one line; without this it clips
+          // at the right edge and the user has to pan horizontally.
+          wordWrap: "on",
         }}
       />
     </div>
