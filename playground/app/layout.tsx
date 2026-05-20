@@ -34,7 +34,7 @@ export const viewport: Viewport = {
 // schema.org structured data so search engines and link unfurlers know
 // this page is a free, browser-based developer tool with a versioned
 // release and a download URL. type="application/ld+json" tells the
-// browser this is data, not script — nothing here ever executes.
+// browser this is data, not script. nothing here ever executes.
 const structuredData = {
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
