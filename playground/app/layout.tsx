@@ -31,6 +31,26 @@ export const viewport: Viewport = {
   initialScale: 1,
 };
 
+// schema.org structured data so search engines and link unfurlers know
+// this page is a free, browser-based developer tool with a versioned
+// release and a download URL. type="application/ld+json" tells the
+// browser this is data, not script — nothing here ever executes.
+const structuredData = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: SITE_NAME,
+  description: SITE_DESCRIPTION,
+  url: SITE_URL,
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "Web Browser",
+  softwareVersion: "0.1.0",
+  downloadUrl: "https://github.com/Abdalla-Eldoumani/qala-lang/releases/latest",
+  codeRepository: "https://github.com/Abdalla-Eldoumani/qala-lang",
+  programmingLanguage: ["Rust", "TypeScript"],
+  license: "https://opensource.org/licenses/MIT",
+  offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+};
+
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
@@ -39,7 +59,12 @@ export default function RootLayout({
       lang="en"
       className={`${fontDisplay.variable} ${fontBody.variable} ${fontMono.variable}`}
     >
-      <body>{children}</body>
+      <body>
+        <script id="ld-json" type="application/ld+json">
+          {JSON.stringify(structuredData)}
+        </script>
+        {children}
+      </body>
     </html>
   );
 }
