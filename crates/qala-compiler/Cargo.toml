@@ -5,6 +5,12 @@ edition = "2024"
 description = "Compiler and bytecode VM for the Qala programming language"
 license = "MIT"
 rust-version = "1.95.0"
+repository = "https://github.com/Abdalla-Eldoumani/qala-lang"
+homepage = "https://qala-lang.vercel.app"
+documentation = "https://docs.rs/qala-compiler"
+readme = "../../README.md"
+keywords = ["compiler", "language", "interpreter", "vm", "wasm"]
+categories = ["compilers", "wasm", "parser-implementations"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
