@@ -54,7 +54,18 @@ and run `qala` from there.
 
 ## build from source
 
-Run from the workspace root.
+You will need three toolchains installed:
+
+- **Rust 1.95 or newer.** Install [rustup](https://rustup.rs/) and run
+  `rustup default stable`.
+- **wasm-pack**, the Rust to WebAssembly toolchain. Once Rust is in place,
+  run `cargo install wasm-pack`. There is also a prebuilt-binary installer
+  at [rustwasm.github.io/wasm-pack/installer](https://rustwasm.github.io/wasm-pack/installer/).
+- **Node.js 22 or newer.** Download the LTS release from
+  [nodejs.org](https://nodejs.org/). npm ships with Node, no separate
+  install needed.
+
+Then, from the workspace root:
 
 ```bash
 cargo test --workspace
