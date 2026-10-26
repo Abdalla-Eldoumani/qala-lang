@@ -6,25 +6,25 @@
 //! one [`Chunk`] is one compiled function (or one throwaway `comptime`
 //! body). a [`Program`] holds every chunk plus the entry-point index, the
 //! globals table, and the parallel name tables the disassembler reads
-//! by index. constant-pool entries are append-only (no dedupe in v1 per
-//! Phase 4 research A6); the resulting deterministic insertion order is
+//! by index. constant-pool entries are append-only (no dedupe in v1);
+//! the resulting deterministic insertion order is
 //! the load-bearing invariant for "compile twice, same bytes" testing.
 //!
 //! the write helpers ([`Chunk::write_op`], [`Chunk::write_u16`],
 //! [`Chunk::write_i16`]) are the ONLY way to append to the byte stream;
 //! they update [`Chunk::source_lines`] in lockstep so the invariant
 //! `code.len() == source_lines.len()` holds after every emission. the
-//! peephole optimizer (Plan 04-05) uses `Vec::splice` directly on both
+//! peephole optimizer uses `Vec::splice` directly on both
 //! vectors, with the same lockstep discipline.
 //!
 //! forward jumps use [`Chunk::emit_jump`] / [`Chunk::patch_jump`] -- the
-//! Crafting Interpreters back-patching pair (Phase 4 research Pattern 4);
+//! Crafting Interpreters back-patching pair;
 //! backward jumps use [`Chunk::emit_loop`] when the target is already
 //! emitted. both error with [`crate::errors::QalaError::Parse`] +
-//! "branch too far" on i16 range overflow (Phase 4 research A1).
+//! "branch too far" on i16 range overflow.
 //!
 //! the disassembler ([`Chunk::disassemble`] + [`Program::disassemble`])
-//! is the documented contract for Phase 6's WASM bridge and Phase 8's
+//! is the documented contract for the WASM bridge and the playground's
 //! bytecode panel. byte-determinism is part of the contract; the inline
 //! `compile_twice_disassemble_twice` test guards it.
 
@@ -97,7 +97,7 @@ pub struct StructInfo {
 pub struct Program {
     /// one chunk per function, indexed by function id (u16 in CALL operands).
     pub chunks: Vec<Chunk>,
-    /// the chunks index where execution starts. Phase 4 codegen sets this
+    /// the chunks index where execution starts. codegen sets this
     /// to the index of the `main` function.
     pub main_index: usize,
     /// global names indexed by GET_GLOBAL / SET_GLOBAL u16 operands. v1 has
@@ -167,7 +167,7 @@ impl Chunk {
     }
 
     /// append a value to the constant pool and return its u16 index. the
-    /// pool is append-only (no dedupe in v1 per Phase 4 research A6);
+    /// pool is append-only (no dedupe in v1);
     /// determinism follows from this. the assumption is that 65536
     /// constants per chunk is more than realistic; debug builds assert
     /// the cap, production builds keep the cast for v1. widening to u32
@@ -256,8 +256,8 @@ impl Chunk {
     /// arithmetic per Crafting Interpreters chapter 23.
     ///
     /// returns `Err(QalaError::Parse { ..., "branch too far" })` when the
-    /// computed offset would not fit in i16. this is a v1 limitation
-    /// (Phase 4 research A1); widening to i32 is a v2 concern.
+    /// computed offset would not fit in i16. this is a v1 limitation;
+    /// widening to i32 is a v2 concern.
     pub fn patch_jump(&mut self, pos: usize) -> Result<(), QalaError> {
         let target = self.code.len();
         let jump = target as isize - pos as isize - 2;
@@ -298,7 +298,7 @@ impl Chunk {
     /// produce the human-readable listing for this chunk. one line per
     /// instruction: byte offset, opcode name (uppercase), operand
     /// interpretation, source line. the format is the documented contract
-    /// for Phase 6's WASM bridge and Phase 8's playground bytecode panel.
+    /// for the WASM bridge and the playground's bytecode panel.
     ///
     /// byte-deterministic: same input bytes produce byte-identical output
     /// on every run. no HashMap iteration, no debug formatters; constants
@@ -338,7 +338,7 @@ impl Chunk {
     /// render the operand string for the opcode starting at `off` in
     /// `code`. caller has already verified `Opcode::from_u8(code[off])`
     /// is `Some(op)`. the formatting table is the locked playground
-    /// contract per the Phase 4 plan.
+    /// contract.
     fn operand_string(&self, op: Opcode, off: usize, program: &Program) -> String {
         match op {
             // CONST(u16 idx) -> `#idx value`. the constant lives in the chunk.
@@ -416,7 +416,7 @@ impl Chunk {
             }
             // FIELD (u16 name_index) -> `#idx`. v1 does not yet track field
             // names beyond the constant pool; the raw index is shown. the
-            // playground can decorate this in Phase 8 if needed.
+            // playground can decorate this later if needed.
             Opcode::Field => {
                 let idx = self.read_u16(off + 1);
                 format!("#{idx}")
