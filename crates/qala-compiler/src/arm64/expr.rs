@@ -54,8 +54,8 @@ use super::Arm64Backend;
 
 /// the AAPCS64 integer-argument register count: arguments 0-7 go in `x0`-`x7`,
 /// a ninth argument would spill onto the stack. the integer core supports at
-/// most this many arguments per call; a stack-passed argument is a Phase 13+
-/// extension.
+/// most this many arguments per call; a stack-passed argument is not
+/// supported yet.
 ///
 /// `pub(super)` so `print.rs` derives its `MAX_PRINTF_HOLES` from this one
 /// source -- the printf hole limit is this count minus the `x0` the format
@@ -114,9 +114,8 @@ impl Arm64Backend {
             }
             TypedExpr::Unary { op, operand, .. } => self.compile_unary(op, operand),
             TypedExpr::Binary { op, lhs, rhs, .. } => self.compile_binary(op, lhs, rhs),
-            // Block recurses into the block via the minimal compile_block held
-            // in mod.rs for this plan (plan 12-02 replaces it with the full
-            // scope-aware version in stmt.rs).
+            // Block recurses into the block via the scope-aware compile_block
+            // in stmt.rs.
             TypedExpr::Block { block, .. } => self.compile_block(block),
             // a call to a user function: AAPCS64 argument passing and a bl.
             TypedExpr::Call {
@@ -907,7 +906,7 @@ mod tests {
     fn a_call_to_a_stdlib_function_is_rejected_cleanly() {
         // `abs` is a stdlib function, not a user function -- it is not in
         // `fn_names`, so the backend rejects the call with a clean QalaError
-        // (the stdlib is Phase 13), never a panic, never a bl. `abs(i64)`
+        // (the backend has no stdlib yet), never a panic, never a bl. `abs(i64)`
         // type-checks to `i64`, so the rejection is the backend's, not the
         // typechecker's.
         let src = "fn caller() -> i64 { abs(-1) }";
@@ -926,7 +925,7 @@ mod tests {
 
     #[test]
     fn a_user_function_named_println_routes_as_a_user_call_not_the_printf_path() {
-        // WR-01 regression. the typechecker does not reserve `print` /
+        // regression test. the typechecker does not reserve `print` /
         // `println`: a program may declare its own `fn println(n: i64) -> i64`,
         // and the bytecode backend runs that user function. the arm64 backend
         // must agree -- a call to the shadowing user `println` lowers to an
@@ -1012,7 +1011,7 @@ mod tests {
 
     #[test]
     fn a_nested_call_in_a_later_argument_does_not_clobber_an_earlier_argument() {
-        // CR-01 regression. `h(100, id(7))` where `h` returns its FIRST
+        // regression test. `h(100, id(7))` where `h` returns its FIRST
         // parameter: `f` must compute h(100, _) and so return 100. the bug was
         // a single shared argument run -- the nested `id(7)` reused argument
         // slot 0 and overwrote the outer call's stored 100 with 7, so `f`
@@ -1068,7 +1067,7 @@ mod tests {
 
     #[test]
     fn a_deep_arithmetic_call_argument_keeps_every_slot_inside_the_frame() {
-        // CR-02 regression. `id(((a+1)*(a+2)) - ((a+3)*(a+4)))` -- a call whose
+        // regression test. `id(((a+1)*(a+2)) - ((a+3)*(a+4)))` -- a call whose
         // single argument is a deeply-nested arithmetic expression. the bug
         // was that the frame planner's spill-depth pre-walk had no `Call` arm,
         // so the call contributed zero scratch depth even though its argument
