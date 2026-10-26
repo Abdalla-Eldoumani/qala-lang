@@ -24,7 +24,7 @@
 use crate::ast;
 use crate::effects::EffectSet;
 use crate::errors::QalaError;
-#[allow(unused_imports)] // task 2 uses this in the depth-cap check.
+#[allow(unused_imports)] // used by the depth-cap check in infer_expr.
 use crate::parser::MAX_DEPTH;
 use crate::span::{LineIndex, Span};
 use crate::typed_ast;
@@ -84,11 +84,10 @@ pub fn check_program(
     }
     // detect any recursive-struct cycles before pass 2 runs.
     c.detect_recursive_structs();
-    // pass 2 placeholder: build a TypedAst by translating each item. tasks
-    // 2-5 fill in the real check_item that walks bodies and types
-    // expressions; for task 1 this returns a minimal-but-valid typed shape.
+    // pass 2: build a TypedAst by translating each item; check_item walks
+    // bodies and types expressions.
     let typed: typed_ast::TypedAst = ast.iter().map(|item| c.check_item(item)).collect();
-    // pass 3 placeholder: task 3 implements the effect fixed-point.
+    // pass 3: the effect fixed-point.
     c.resolve_function_effects();
     // deterministic sort by (span.start, span.len).
     c.errors.sort_by_key(|e| (e.span().start, e.span().len));
@@ -117,7 +116,7 @@ struct SymbolTable {
 }
 
 /// a resolved struct declaration. fields are populated in pass 1 and
-/// consumed by the bidirectional checker in task 2 plus the
+/// consumed by the bidirectional checker plus the
 /// recursive-struct detector below.
 #[allow(dead_code)]
 struct StructInfo {
@@ -128,7 +127,7 @@ struct StructInfo {
 }
 
 /// a resolved enum declaration. fields are populated in pass 1 and consumed
-/// by the exhaustiveness checker in task 3.
+/// by the exhaustiveness checker.
 #[allow(dead_code)]
 struct EnumInfo {
     /// the variants in declaration order: name + resolved field types.
@@ -138,7 +137,7 @@ struct EnumInfo {
 }
 
 /// a resolved interface declaration. fields are populated in pass 1 and
-/// consumed by the structural-satisfaction checker in task 3.
+/// consumed by the structural-satisfaction checker.
 #[allow(dead_code)]
 struct InterfaceInfo {
     /// the required method signatures in declaration order.
@@ -148,7 +147,7 @@ struct InterfaceInfo {
 }
 
 /// a resolved interface-method signature. fields are populated in pass 1
-/// and consumed by the structural-satisfaction checker in task 3.
+/// and consumed by the structural-satisfaction checker.
 #[allow(dead_code)]
 struct MethodSigInfo {
     /// the method name.
@@ -177,8 +176,8 @@ struct FnKey {
 }
 
 /// a resolved function declaration. fields are populated in pass 1 and
-/// consumed by the bidirectional checker (task 2), the effect fixed-point
-/// (task 3), and the structural-satisfaction checker (task 3).
+/// consumed by the bidirectional checker, the effect fixed-point, and the
+/// structural-satisfaction checker.
 #[allow(dead_code)]
 struct FnInfo {
     /// the parameter list: name + resolved type + an unevaluated default if
@@ -210,7 +209,7 @@ struct LocalInfo {
     span: Span,
     /// whether the binding was declared `let mut`.
     is_mut: bool,
-    /// whether the binding has been read at least once. tasks 4-5 use this
+    /// whether the binding has been read at least once. used
     /// to fire the `unused_var` warning.
     used: bool,
     /// whether this is a function parameter (exempt from `unused_var` per
@@ -287,7 +286,7 @@ struct Checker<'src> {
     /// returning.
     warnings: Vec<QalaWarning>,
     /// the `// qala: allow(...)` directive table built once at the start of
-    /// [`check_program`]. tasks 4-5 use it to silence warnings per-line.
+    /// [`check_program`]. used to silence warnings per-line.
     allow: HashMap<usize, BTreeSet<String>>,
     /// the active lexical scopes. each scope is a name -> local-info map;
     /// the topmost is the innermost.
@@ -299,7 +298,7 @@ struct Checker<'src> {
     depth: u32,
     /// per-function record (intrinsic body effect, called fns, candidate
     /// call sites). populated during pass 2's `check_fn_decl`; consumed by
-    /// pass 3's `resolve_function_effects` in task 3.
+    /// pass 3's `resolve_function_effects`.
     body_records: HashMap<FnKey, BodyEffectRecord>,
 }
 
@@ -315,7 +314,7 @@ impl<'src> Checker<'src> {
             collected_interface_names: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
-            // task 5 replaces this empty map with the real scanner output.
+            // check_program replaces this with the scan_allow_directives output.
             allow: HashMap::new(),
             scopes: Vec::new(),
             fn_ctx: None,
@@ -456,7 +455,7 @@ impl<'src> Checker<'src> {
                 // resolve self to the receiver -- but at the interface
                 // declaration site we don't yet know the receiver type, so
                 // we treat `self` as `QalaType::Unknown` here. structural
-                // satisfaction (task 3) ignores the self slot when matching
+                // satisfaction ignores the self slot when matching
                 // against an impl's `fn Type.method`.
                 let params: Vec<QalaType> = m
                     .params
@@ -2752,9 +2751,9 @@ impl<'src> Checker<'src> {
 
     /// type-check a match expression.
     ///
-    /// task 2 implements the basic typing rule: infer the scrutinee, type
-    /// each arm body, require a common arm body type (Unknown counts as
-    /// poison). exhaustiveness checking is task 3.
+    /// the basic typing rule: infer the scrutinee, type each arm body,
+    /// require a common arm body type (Unknown counts as poison), then
+    /// check exhaustiveness.
     fn check_match(
         &mut self,
         scrutinee: &ast::Expr,
@@ -2801,7 +2800,7 @@ impl<'src> Checker<'src> {
                 span: arm.span,
             });
         }
-        // exhaustiveness check (task 3): only against an enum scrutinee.
+        // exhaustiveness check: only against an enum scrutinee.
         if let QalaType::Named(Symbol(enum_name)) = &scrut_ty
             && self.symbols.enums.contains_key(enum_name)
         {
@@ -3016,7 +3015,7 @@ impl<'src> Checker<'src> {
     /// bind any names introduced by a pattern into the topmost scope, with
     /// types derived from the scrutinee type.
     ///
-    /// task 2's minimal implementation: for `Variant { sub }`, look up the
+    /// the rules: for `Variant { sub }`, look up the
     /// variant in any enum and use its field types; for `Binding`, bind
     /// the scrutinee type; for literal / wildcard patterns, nothing.
     fn bind_pattern(&mut self, pattern: &ast::Pattern, scrut_ty: &QalaType) {
@@ -3233,8 +3232,7 @@ fn format_fn_sig(params: &[QalaType], ret: &QalaType) -> String {
     }
 }
 
-/// one entry in the stdlib signature table. task 3 fills in the actual
-/// list; task 2 only needs the shape so dependent code compiles.
+/// one entry in the stdlib signature table.
 #[allow(dead_code)]
 struct StdlibFn {
     /// `None` for a free function; `Some(T)` for `fn T.method` (e.g.
@@ -3314,10 +3312,9 @@ fn stdlib_effect(key: &FnKey) -> Option<EffectSet> {
     None
 }
 
-/// the hardcoded stdlib signature table. task 3 finalises this; task 2's
-/// stub gives enough entries that pass 2 tests resolve the names they need
-/// (println, print, parse_int-shaped placeholders are NOT in the stdlib;
-/// the test fixtures define those as user functions when needed).
+/// the hardcoded stdlib signature table. a name that is not listed here
+/// (a `parse_int`-shaped helper, say) is defined as a user function by the
+/// test fixtures that need it.
 fn stdlib_signatures() -> Vec<StdlibFn> {
     vec![
         StdlibFn {
@@ -4083,7 +4080,7 @@ mod tests {
         assert_eq!(unreach.len(), 1, "{warnings:?}");
     }
 
-    // ---- task 3: effect fixed-point + exhaustiveness + interfaces ---------
+    // ---- effect fixed-point + exhaustiveness + interfaces -----------------
 
     #[test]
     fn pure_add_function_has_no_effect_errors() {
@@ -4322,7 +4319,7 @@ mod tests {
         }
     }
 
-    // ---- task 4: five warning categories ----------------------------------
+    // ---- five warning categories ------------------------------------------
 
     #[test]
     fn unused_var_warns_with_correct_category() {
@@ -4505,7 +4502,7 @@ mod tests {
         assert_eq!(w.len(), 1, "{warnings:?}");
     }
 
-    // ---- task 5: directive scanner ----------------------------------------
+    // ---- directive scanner ------------------------------------------------
 
     #[test]
     fn directive_scanner_handles_section_8_edge_cases() {
