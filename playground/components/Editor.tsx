@@ -5,7 +5,7 @@
 // the use-client directive here plus the ssr-false dynamic import in
 // page.tsx are the two layers that keep it client-only.
 //
-// phase 8 adds three things on top of the phase 7 syntax-and-theme base:
+// three things sit on top of the syntax-and-theme base:
 // diagnostic underlines from the structured compile result, a whole-line
 // highlight tracking the vm's current source line during step-through,
 // and a quiet needs-compile rule shown while the source is dirty. the
@@ -52,10 +52,10 @@ export default function QalaEditor({
   // since the last successful compile: the current-line decoration is
   // stale and gets cleared, but the diagnostic markers stay (a failed
   // compile leaves the source dirty, so its errors must remain visible).
-  // plan 08-05 wires these from useQala.
+  // the page wires these from useQala.
   //
-  // the three step-through props are optional: the phase 7 page renders
-  // this editor with value/onChange only, and plan 08-05 adds the wiring.
+  // the three step-through props are optional: the editor also renders
+  // with value/onChange only.
   // the defaults are the inert "no compile, not stepping, not dirty"
   // state: the editor shows no markers, no line highlight, no rule.
   lastCompile = null,
