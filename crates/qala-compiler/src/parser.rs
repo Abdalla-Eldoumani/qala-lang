@@ -91,7 +91,7 @@ impl<'t> Parser<'t> {
     /// useful for the few two-token decisions the grammar needs (e.g. is the
     /// token after `Ident` a `(` opening a call, or a `{` opening a struct
     /// literal).
-    #[allow(dead_code)] // wired in by Task 3's struct-literal lookahead
+    #[allow(dead_code)] // kept for a struct-literal lookahead; unused today
     fn peek2(&self) -> &TokenKind {
         self.tokens
             .get(self.pos + 1)
@@ -2695,7 +2695,7 @@ mod tests {
     // ---- delimited list -----------------------------------------------------
     //
     // delimited_list is exercised end-to-end through the expression engine
-    // (Task 3) on `(args)`, `[elems]`, struct literal `{ fields }`, match arms,
+    // on `(args)`, `[elems]`, struct literal `{ fields }`, match arms,
     // etc. it is also unit-tested here against a tiny "parse a list of idents"
     // closure to pin the open / sep / close behaviour and the "blame the
     // opener" rule independently of any expression machinery.
@@ -4042,7 +4042,7 @@ mod tests {
     // The deep-nesting integration test: this MUST actually run without a
     // stack overflow. if it segfaults, the depth guard is not wired around
     // all recursive productions, or `MAX_DEPTH` is too high; either is a real
-    // bug to fix in Tasks 1-2's code, not to work around here.
+    // bug to fix in the parser, not to work around here.
 
     #[test]
     fn deeply_nested_input_fails_gracefully_not_with_a_stack_overflow() {
