@@ -1,4 +1,4 @@
-// these mirror the phase 6 rust serde structs. field names are
+// these mirror the rust serde structs in the WASM bridge. field names are
 // snake_case to match serde's default serialization -- the rust
 // structs carry no #[serde(rename)]. verified against:
 //   compiler/src/wasm.rs        CompileResult/RunResult/StepResult/ReplResult
@@ -75,8 +75,7 @@ export interface StepResult {
   error?: MonacoDiagnostic; // a diagnostic on a runtime fault, else absent
 }
 
-// wasm.rs ReplResult -- declared now for phase 8's console; not used
-// by phase 7's useQala surface.
+// wasm.rs ReplResult -- the console's repl result.
 export interface ReplResult {
   ok: boolean;
   value?: StateValue; // the evaluated value; absent when there is none
