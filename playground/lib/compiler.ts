@@ -6,7 +6,7 @@
 // which useQala catches.
 //
 // the casts in loadQala's returned methods are the single controlled any
-// boundary the root CLAUDE.md sanctions: the generated qala_compiler.d.ts
+// boundary in the playground: the generated qala_compiler.d.ts
 // types every Qala method return as any, so the wrapper narrows them once.
 import type {
   Arm64Result,
