@@ -5,7 +5,7 @@
 //! last three are stored explicitly: an empty bitfield IS pure. the lattice
 //! is the powerset of `{Io, Alloc, Panic}` ordered by subset; lattice height
 //! is 4 (the chain `pure -> +io -> +alloc -> +panic`). that height is what
-//! makes Plan 4's effect fixed-point loop terminate -- a monotonic ascent on
+//! makes the typechecker's effect fixed-point loop terminate -- a monotonic ascent on
 //! a finite lattice of height `h` converges in at most `h - 1` rounds
 //! (Davey & Priestley), so the iteration is guaranteed to settle in <= 3
 //! rounds regardless of call-graph shape.
@@ -19,7 +19,7 @@
 //! diagnostics need a deterministic textual form -- the renderer must produce
 //! byte-identical output for the same set every time. [`EffectSet::display`]
 //! enumerates the flags in fixed (Io, Alloc, Panic) order and renders an
-//! empty set as `"pure"`. that wording is the contract Plan 5's
+//! empty set as `"pure"`. that wording is the contract the
 //! `EffectViolation` diagnostic wording depends on.
 //!
 //! this file depends only on `core::fmt`. no inference logic lives here --
@@ -116,8 +116,8 @@ impl EffectSet {
     /// the lattice join: the union of `self`'s flags and `other`'s flags.
     ///
     /// idempotent (`a.union(a) == a`), commutative (`a.union(b) == b.union(a)`),
-    /// and associative. these properties are what guarantee Plan 4's
-    /// fixed-point loop converges monotonically.
+    /// and associative. these properties are what guarantee the
+    /// effect fixed-point loop converges monotonically.
     pub fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
