@@ -1,14 +1,14 @@
 //! the peephole optimizer: a single-pass walk over a [`crate::chunk::Chunk`]
 //! removing wasteful instruction patterns and folding constant-condition
-//! jumps. eight locked patterns -- the v1 set in 04-CONTEXT.md "Optimizations"
-//! -- each matched with a 2-3 instruction sliding window.
+//! jumps. eight locked patterns -- the v1 set -- each
+//! matched with a 2-3 instruction sliding window.
 //!
 //! every rewrite preserves the source line of the surviving instruction
-//! (the locked OPT-02 contract); when a rewrite removes `delta` bytes at
+//! (a locked contract); when a rewrite removes `delta` bytes at
 //! offset `cut_at`, JUMP* and MATCH_VARIANT offsets whose source-to-target
 //! span crossed the cut are adjusted by the locked delta. a rewrite whose
-//! JUMP fix-up would overflow i16 range is SKIPPED (single-pass discipline
-//! locked per OPT-03; v2 may widen to i32).
+//! JUMP fix-up would overflow i16 range is SKIPPED (single-pass discipline;
+//! v2 may widen to i32).
 //!
 //! single-pass: the optimizer does NOT iterate to a fixed point. a pattern
 //! that becomes matchable only after another rewrite is missed in v1. a
@@ -39,8 +39,7 @@ use crate::value::ConstValue;
 /// idempotent: a second pass does no further work, because the first pass
 /// already collapsed every window matchable in a single left-to-right scan.
 /// a rewrite whose JUMP fix-up would overflow i16 range is skipped, leaving
-/// that window un-rewritten (no error -- single-pass discipline locked per
-/// OPT-03).
+/// that window un-rewritten (no error -- single-pass discipline).
 pub fn peephole(chunk: &mut Chunk) {
     let mut i: usize = 0;
     while i < chunk.code.len() {
