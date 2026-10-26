@@ -624,11 +624,10 @@ mod tests {
     #[test]
     fn render_arrow_line_uses_1_based_line_and_column() {
         // src "abcde\nfghij": bytes a=0,b=1,c=2,d=3,e=4,\n=5,f=6,g=7,...
-        // byte 6 (the `f`) is on line 2, column 1 -- the Plan's stated
-        // expected output "  --> 2:1" corresponds to byte 6, not byte 5
-        // (byte 5 is the `\n` on line 1 col 6). picking byte 6 here
-        // matches the Plan's intent: "show that a span on line 2 col 1
-        // renders the arrow line correctly".
+        // byte 6 (the `f`) is on line 2, column 1 -- the expected output
+        // "  --> 2:1" corresponds to byte 6, not byte 5 (byte 5 is the `\n`
+        // on line 1 col 6). picking byte 6 here shows that a span on line 2
+        // col 1 renders the arrow line correctly.
         let d = Diagnostic {
             severity: Severity::Error,
             category: None,
