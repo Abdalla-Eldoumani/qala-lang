@@ -1,5 +1,5 @@
 //! the diagnostics layer: one [`Diagnostic`] data model with two rendering
-//! paths -- [`Diagnostic::render`] (Task 2) produces a Rust-style
+//! paths -- [`Diagnostic::render`] produces a Rust-style
 //! ASCII-underlined source block for CLI output and snapshot tests;
 //! [`Diagnostic::to_monaco`] produces a serde-Serialize [`MonacoDiagnostic`]
 //! for the playground's inline editor underlines. errors and warnings share
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(a.primary_span, b.primary_span);
     }
 
-    // ---- Task 2: render tests ---------------------------------------------
+    // ---- render tests -----------------------------------------------------
 
     #[test]
     fn render_header_says_error_for_an_error_diagnostic() {
