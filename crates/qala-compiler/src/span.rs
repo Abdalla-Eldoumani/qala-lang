@@ -235,7 +235,7 @@ mod tests {
     fn location_counts_columns_as_characters_so_tabs_are_one_column() {
         // line 2 is "\t\tx": two tabs then 'x'. the 'x' is byte 6, column 3
         // (char count from line start: tab, tab, then x is the 3rd char), not
-        // column 17 or anything tab-expanded. this is LEX-06.
+        // column 17 or anything tab-expanded.
         let src = "fn f() {\n\t\tx\n}";
         let idx = LineIndex::new(src);
         let x_offset = src.find('x').unwrap();
