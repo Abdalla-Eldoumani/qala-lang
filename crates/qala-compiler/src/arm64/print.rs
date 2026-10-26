@@ -39,7 +39,7 @@
 //! the format-string pointer takes `x0`, so the AArch64 argument registers
 //! `x1`-`x7` hold at most seven holes; an interpolation with more is rejected.
 //!
-//! Phase 12's `main` prologue keeps `sp` 16-byte aligned for the whole body
+//! the `main` prologue keeps `sp` 16-byte aligned for the whole body
 //! (`sp` never moves mid-body -- locals are `fp`-relative), so the `bl printf`
 //! site is correctly aligned.
 
@@ -181,7 +181,7 @@ impl Arm64Backend {
     /// emit the `printf` call: intern the format string, evaluate every hole
     /// into an argument register, and `bl printf`.
     ///
-    /// each hole is evaluated into `x0` through the Phase 12 expression codegen
+    /// each hole is evaluated into `x0` through the expression codegen
     /// and spilled to a freshly claimed scratch slot -- evaluating hole `k+1`
     /// into `x0` would clobber hole `k`, exactly the clobber `compile_call`
     /// avoids for a user call's arguments. once every hole is in a slot the
@@ -708,7 +708,7 @@ mod tests {
 
     #[test]
     fn a_non_i64_hole_rejection_matches_the_error_snapshot() {
-        // the new ARM-05 boundary the printf path introduces: a non-i64
+        // the new clean-rejection boundary the printf path introduces: a non-i64
         // interpolation hole. `compile_arm64` returns `Err`; the rendered
         // diagnostic text is snapshotted -- the backend's clean rejection of
         // an unsupported interpolation hole.
@@ -744,10 +744,10 @@ mod tests {
 
     #[test]
     fn a_printf_with_deep_holes_keeps_every_slot_inside_the_frame() {
-        // WR-02 regression. the printf frame-sizing path
+        // regression test. the printf frame-sizing path
         // (`printf_call_spill_depth` / `emit_printf`) had no isolated
-        // frame-containment proof: the Phase 12 "scratch overflow past the
-        // frame" CRITICAL was caught only by the `expr.rs` containment test,
+        // frame-containment proof: the earlier "scratch overflow past the
+        // frame" bug was caught only by the `expr.rs` containment test,
         // and a regression dropping the `+ deepest` term -- so a hole that is
         // a deep arithmetic expression or a multi-arg call under-reserves --
         // would pass every snapshot-style printf test.
