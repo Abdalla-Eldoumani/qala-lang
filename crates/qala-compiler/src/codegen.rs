@@ -1,5 +1,5 @@
 //! the bytecode codegen: lower a [`TypedAst`] to a [`Program`] of bytecode
-//! chunks, ready for the Phase 5 stack VM to execute.
+//! chunks, ready for the stack VM to execute.
 //!
 //! one recursive walk over the typed AST; each typed expression and
 //! statement compiles to a sequence of opcodes via the write helpers on
@@ -29,7 +29,8 @@
 //! returns Err(Vec<QalaError>) sorted by (span.start, span.len); on full
 //! success it returns Ok(Program).
 //!
-//! file order (per compiler/CLAUDE.md): `value -> opcode -> chunk -> codegen`.
+//! module order: `value -> opcode -> chunk -> codegen`, each building only on
+//! the ones before it.
 //! every byte this module writes goes through [`Chunk::write_op`] /
 //! [`Chunk::write_u16`] / [`Chunk::write_i16`] so the lockstep invariant
 //! `chunk.code.len() == chunk.source_lines.len()` survives codegen.
@@ -1891,7 +1892,7 @@ impl<'a> Codegen<'a> {
     /// `LocalsScope` so a `defer` inside an arm fires at arm exit.
     ///
     /// the precise stack discipline of `MATCH_VARIANT` is finalized by the
-    /// Phase 5 VM; codegen emits the locked DUP / MATCH_VARIANT / POP shape
+    /// VM; codegen emits the locked DUP / MATCH_VARIANT / POP shape
     /// per arm so the bytecode is well-formed for that VM to interpret.
     fn compile_match(
         &mut self,
@@ -2300,8 +2301,8 @@ struct Frame {
 /// the compile-time bytecode interpreter. a small stack VM that executes a
 /// `comptime` block's bytecode under a hard instruction budget; it supports
 /// only pure computation -- arithmetic, comparisons, locals, jumps, and calls
-/// to functions whose effect set is pure (a defense-in-depth gate; Phase 3
-/// already enforces comptime-body purity).
+/// to functions whose effect set is pure (a defense-in-depth gate; the type
+/// checker already enforces comptime-body purity).
 struct ComptimeInterpreter<'a> {
     /// the program -- supplies the chunks that comptime CALLs dispatch into.
     program: &'a Program,
@@ -2521,7 +2522,7 @@ impl<'a> ComptimeInterpreter<'a> {
                     let fn_id = chunk.read_u16(ip + 1);
                     let argc = chunk.code[ip + 3];
                     // defense-in-depth: a non-pure callee is rejected even
-                    // though Phase 3 should already have caught it.
+                    // though the type checker should already have caught it.
                     let effect = self
                         .fn_effects
                         .get(&fn_id)
@@ -3408,8 +3409,8 @@ mod tests {
     }
 
     // Test 3: a pipeline with extra args prepends the lhs as the first
-    // argument. (a user fn with extra args fails the Phase 3 pipeline arity
-    // check; only the generic stdlib functions accept the form, and only in
+    // argument. (a user fn with extra args fails the type checker's pipeline
+    // arity check; only the generic stdlib functions accept the form, and only in
     // a `let` binding -- a pipeline as a fn trailing-return-value hits a
     // stricter check path. so this mirrors the bundled `pipeline.qala`:
     // `let evens = numbers |> filter(is_even)`.)
