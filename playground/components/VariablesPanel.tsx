@@ -26,7 +26,7 @@ function VariableRow({ variable }: { variable: NamedValue }) {
       <span className="min-w-0 flex-1 truncate text-text-primary">
         {variable.value.rendered}
       </span>
-      {/* the type tag: a quiet reference chip, the one phase 8 use of the
+      {/* the type tag: a quiet reference chip, on the
           2px tag radius. Label type (the body font), --text-secondary,
           a --surface-raised fill so it reads as a tag, not as text. */}
       <span className="shrink-0 rounded-[var(--radius-tag)] bg-surface px-[var(--space-1)] text-[12px] font-medium leading-[1.4] text-text-secondary">
@@ -40,8 +40,8 @@ export default function VariablesPanel({
   className,
   // state carries the current frame's variables; null before the first
   // step (or after a Reset). dirty true means the variables are stale.
-  // these are optional: the phase 7 page renders this panel chrome-only,
-  // and plan 08-05 wires the live snapshots. the defaults are the empty,
+  // these are optional: without them the panel renders chrome-only; the
+  // page wires the live snapshots. the defaults are the empty,
   // not-stepping, not-dirty state.
   state = null,
   dirty = false,
