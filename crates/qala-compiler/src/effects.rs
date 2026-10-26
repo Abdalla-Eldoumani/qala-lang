@@ -23,8 +23,8 @@
 //! `EffectViolation` diagnostic wording depends on.
 //!
 //! this file depends only on `core::fmt`. no inference logic lives here --
-//! the type checker builds an [`EffectSet`] from each function's body in a
-//! later plan; this module just provides the data and its operations.
+//! the type checker builds an [`EffectSet`] from each function's body; this
+//! module just provides the data and its operations.
 
 /// the `Io` flag's bit in [`EffectSet`]'s u8 repr.
 ///
