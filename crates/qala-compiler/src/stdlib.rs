@@ -27,8 +27,8 @@
 //! | 40013 | `reduce`   | pure*  | fold an array with a callback |
 //! | 40014 | `read_all` | io     | read a file handle's content (`FileHandle.read_all`) |
 //!
-//! (`map` / `filter` / `reduce` inherit the callback's effect; Phase 3's effect
-//! inference already propagated that into the caller, so the native code here
+//! (`map` / `filter` / `reduce` inherit the callback's effect; the type
+//! checker's effect inference already propagated that into the caller, so the native code here
 //! does not re-check effects.)
 //!
 //! the effect column is consistent with the typechecker's `stdlib_signatures`
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn map_reentrant_a_nested_map_inside_the_callback_works() {
-        // RESEARCH Pitfall 7: a `map` whose callback itself calls `map` must
+        // a `map` whose callback itself calls `map` must
         // produce the correct nested result. `double_row` is the outer
         // callback; it calls `map(row, double)` -- a nested re-entry. the loop
         // state of each `map` stays in Rust locals, so the inner map does not
@@ -995,7 +995,7 @@ mod tests {
     fn six_examples_run_to_completion() {
         // every bundled example compiles, runs to completion without a runtime
         // error, and -- for the examples that print -- produces the expected
-        // console output. the examples are the acceptance corpus for Phase 5.
+        // console output. the examples are the VM's acceptance corpus.
 
         // hello: string interpolation -> "hello, world!".
         let hello = run_example("hello");
