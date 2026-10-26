@@ -137,8 +137,8 @@ export default function StackPanel({
   className,
   // state carries the value stack the panel renders; null before the
   // first step (or after a Reset). dirty true means the stack is stale.
-  // these are optional: the phase 7 page renders this panel chrome-only,
-  // and plan 08-05 wires the live snapshots. the defaults are the empty,
+  // these are optional: without them the panel renders chrome-only; the
+  // page wires the live snapshots. the defaults are the empty,
   // not-stepping, not-dirty state.
   state = null,
   dirty = false,
