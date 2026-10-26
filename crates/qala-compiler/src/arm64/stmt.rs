@@ -69,7 +69,7 @@ impl Arm64Backend {
     /// block does not see them. the trailing value's result, if any, lands in
     /// `x0` -- it is the block's value.
     ///
-    /// Phase 12 emits straight-line code with no dead-code elimination: a
+    /// the backend emits straight-line code with no dead-code elimination: a
     /// statement after a `return` still emits, which is correct (merely
     /// unreachable), so this returns `Result<(), QalaError>` rather than a
     /// terminator flag.
