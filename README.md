@@ -137,7 +137,7 @@ diagnostic path; program output goes to stdout, errors to stderr.
 **ARM64 backend.** A second codegen target emits AArch64 assembly text in the
 CPSC 355 hosted-Linux dialect: `qala build --target arm64 program.qala`. The
 integer core is verified end to end under QEMU. The output is meant to be
-pasted into the [AArch64 playground](https://aarch64-playground.vercel.app) to
+pasted into the [AArch64 playground](https://aarch64-playground.com) to
 step through execution one instruction at a time.
 
 ## error messages
