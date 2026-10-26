@@ -7,13 +7,13 @@
 //! decoded only to know how far to advance and what to put in the error). every
 //! source index is a checked accessor or a position this scanner produced, and no
 //! malformed input reaches an `unwrap`/`expect`/`panic!`/`unreachable!` -- that
-//! discipline is load-bearing for Phase 6, where this code runs in WASM and a
+//! discipline is load-bearing for the WASM build, where this code runs in WASM and a
 //! panic aborts the module.
 //!
 //! the lexer is fail-fast: it returns `Result<Vec<Token>, QalaError>` and stops
 //! at the first error. the parser is fail-fast for the same reason -- the first
 //! error wins and parsing stops; multi-error reporting and resync points are
-//! deferred (per CONTEXT.md).
+//! deferred.
 
 use std::num::IntErrorKind;
 
@@ -572,7 +572,7 @@ impl<'src> Lexer<'src> {
         if is_float {
             match text.parse::<f64>() {
                 Ok(value) => Ok(TokenKind::Float(value)),
-                // a non-round-tripping float is NOT an error (a Phase 4 precision
+                // a non-round-tripping float is NOT an error (a codegen precision
                 // warning handles it); only a shape that slipped past the scanner
                 // lands here, which is genuinely malformed.
                 Err(_) => Err(self.malformed_number(start)),
