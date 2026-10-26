@@ -271,9 +271,9 @@ impl FrameLayout {
     /// the number of scratch spill slots this frame reserves for the
     /// expression codegen's nested-binary-operator spill discipline.
     ///
-    /// plan 12-02 consults this when it extends `plan_frame` to also count
-    /// `let`-binding slots -- the scratch reservation must survive that
-    /// extension. tests assert it against known expression shapes.
+    /// `plan_frame` also counts `let`-binding slots; the scratch reservation
+    /// must hold alongside them. tests assert it against known expression
+    /// shapes.
     #[allow(dead_code)]
     pub(crate) fn scratch_count(&self) -> i64 {
         self.scratch_count
