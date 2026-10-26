@@ -1,5 +1,5 @@
 //! the untyped AST: what the parser produces and the type checker consumes.
-//! every node carries a [`Span`] (so Phase 3's diagnostics underline the source
+//! every node carries a [`Span`] (so the type checker's diagnostics underline the source
 //! as written); the tree is boxed at recursive positions; nothing is desugared
 //! -- [`Expr::Pipeline`], [`Expr::Interpolation`], [`Stmt::For`], and
 //! [`Expr::Match`] are real nodes, not lowered to calls / `+` chains / `while`.
@@ -8,7 +8,7 @@
 //! `match` and `{ ... }` blocks produce values in expression position. method
 //! calls get their own node ([`Expr::MethodCall`]) distinct from field access
 //! ([`Expr::FieldAccess`]) -- the parser decides based on whether `(` follows
-//! the `.name`; Phase 3 resolves a method call to the free function
+//! the `.name`; the type checker resolves a method call to the free function
 //! `fn Type.name(self, ...)`.
 //!
 //! the node enums derive `Debug, Clone, PartialEq` and no more: no `Eq`,
@@ -63,7 +63,7 @@ impl Item {
 /// a `fn` declaration. `type_name` is `Some` for a `fn Type.method` definition
 /// (the receiver type's name) and `None` for a free function. `ret_ty` is the
 /// `-> T` return type, omitted for `void`. `effect` is the `is pure`/`io`/
-/// `alloc`/`panic` annotation, omitted when Phase 3 should infer it.
+/// `alloc`/`panic` annotation, omitted when the type checker should infer it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
     /// the receiver type's name for a `fn Type.method` definition, else `None`.
@@ -100,7 +100,7 @@ pub struct Param {
 }
 
 /// the four effect annotations. this is the parser's record of *which keyword
-/// appeared* (`is pure` etc.); the type checker's `effects` module (Phase 3)
+/// appeared* (`is pure` etc.); the type checker's `effects` module
 /// owns the real effect lattice and inference.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
@@ -163,7 +163,7 @@ pub struct Variant {
 
 /// an `interface` declaration: a name and a set of method signatures (no
 /// bodies). a type satisfies the interface structurally -- by having matching
-/// methods -- with no `implements` declaration; Phase 3 checks that.
+/// methods -- with no `implements` declaration; the type checker checks that.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterfaceDecl {
     /// the interface's name.
@@ -302,8 +302,8 @@ pub enum ElseBranch {
 /// nothing is desugared: [`Expr::Pipeline`] stays a pipeline (not `f(x, a)`),
 /// [`Expr::Interpolation`] stays a parts list (not a `+` chain), [`Expr::Match`]
 /// and [`Expr::Block`] produce values directly. that faithfulness is what lets
-/// Phase 3 diagnostics point at the source as written; lowering happens in
-/// Phase 4 codegen.
+/// type-checker diagnostics point at the source as written; lowering happens
+/// in codegen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// an integer literal (already decoded; a leading `-` is a separate
@@ -318,7 +318,8 @@ pub enum Expr {
     /// a boolean literal, `true` or `false`.
     Bool { value: bool, span: Span },
     /// an identifier reference (a variable, a function name, a type name in
-    /// value position -- the parser does not distinguish; Phase 3 resolves it).
+    /// value position -- the parser does not distinguish; the type checker
+    /// resolves it).
     Ident { name: String, span: Span },
     /// `( inner )` -- a parenthesized expression. kept as a node so the span and
     /// the parentheses are visible to diagnostics; semantically transparent.
@@ -335,7 +336,7 @@ pub enum Expr {
         span: Span,
     },
     /// `Name { field: e, ... }` -- a struct literal. `name` is the struct's
-    /// name; whether it names a real struct is Phase 3's call.
+    /// name; whether it names a real struct is the type checker's call.
     StructLit {
         name: String,
         fields: Vec<FieldInit>,
@@ -349,7 +350,7 @@ pub enum Expr {
         span: Span,
     },
     /// `receiver.name(args)` -- a method call. distinct from a field access
-    /// followed by a call; Phase 3 resolves it to `fn Type.name(self, ...)`.
+    /// followed by a call; the type checker resolves it to `fn Type.name(self, ...)`.
     MethodCall {
         receiver: Box<Expr>,
         name: String,
@@ -399,7 +400,7 @@ pub enum Expr {
         span: Span,
     },
     /// `lhs |> call` -- the pipeline operator. kept as a faithful node, NOT
-    /// lowered to `call(lhs, ...)`; that desugaring is Phase 4 codegen. `call`
+    /// lowered to `call(lhs, ...)`; that desugaring happens in codegen. `call`
     /// is whatever expression followed `|>` (typically a call or a bare function
     /// name); the parser does not rewrite it.
     Pipeline {
@@ -418,7 +419,7 @@ pub enum Expr {
     Block { block: Block, span: Span },
     /// `match scrutinee { arm, ... }` -- pattern matching with at least one arm.
     /// kept as a faithful node. each arm has a pattern, an optional `if` guard,
-    /// and a body (an expression or a block); Phase 3 checks exhaustiveness.
+    /// and a body (an expression or a block); the type checker checks exhaustiveness.
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
@@ -435,7 +436,7 @@ pub enum Expr {
     },
     /// a string with `{expr}` interpolations -- `parts` alternates literal text
     /// and embedded expressions, in source order. NOT desugared to a `+` chain;
-    /// the conversion-and-concatenation happens in Phase 4 codegen.
+    /// the conversion-and-concatenation happens in codegen.
     Interpolation { parts: Vec<InterpPart>, span: Span },
 }
 
@@ -550,7 +551,7 @@ pub enum InterpPart {
 pub enum Pattern {
     /// `Name(sub, ...)` -- destructure an enum variant; `sub` is the
     /// sub-patterns for its fields (empty for a no-data variant matched as
-    /// `Name`). whether `Name` is a real variant is Phase 3's call.
+    /// `Name`). whether `Name` is a real variant is the type checker's call.
     Variant {
         name: String,
         sub: Vec<Pattern>,
@@ -627,7 +628,7 @@ pub enum TypeExpr {
     /// a primitive type name: `i64`, `f64`, `bool`, `str`, `byte`, `void`.
     Primitive { kind: PrimType, span: Span },
     /// a named type -- a struct, enum, or interface name (the parser does not
-    /// distinguish; Phase 3 resolves it).
+    /// distinguish; the type checker resolves it).
     Named { name: String, span: Span },
     /// `[ elem; size ]` -- a fixed-size array. `size` is the literal length.
     Array {
@@ -647,7 +648,7 @@ pub enum TypeExpr {
     },
     /// `Name< T1, T2 >` -- a generic application (used by `Result<T, E>` and
     /// `Option<T>`). the parser allows it on any name; restricting which names
-    /// may be generic is Phase 3's job.
+    /// may be generic is the type checker's job.
     Generic {
         name: String,
         args: Vec<TypeExpr>,
