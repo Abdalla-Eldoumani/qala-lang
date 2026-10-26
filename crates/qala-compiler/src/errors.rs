@@ -15,7 +15,7 @@ use crate::token::TokenKind;
 /// fault. `PartialEq` so tests can compare errors directly; no `Eq` and no
 /// `serde` derives, because the parse variants carry [`TokenKind`], which holds
 /// an `f64` and is therefore neither `Eq` nor (currently) `serde`-derivable.
-/// the diagnostics layer (Phase 3) builds its own structured editor form from
+/// the diagnostics layer builds its own structured editor form from
 /// `span()` and `message()` rather than serializing this enum directly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QalaError {
@@ -217,7 +217,7 @@ pub enum QalaError {
     ComptimeBudgetExceeded { span: Span },
 
     /// defense-in-depth: the comptime interpreter dispatched a CALL whose
-    /// callee is not pure. phase 3's effect checker should have caught this;
+    /// callee is not pure. the typechecker's effect check should have caught this;
     /// emitting at codegen prevents the comptime interpreter from running
     /// an IO/alloc/panic body if the typechecker missed something. span =
     /// the comptime block's span (NOT the call site, since by codegen time
