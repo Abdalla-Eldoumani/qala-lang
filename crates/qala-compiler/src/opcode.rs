@@ -11,14 +11,14 @@
 //! module loop over every variant and over every byte 0..=255, so a missing
 //! arm or a wrong discriminant fails loudly.
 //!
-//! the disassembler ([`crate::chunk::Chunk::disassemble`], plan 04-03) reads
+//! the disassembler ([`crate::chunk::Chunk::disassemble`]) reads
 //! the byte stream back via [`Opcode::from_u8`] and renders via
-//! [`Opcode::name`]; the peephole optimizer ([`crate::optimizer::peephole`],
-//! plan 04-05) uses [`Opcode::operand_bytes`] as its step function for
+//! [`Opcode::name`]; the peephole optimizer ([`crate::optimizer::peephole`])
+//! uses [`Opcode::operand_bytes`] as its step function for
 //! walking past whole instructions. these three methods are the public
 //! contract this file owns.
 //!
-//! no `transmute`-based decode (anti-pattern per Phase 4 research): the
+//! no `transmute`-based decode (an anti-pattern for this): the
 //! match-based reverse lookup compiles to a branch table and is safe on
 //! every byte. zero-cost safety; idiomatic Rust pattern.
 
