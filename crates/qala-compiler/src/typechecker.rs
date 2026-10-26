@@ -19,7 +19,7 @@
 //! are sorted alphabetically via [`BTreeSet`]; the stdlib signatures table
 //! is a [`Vec`], not a [`HashMap`], so iteration is source-order. no panics on
 //! a malformed but well-formed-by-the-parser AST -- this discipline is
-//! load-bearing for Phase 6 where the typechecker runs in WASM.
+//! load-bearing for the WASM build, where the typechecker runs in WASM.
 
 use crate::ast;
 use crate::effects::EffectSet;
