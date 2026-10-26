@@ -14,7 +14,7 @@
 # the AArch64 toolchain (m4, aarch64-linux-gnu-gcc, qemu-aarch64) lives in WSL
 # Ubuntu; this script shells into WSL for the assemble/link/run steps. it
 # checks two programs: a printing integer demo, and the bundled fibonacci.qala
-# (the ARM-06 round-trip target).
+# (the round-trip target).
 #
 # usage:  bash crates/qala-compiler/tests/arm64-roundtrip/verify.sh
 # exit:   0 if every program's output matches, non-zero on the first mismatch.
@@ -165,10 +165,10 @@ count 3"
 
 echo ""
 
-# program 2: the bundled fibonacci.qala -- the ARM-06 round-trip target. it
+# program 2: the bundled fibonacci.qala -- the round-trip target. it
 # prints fib(0)..fib(14) through an i64-holed interpolation.
 check_program \
-    "fibonacci.qala (ARM-06)" \
+    "fibonacci.qala" \
     "$REPO_ROOT/playground/public/examples/fibonacci.qala" \
     "fib(0) = 0
 fib(1) = 1
