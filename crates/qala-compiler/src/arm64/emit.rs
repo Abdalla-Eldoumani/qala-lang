@@ -127,7 +127,7 @@ impl Asm {
         out.push_str("define(fp, x29)\n");
         out.push_str("define(lr, x30)\n");
         out.push('\n');
-        // .data: emitted only when there is data to place (Phase 13 onward).
+        // .data: emitted only when there is data to place.
         if !self.data.is_empty() {
             out.push_str(INDENT);
             out.push_str(".data\n");
