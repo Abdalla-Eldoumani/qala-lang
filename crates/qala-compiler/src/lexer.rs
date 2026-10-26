@@ -1269,7 +1269,7 @@ mod tests {
         assert_eq!(toks[0].span, Span::new(2, 1));
     }
 
-    // ---- Task 2: numeric and byte literals ------------------------------------
+    // ---- numeric and byte literals --------------------------------------------
 
     /// the single kind of a one-token source (plus the trailing Eof).
     fn one(src: &str) -> TokenKind {
@@ -1526,7 +1526,7 @@ mod tests {
         assert_eq!(f.span.slice(src2), "1.5e10");
     }
 
-    // ---- Task 3: strings, escapes, interpolation ------------------------------
+    // ---- strings, escapes, interpolation --------------------------------------
     //
     // these tests are written against Qala source, so a `"` in the source is `\"`
     // in the Rust string literal and a `\` in the source is `\\`.
