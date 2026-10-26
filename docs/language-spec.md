@@ -142,7 +142,7 @@ Qala has two codegen targets that share the same typed AST: a bytecode VM the pl
 
 The ARM64 backend's integer core is shipped: `i64` and `bool` arithmetic, comparisons and boolean logic, `if`/`while`/`for` control flow, `let` bindings in stack slots, AAPCS64 functions with calls and recursion, and integer `print`/`println` output lowered to `printf`. The emitted assembly is verified end to end: it assembles with `m4` and an AArch64 toolchain and runs correctly under QEMU. Floats, string values, and aggregates are still ahead; the compiler rejects them with a clear "the ARM64 backend does not yet support X" diagnostic rather than miscompile.
 
-The emitted assembly is meant to be pasted directly into the [AArch64 playground](https://aarch64-playground.vercel.app) for visual instruction-by-instruction execution.
+The emitted assembly is meant to be pasted directly into the [AArch64 playground](https://aarch64-playground.com) for visual instruction-by-instruction execution.
 
 ## Compiler quality features
 
