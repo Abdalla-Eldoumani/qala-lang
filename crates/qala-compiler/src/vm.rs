@@ -15,7 +15,7 @@
 //!
 //! memory model: an `i64` is uniformly heap-boxed -- a [`HeapObject::Int`]
 //! reached through a `TAG_PTR` [`Value`] -- so the codec in `value.rs` carries
-//! no integer encoding (the uniform-heap-box decision; see 05-RESEARCH.md). a
+//! no integer encoding (the uniform-heap-box decision). a
 //! function value, by contrast, is a tagged scalar: [`Value::function`] rides
 //! the `u16` fn-id in the NaN payload with NO heap object. arrays, strings,
 //! structs, enum variants, and file handles are heap objects.
@@ -89,7 +89,7 @@ pub enum HeapObject {
     /// it; `INDEX` reads an element; `LEN` reports the element count.
     Array(Vec<Value>),
     /// a fixed-shape tuple of values, built by `MAKE_TUPLE`. distinct from
-    /// [`HeapObject::Array`] so the stdlib's `type_of` (plan 05-05) can render
+    /// [`HeapObject::Array`] so the stdlib's `type_of` can render
     /// a tuple's structural type `(i64, str)` rather than an array type. `INDEX`
     /// reads an element exactly as it does for an array.
     Tuple(Vec<Value>),
@@ -287,8 +287,8 @@ impl Heap {
 /// slots.
 ///
 /// the frame owns its `locals` vec, which drops when the frame is popped on
-/// `RETURN`. 05-RESEARCH.md describes a per-frame bump arena freed wholesale on
-/// return; in v1 the heap's free list already reclaims slots, so the frame
+/// `RETURN`. a per-frame bump arena freed wholesale on return was
+/// considered; in v1 the heap's free list already reclaims slots, so the frame
 /// owning its `locals` (dropped on return) is the whole of the "arena" -- a
 /// distinct bump region is not required for correctness, and adding one would
 /// be dead weight against the free list. a richer arena stays a v2 idea.
@@ -318,7 +318,7 @@ pub struct CallFrame {
 /// `rendered` comes from [`Vm::value_to_string`]; `type_name` from
 /// [`Vm::runtime_type_name`].
 ///
-/// derives `serde::Serialize` so Phase 6's WASM bridge can hand the snapshot
+/// derives `serde::Serialize` so the WASM bridge can hand the snapshot
 /// straight to JavaScript -- the same precedent `diagnostics.rs`'s
 /// `MonacoDiagnostic` set.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -625,9 +625,8 @@ impl Vm {
     /// fall-through ip is `next`. split out of [`Vm::dispatch_one`] so the
     /// decode-and-bounds-check is one place and the per-opcode logic another.
     ///
-    /// every opcode this plan does not implement returns a clean `Runtime`
-    /// "opcode not yet implemented" error so the match stays exhaustive and the
-    /// crate compiles; a later commit replaces those arms.
+    /// the match covers every opcode, so a new opcode fails to compile until
+    /// it gets an arm here.
     fn run_opcode(
         &mut self,
         op: Opcode,
@@ -1120,8 +1119,7 @@ impl Vm {
     /// stdlib.
     ///
     /// `fn_id` is the `u16` from the opcode; a `fn_id >= STDLIB_FN_BASE`
-    /// (40000) is a native stdlib call, handed to [`Vm::call_stdlib`] -- a seam
-    /// plan 05-05 fills in. otherwise `fn_id` indexes [`Program::chunks`]: the
+    /// (40000) is a native stdlib call, handed to [`Vm::call_stdlib`]. otherwise `fn_id` indexes [`Program::chunks`]: the
     /// frame-depth cap is checked, then a fresh [`CallFrame`] is pushed for the
     /// callee. the `argc` argument values are already on the value stack (the
     /// topmost is the rightmost argument); they are moved off the stack into
@@ -1891,7 +1889,7 @@ impl Vm {
     ///
     /// the output is deterministic -- it iterates `Vec`s in index order, never
     /// a `HashMap`, so two `get_state` calls on the same VM state produce
-    /// byte-identical snapshots (the contract Phase 6's WASM bridge needs).
+    /// byte-identical snapshots (the contract the WASM bridge needs).
     ///
     /// never panics. when `frames` is empty (the program has finished and the
     /// last frame returned) it reports a terminal snapshot: the last chunk
@@ -3866,7 +3864,7 @@ fn main() -> i64 is pure {
 
     #[test]
     fn concat_n_of_an_interpolated_nan_float_renders_the_word_nan() {
-        // the VM-04 guarantee at the CONCAT_N layer: a string interpolation of
+        // the NaN-rendering guarantee at the CONCAT_N layer: a string interpolation of
         // a NaN float renders "NaN", not a numeric token. CONST "v=" ;
         // CONST NaN ; CONCAT_N 2 -> "v=NaN" (CONCAT_N stringifies each part).
         let mut chunk = Chunk::new();
@@ -3968,7 +3966,7 @@ fn main() -> i64 is pure {
 
     #[test]
     fn defer_bytecode_runs_in_lifo_order_at_scope_exit() {
-        // VM-03: Phase 4 codegen splices defer bytecode inline at scope exit,
+        // codegen splices defer bytecode inline at scope exit,
         // emitted in REVERSE (LIFO) order. this test compiles a Qala program
         // with two defers, runs it through the VM, and confirms both that the
         // VM executes the spliced defer bytecode correctly (the program runs
@@ -4066,7 +4064,7 @@ fn main() -> i64 is pure { return run() }
 
     #[test]
     fn state_current_line_tracks_the_source_map_then_is_zero_after_halt() {
-        // PGUI-08: get_state surfaces the 1-based source line of the
+        // get_state surfaces the 1-based source line of the
         // instruction at ip, read from the chunk's source_lines map. emit_const
         // writes every byte of CONST + HALT against the line it is given here,
         // so the whole chunk maps to line 7.
@@ -4185,7 +4183,7 @@ fn main() -> i64 is pure { return run() }
     #[test]
     fn get_state_output_is_deterministic_across_two_calls() {
         // the snapshot iterates Vecs only, no HashMap -- two calls on the same
-        // VM state must produce equal snapshots (the Phase 6 bridge contract).
+        // VM state must produce equal snapshots (the WASM bridge contract).
         let src = "\
 fn main() -> i64 is pure {
     let a = 1
@@ -4259,7 +4257,7 @@ fn main() -> i64 is pure {
     fn vm_state_implements_serialize_for_the_wasm_bridge() {
         // a compile-time witness: if VmState (and the StateValue / NamedValue
         // it nests) did not derive serde::Serialize, this generic call would
-        // fail to typecheck. Phase 6's WASM bridge serializes get_state's
+        // fail to typecheck. the WASM bridge serializes get_state's
         // output, so the derive is part of the locked contract.
         fn assert_serialize<T: serde::Serialize>(_: &T) {}
         let src = "fn main() -> i64 is pure { return 5 }";
@@ -4335,7 +4333,7 @@ fn main() -> i64 is pure {
 
     #[test]
     fn repl_persists_a_binding_from_one_call_to_the_next() {
-        // the VM-07 success criterion: a `let` on one REPL call, then an
+        // the REPL contract: a `let` on one REPL call, then an
         // expression using it on the next, returns the expected value.
         let mut vm = Vm::new_repl();
         // call 1: a let binding -- a statement, the result is void.
@@ -4555,9 +4553,8 @@ fn main() -> i64 is pure {
         //
         // the defer lives in a function that ends in an explicit `return`: a
         // fall-through `defer` (a block with no terminator) trips a separate,
-        // pre-existing codegen scope-ordering bug logged in
-        // .planning/phases/05-bytecode-vm-stdlib/deferred-items.md -- out of
-        // scope for this plan, and the bundled `defer-demo.qala` (which also
+        // known codegen scope-ordering bug that this test does not cover,
+        // and the bundled `defer-demo.qala` (which also
         // ends in `return`) is unaffected.
         let src = "fn use_handle() -> i64 is io {\n    \
                    let f = open(\"data.txt\")\n    \
