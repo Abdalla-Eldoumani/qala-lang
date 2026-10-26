@@ -1311,7 +1311,7 @@ impl Vm {
     /// `RETURN`, returning the result value.
     ///
     /// this is the re-entry point the higher-order stdlib functions
-    /// (`map` / `filter` / `reduce` in 05-05) use to invoke a user callback.
+    /// (`map` / `filter` / `reduce`) use to invoke a user callback.
     /// `callable` must be a [`Value::function`] -- the callbacks those stdlib
     /// functions receive are user functions; a non-function (or a stdlib fn-id
     /// callable, unsupported in v1) is a `Runtime` error.
@@ -1407,7 +1407,7 @@ impl Vm {
     /// the values come off the stack in source order via [`Vm::pop_n`], so
     /// element 0 is the first. a heap exhaustion is a `Runtime` error. `MAKE_*`
     /// shares this one body because an array and a tuple differ only in which
-    /// heap variant labels them -- the distinction lets 05-05's `type_of` tell
+    /// heap variant labels them -- the distinction lets the stdlib's `type_of` tell
     /// a tuple from an array.
     fn op_make_collection(&mut self, count: u16, tuple: bool) -> Result<(), QalaError> {
         let elements = self.pop_n(count as usize)?;
@@ -2623,7 +2623,7 @@ mod tests {
     #[test]
     fn dispatch_const_of_a_function_pushes_a_function_value_carrying_the_id() {
         // a ConstValue::Function becomes a tagged Value::function, no heap
-        // object -- the locked representation 05-05's map/filter/reduce read.
+        // object -- the locked representation the stdlib's map/filter/reduce read.
         let mut chunk = Chunk::new();
         emit_const(&mut chunk, ConstValue::Function(13), 1);
         chunk.write_op(Opcode::Halt, 1);
@@ -3521,7 +3521,7 @@ fn main() -> i64 is pure {
     #[test]
     fn make_tuple_builds_a_distinct_heap_tuple_object() {
         // MAKE_TUPLE produces a HeapObject::Tuple, not an Array -- the
-        // distinction lets 05-05's type_of tell a tuple from an array.
+        // distinction lets the stdlib's type_of tell a tuple from an array.
         let mut chunk = Chunk::new();
         emit_const(&mut chunk, ConstValue::I64(7), 1);
         emit_const(&mut chunk, ConstValue::Bool(true), 1);
