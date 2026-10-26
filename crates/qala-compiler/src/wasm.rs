@@ -712,7 +712,7 @@ mod tests {
         );
     }
 
-    // ---- the WASM-05 end-to-end test --------------------------------------
+    // ---- the end-to-end test ----------------------------------------------
 
     #[test]
     fn wasm_end_to_end_compiles_optimizes_and_runs_to_expected_output() {
