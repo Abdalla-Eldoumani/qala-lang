@@ -4,7 +4,7 @@
 //! every expression node and an [`EffectSet`] annotation on every function
 //! node. nothing is desugared -- [`TypedExpr::Pipeline`], [`TypedExpr::Match`],
 //! [`TypedExpr::OrElse`], and [`TypedExpr::Interpolation`] stay faithful, same
-//! rule as the untyped AST; lowering happens in Phase 4 codegen.
+//! rule as the untyped AST; lowering happens in codegen.
 //!
 //! the type checker takes `&ast::Ast` and returns a [`TypedAst`] by value plus
 //! error and warning vectors; no interior mutability, no side tables, no
@@ -99,7 +99,7 @@ impl TypedFnDecl {
     ///
     /// [`EffectSet`] is `Copy`, so returning by value is the same cost as a
     /// reference and reads cleaner at call sites. this is the public accessor
-    /// the diagnostics renderer (Plan 5) consults when building the
+    /// the diagnostics renderer consults when building the
     /// `EffectViolation` message's caller-effect slot.
     pub fn effect(&self) -> EffectSet {
         self.effect
@@ -467,7 +467,7 @@ pub enum TypedExpr {
         span: Span,
     },
     /// `lhs |> call` -- the pipeline operator. NOT desugared in the typed AST
-    /// either; desugaring is Phase 4 codegen's job. resolved type is the call's
+    /// either; desugaring is codegen's job. resolved type is the call's
     /// return type.
     Pipeline {
         lhs: Box<TypedExpr>,
@@ -509,7 +509,7 @@ pub enum TypedExpr {
         span: Span,
     },
     /// a string with `{expr}` interpolations. NOT desugared to a `+` chain;
-    /// the conversion-and-concatenation happens in Phase 4 codegen. resolved
+    /// the conversion-and-concatenation happens in codegen. resolved
     /// type is [`QalaType::Str`].
     Interpolation {
         parts: Vec<TypedInterpPart>,
