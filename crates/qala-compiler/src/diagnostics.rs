@@ -66,7 +66,7 @@ pub struct Diagnostic {
 /// message, and an optional category (which the playground renders as
 /// the marker source string).
 ///
-/// derives `serde::Serialize` so the Phase 6 WASM bridge can hand a
+/// derives `serde::Serialize` so the WASM bridge can hand a
 /// `Vec<MonacoDiagnostic>` straight to JS via `serde-wasm-bindgen`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MonacoDiagnostic {
@@ -96,7 +96,7 @@ impl Diagnostic {
     ///
     /// byte-identical for the same `(Diagnostic, src)` pair: same input
     /// produces the same output, regardless of process, build, or
-    /// platform. that is the DIAG-04 contract; a snapshot test in
+    /// platform. that is the determinism contract; a snapshot test in
     /// `compiler/tests/snapshots/diagnostics_basic.txt` proves it
     /// cross-process.
     ///
@@ -136,7 +136,7 @@ impl Diagnostic {
         // header line: "error: <message>" / "warning: <message>".
         out.push_str(&format!("{header}: {}\n", self.message));
 
-        // arrow line: file path is omitted; Phase 6's WASM bridge
+        // arrow line: file path is omitted; the WASM bridge
         // supplies the file name separately if needed.
         out.push_str(&format!("  --> {line}:{column}\n"));
 
@@ -793,8 +793,8 @@ mod tests {
 
     #[test]
     fn six_bundled_examples_render_no_error_output() {
-        // the Plan 04 typechecker smoke test asserted errors is empty;
-        // this paired Plan 05 test asserts rendering those (empty)
+        // the typechecker smoke test asserts errors is empty;
+        // this paired test asserts rendering those (empty)
         // errors collects to the empty string -- proves the renderer
         // is wired in correctly for the no-error case.
         for name in [
