@@ -44,7 +44,7 @@ const RUN_SPEED_MS: Record<RunSpeed, number> = {
 };
 
 // the localStorage key the editor source is persisted under. text only --
-// never vm state (PGUI-09).
+// never vm state.
 const STORAGE_KEY = "qala.editor.source";
 
 export interface UseQala {
