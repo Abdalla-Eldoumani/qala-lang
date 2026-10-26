@@ -12,7 +12,7 @@
 //! comparisons, the short-circuit `&&` / `||`, the unary `!` and `-`,
 //! parameter loads, `let` bindings in stack slots, control flow (`if` /
 //! `while` / `for` over a range), and a function's prologue / body / epilogue
-//! following AAPCS64. calls arrive in plan 12-03. every construct outside the
+//! following AAPCS64, and calls to user functions. every construct outside the
 //! integer core -- a float, a string, a struct literal, a method, a
 //! `>8`-parameter function, a `defer` -- returns a [`QalaError`], never a
 //! panic, never a `todo!()`.
@@ -61,8 +61,7 @@ use stmt::LoopLabels;
 /// same `(span.start, span.len)` ordering contract as
 /// [`crate::codegen::compile_program`].
 ///
-/// the entry point the `qala build --target arm64` CLI seam (plan 12-03)
-/// calls. `src` is the original source, kept for span-to-line lookups when
+/// the entry point the `qala build --target arm64` CLI seam calls. `src` is the original source, kept for span-to-line lookups when
 /// rendering an error.
 pub fn compile_arm64(ast: &TypedAst, src: &str) -> Result<String, Vec<QalaError>> {
     let mut backend = Arm64Backend::new(src);
@@ -115,17 +114,17 @@ struct Arm64Backend {
     /// reset to 0 at the start of each function.
     binding_cursor: usize,
     /// every user-declared function name, pre-scanned before the compile walk.
-    /// plan 12-03 consults this to resolve a call target; this plan records it
-    /// for that forward reference.
+    /// the call path consults this to resolve a call target, including a
+    /// forward reference to a function declared later.
     fn_names: HashSet<String>,
     /// the errors accumulated across every function.
     errors: Vec<QalaError>,
-    /// the original source text. plan 12-02 / 12-03 read it when an error
-    /// diagnostic needs the offending source line; this plan only stores it.
+    /// the original source text, kept for error diagnostics that need the
+    /// offending source line; nothing reads it yet.
     #[allow(dead_code)]
     src: String,
-    /// the byte-offset-to-line index. plan 12-02 / 12-03 consult it for
-    /// span-to-line lookups in richer diagnostics; this plan only stores it.
+    /// the byte-offset-to-line index, kept for span-to-line lookups in richer
+    /// diagnostics; nothing reads it yet.
     #[allow(dead_code)]
     line_index: LineIndex,
 }
@@ -612,7 +611,7 @@ mod tests {
     fn recursion_matches_the_snapshot() {
         // a recursive `factorial`: an `if` base case, a `bl` to itself, the
         // return -- the prologue/epilogue, the frame, a call, and recursion
-        // exercised together. the structural shape Phase 13's `fibonacci`
+        // exercised together. the structural shape the `fibonacci`
         // round-trip needs.
         let src = "fn factorial(n: i64) -> i64 {\n\
                    \x20   if n <= 1 { return 1 }\n\
@@ -654,7 +653,7 @@ mod tests {
 
     #[test]
     fn every_unsupported_construct_is_rejected_with_a_specific_named_diagnostic() {
-        // the ARM-05 contract, exercised across the spread of constructs the
+        // the clean-rejection contract, exercised across the spread of constructs the
         // integer core does not support. each program is well-typed -- the
         // rejection is the BACKEND's, not the typechecker's -- and must yield
         // a `QalaError` (never a panic, never bad assembly) whose message
