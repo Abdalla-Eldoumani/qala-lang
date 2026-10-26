@@ -3,9 +3,8 @@
 //! items and statements, a Pratt (binding-power) loop for expressions.
 //!
 //! fail-fast: returns `Result<Ast, QalaError>` and stops at the first error.
-//! multi-error collection is the type checker's job (Phase 3); the parser does
-//! not synchronize. (the lexer's module doc mentions "Phase 2's parser has
-//! resync points" -- a wording drift; recovery is deferred per CONTEXT.md.)
+//! multi-error collection is the type checker's job; the parser does not
+//! synchronize, and error recovery is deferred.
 //!
 //! a [`depth`] counter on [`Parser`] guards every recursive production against
 //! pathologically nested input. Rust has no tail-call optimization; on WASM a
@@ -14,7 +13,7 @@
 //!
 //! no `unwrap` / `expect` / `panic!` / `unreachable!` is reachable from a
 //! malformed token stream -- the same discipline the lexer documents; load-
-//! bearing for Phase 6 where the compiler runs in a browser tab.
+//! bearing for the WASM build, where the compiler runs in a browser tab.
 
 use crate::ast::*;
 use crate::errors::QalaError;
@@ -159,8 +158,8 @@ impl<'t> Parser<'t> {
     ///
     /// if the cursor is at `Eof`, this is [`QalaError::UnexpectedEof`] with a
     /// zero-width span just past the last real token (computed from the
-    /// previous token's `end`, per CONTEXT.md / RESEARCH Pitfall 6 -- not
-    /// `src.len()`). otherwise it is [`QalaError::UnexpectedToken`] with the
+    /// previous token's `end` -- not `src.len()`, which would point past any
+    /// trailing whitespace). otherwise it is [`QalaError::UnexpectedToken`] with the
     /// expected set the caller listed and the current token as `found`.
     fn unexpected(&self, expected: &[TokenKind]) -> QalaError {
         if matches!(self.peek(), TokenKind::Eof) {
@@ -789,8 +788,7 @@ impl<'t> Parser<'t> {
     // pair of binding powers (`(lbp, rbp)` for infix, `(lbp, ())` for postfix,
     // `((), rbp)` for prefix) that encode precedence and associativity. the
     // technique is matklad's "simple but powerful Pratt parsing"
-    // (matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html);
-    // see `02-RESEARCH.md` Patterns 2-4.
+    // (matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html).
 
     /// parse a single expression at the loosest precedence. a thin alias for
     /// `expr_bp(0, ExprCtx::Normal)`; statements call this to read the leaves
@@ -812,7 +810,7 @@ impl<'t> Parser<'t> {
     /// `ctx` threads the "struct literals are not allowed at the start of an
     /// expression here" rule through the recursion: the head of `match`, and
     /// later `if`/`while`/`for`, must not parse `Name { ... }` as a struct
-    /// literal -- per RESEARCH Pitfall 3. `ExprCtx::Normal` allows them;
+    /// literal. `ExprCtx::Normal` allows them;
     /// `ExprCtx::NoStructLiteral` rejects them at the primary.
     fn expr_bp(&mut self, min_bp: u8, ctx: ExprCtx) -> Result<Expr, QalaError> {
         self.enter()?;
@@ -903,7 +901,7 @@ impl<'t> Parser<'t> {
             // match expression.
             TokenKind::Match => self.parse_match(),
             // `self` in expression position: produces `Expr::Ident { name: "self" }`.
-            // the resolver (Phase 3) checks that it only occurs inside a method body;
+            // the resolver checks that it only occurs inside a method body;
             // the parser just needs to not reject it with UnexpectedToken.
             TokenKind::SelfKw => {
                 let span = self.advance().span;
@@ -939,7 +937,7 @@ impl<'t> Parser<'t> {
     /// literals are allowed in this context.
     ///
     /// the "no struct literals at the head of `match` / `if` / `while` /
-    /// `for`" rule is RESEARCH Pitfall 3 -- without it, `match s { Circle(r)
+    /// `for`" rule matters: without it, `match s { Circle(r)
     /// => ... }` would read `s { Circle(r) => ... }` as a struct literal with
     /// a `Circle(r)` field, which is nonsense. when `ctx` is `NoStructLiteral`
     /// we read just the ident; the trailing `{` will start the match-arm
@@ -1334,7 +1332,7 @@ impl<'t> Parser<'t> {
     }
 
     /// `return` or `return EXPR`. bare `return` (in a `void` function) is
-    /// legal; the type checker (Phase 3) is responsible for rejecting it in a
+    /// legal; the type checker is responsible for rejecting it in a
     /// non-`void` function.
     fn parse_return_stmt(&mut self) -> Result<Stmt, QalaError> {
         let kw_span = self.expect(&TokenKind::Return)?;
@@ -1378,7 +1376,7 @@ impl<'t> Parser<'t> {
     /// reassemble an interpolated string `StrStart text0 (InterpStart expr
     /// InterpEnd StrMid text)* InterpStart expr InterpEnd StrEnd textN` into
     /// an `Expr::Interpolation` whose `parts` list alternates `Literal(text)`
-    /// and `Expr(...)`. RESEARCH Pattern 4.
+    /// and `Expr(...)`.
     fn parse_interpolation(&mut self) -> Result<Expr, QalaError> {
         // consume the `StrStart(text0)`.
         let (start_text, start_span) = match self.peek().clone() {
@@ -1428,8 +1426,7 @@ impl<'t> Parser<'t> {
     ///
     /// the scrutinee is parsed in `NoStructLiteral` context so the `{` that
     /// opens the match body is not consumed as a struct-literal body. at
-    /// least one arm is required (RESEARCH Pitfall 7 / success criterion 2);
-    /// zero arms is a parse error.
+    /// least one arm is required; zero arms is a parse error.
     fn parse_match(&mut self) -> Result<Expr, QalaError> {
         let kw_span = self.expect(&TokenKind::Match)?;
         let scrutinee = self.expr_bp(0, ExprCtx::NoStructLiteral)?;
@@ -1502,12 +1499,12 @@ impl<'t> Parser<'t> {
 
     /// parse one pattern.
     ///
-    /// the v1 set (per Plan 01's `Pattern` enum):
+    /// the v1 set (the `Pattern` enum):
     /// - `Name(sub, ...)`: variant destructure (sub-patterns recursively)
     /// - `_`: wildcard
     /// - `name`: binding (bare ident -- the parser does not distinguish a
-    ///   capitalized nullary-variant from a binding; that is Phase 3's call,
-    ///   matching CONTEXT.md's "simpler, more-faithful choice")
+    ///   capitalized nullary-variant from a binding; that is the type
+    ///   checker's call, the simpler and more faithful choice)
     /// - integer / float / byte / string / boolean literal patterns
     fn parse_pattern(&mut self) -> Result<Pattern, QalaError> {
         match self.peek().clone() {
@@ -1531,7 +1528,7 @@ impl<'t> Parser<'t> {
                         span: name_span.to(close),
                     });
                 }
-                // bare ident: binding. Phase 3 reinterprets a capitalised
+                // bare ident: binding. the type checker reinterprets a capitalised
                 // ident as a nullary variant if name-resolution finds one.
                 Ok(Pattern::Binding {
                     name,
@@ -1614,7 +1611,7 @@ impl<'t> Parser<'t> {
                 self.advance(); // consume the `.`
                 let (name, name_span) = self.expect_ident()?;
                 // `.name(args)` is a method call; `.name` alone is a field
-                // access. the parser decides; Phase 3 resolves it.
+                // access. the parser decides; the type checker resolves it.
                 if self.check(&TokenKind::LParen) {
                     let (args, close) = self.delimited_list(
                         TokenKind::LParen,
@@ -1705,7 +1702,7 @@ impl<'t> Parser<'t> {
                 // the pipeline rhs must be a callable-shaped expression (an
                 // ident / call / field-access / method-call); a literal or a
                 // binary on the rhs is a parse error whose span is the `|>`
-                // token, per CONTEXT.md.
+                // token.
                 let rhs = self.parse_pipeline_rhs(op_tok.span)?;
                 let lhs_span = lhs.span();
                 let rhs_span = rhs.span();
@@ -1773,8 +1770,7 @@ impl<'t> Parser<'t> {
     /// ident is allowed, but a literal or a binary is not.
     ///
     /// the violation case `x |> 5` produces an error whose span is the `|>`
-    /// token; `x |>` with nothing after (an Eof / closer) does the same --
-    /// per CONTEXT.md and success criterion PARSE-06.
+    /// token; `x |>` with nothing after (an Eof / closer) does the same.
     fn parse_pipeline_rhs(&mut self, pipe_span: Span) -> Result<Expr, QalaError> {
         // fast-reject: if the next token cannot even begin an expression that
         // might be callable, error now with the pipe span so the diagnostic
@@ -1807,7 +1803,7 @@ impl<'t> Parser<'t> {
 /// the context an expression is being parsed in.
 ///
 /// the only knob v1 needs is "are struct literals allowed here?" -- they are
-/// not at the head of `match` / `if` / `while` / `for`. RESEARCH Pitfall 3.
+/// not at the head of `match` / `if` / `while` / `for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExprCtx {
     /// struct literals are allowed at this primary.
@@ -1854,7 +1850,7 @@ fn prefix_bp(k: &TokenKind) -> ((), u8) {
 /// direction.
 ///
 /// `Eq` (the assignment token) is deliberately absent -- `let x = ...` is
-/// statement syntax (Plan 03), not an expression operator.
+/// statement syntax, not an expression operator.
 fn infix_bp(k: &TokenKind) -> Option<(u8, u8)> {
     Some(match k {
         // tightest infix: multiplicative.
@@ -1912,9 +1908,9 @@ fn binop_of(k: &TokenKind) -> Option<BinOp> {
 
 /// is `e` shaped like something that can be called?
 ///
-/// per CONTEXT.md and `pipeline.qala`, a pipeline rhs is either a bare
+/// per `pipeline.qala`, a pipeline rhs is either a bare
 /// identifier, a call, a field access, or a method call -- anything that
-/// post-desugar in Phase 4 becomes `f(x, ...)`. a literal, a binary, a
+/// post-desugar in codegen becomes `f(x, ...)`. a literal, a binary, a
 /// range, etc., is rejected.
 fn is_callable_shape(e: &Expr) -> bool {
     matches!(
@@ -1956,7 +1952,7 @@ mod tests {
     }
 
     /// parse a whole program, asserting success.
-    #[allow(dead_code)] // exercised by Plan 03's item tests
+    #[allow(dead_code)] // exercised by the item tests
     fn parse_ok(src: &str) -> Ast {
         Parser::parse(&lex(src)).expect("expected a successful parse")
     }
@@ -1969,7 +1965,7 @@ mod tests {
     /// parse `src` as a single expression (using the Pratt entry point
     /// directly), asserting success and that the cursor ends at `Eof`. used
     /// to test the expression engine without dragging in statement / item
-    /// parsing (Plan 03).
+    /// parsing.
     fn expr_of(src: &str) -> Expr {
         let toks = lex(src);
         let mut p = Parser {
@@ -2329,7 +2325,7 @@ mod tests {
     fn self_in_method_body_parses_as_ident() {
         // `self` in expression position inside a method body must produce
         // Expr::Ident { name: "self" } -- the same node the type checker uses.
-        // Phase 3 is responsible for rejecting `self` outside a method body.
+        // the type checker is responsible for rejecting `self` outside a method body.
         let ast = parse_ok("fn Point.area(self) -> f64 is pure { self.x }");
         match &ast[0] {
             Item::Fn(d) => {
@@ -2824,7 +2820,7 @@ mod tests {
 
     // ---- expression engine: precedence table --------------------------------
     //
-    // one assertion per precedence level (success criterion 3), each pinning
+    // one assertion per precedence level, each pinning
     // the parsed-tree shape so a tweak to `infix_bp`/`prefix_bp`/`postfix_bp`
     // that drops a level by one bp is caught.
 
@@ -3852,7 +3848,7 @@ mod tests {
 
     #[test]
     fn let_x_eq_followed_by_eof_errors_with_a_zero_width_span_at_the_eq() {
-        // KEY PARSE-09 case: the EOF span is zero-width, just past the `=`.
+        // KEY case: the EOF span is zero-width, just past the `=`.
         let err = parse_err("fn f() { let x =\n");
         match err {
             QalaError::UnexpectedEof { span, .. } => {
@@ -3894,7 +3890,7 @@ mod tests {
         }
     }
 
-    // ---- the verification battery (PARSE-09 negatives + integration) --------
+    // ---- the verification battery (span negatives + integration) -----------
 
     #[test]
     fn the_six_examples_parse_with_no_error() {
@@ -3928,7 +3924,7 @@ mod tests {
         }
     }
 
-    // PARSE-09: spans-on-the-operator, blame-the-opener, zero-width EOF span,
+    // spans-on-the-operator, blame-the-opener, zero-width EOF span,
     // "expected X, found Y", trailing commas, empty body, zero match arms,
     // `self` misplacement. some overlap with prior tests is fine; this
     // section is the consolidated battery.
@@ -4091,7 +4087,7 @@ mod tests {
     #[test]
     fn ast_node_spans_point_at_the_source_bytes_they_came_from() {
         // pick a handful of nodes at different depths and assert their span
-        // slices the source to the right text. PARSE-01.
+        // slices the source to the right text.
         let src = "fn add(a: i64, b: i64) -> i64 is pure { return a + b }";
         let toks = lex(src);
         let ast = Parser::parse(&toks).expect("parses");
