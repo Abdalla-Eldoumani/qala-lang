@@ -947,10 +947,9 @@ impl<'a> Codegen<'a> {
 
     /// compile one expression, leaving its value on the stack.
     ///
-    /// Task 2 covers primitives, identifiers, parenthesized expressions,
-    /// unary / binary operators (with inline constant folding), and the
-    /// simple ident-callee call. Task 3 adds the compound expressions and
-    /// `match`; Task 5 adds `comptime`.
+    /// covers primitives, identifiers, parenthesized expressions, unary /
+    /// binary operators (with inline constant folding), calls, the compound
+    /// expressions, `match`, and `comptime`.
     fn compile_expr(&mut self, e: &TypedExpr) -> Result<(), QalaError> {
         match e {
             TypedExpr::Int { value, span, .. } => {
@@ -2771,9 +2770,8 @@ mod tests {
     /// `(code_bytes, constants)`. the expression is the trailing value of
     /// `fn main`'s body in the wrapper program -- so test sources are
     /// written as `fn main() is io { EXPR }` (or include the helper fns the
-    /// expression needs). `compile_block` / `compile_stmt` are still
-    /// placeholders in Task 2, so the public entry cannot be used yet;
-    /// running `compile_expr` directly is the Task-2 / Task-3 test path.
+    /// expression needs). running `compile_expr` directly keeps these tests
+    /// independent of `compile_block` / `compile_stmt`.
     fn compile_expr_of(src: &str, fn_name: &str) -> (Vec<u8>, Vec<ConstValue>) {
         let typed = typecheck(src);
         let mut cg = Codegen::new(src);
@@ -3027,7 +3025,7 @@ mod tests {
     #[test]
     fn skeleton_pop_scope_emits_a_single_registered_defer() {
         // `fn f() is io { defer println("a") }` -- the defer is registered
-        // by Task 4's compile_stmt, but here we exercise the helper directly
+        // by compile_stmt, but here we exercise the helper directly
         // by hand-registering a typed Call expression in a scope.
         let src = "fn f() is io { }";
         let tokens = Lexer::tokenize(src).expect("lex");
@@ -3072,9 +3070,8 @@ mod tests {
     // Test 8: a fn with two params has them in slots 0 and 1.
     #[test]
     fn skeleton_fn_params_occupy_slots_zero_and_one() {
-        // with Task 1's placeholder compile_block, the body bytecode is just
-        // a RETURN; this test pins the table/scope wiring: two params, one
-        // user chunk, fn_names == ["add"].
+        // this test pins the table/scope wiring, not the body bytecode: two
+        // params, one user chunk, fn_names == ["add"].
         let p = compile_ok("fn add(a: i64, b: i64) -> i64 is pure { return a + b }");
         assert_eq!(p.chunks.len(), 1);
         assert_eq!(p.fn_names, vec!["add".to_string()]);
@@ -3120,7 +3117,7 @@ mod tests {
         assert_eq!(cg2.line_at(Span::new(4, 3)), 2);
     }
 
-    // ===== Task 2: compile_expr literals / locals / binary / unary / calls ===
+    // ===== compile_expr literals / locals / binary / unary / calls =========
 
     // Test 1: an integer literal expression compiles to one CONST(I64). the
     // wrapper fn returns i64 so the literal is the body's trailing value.
@@ -3288,7 +3285,7 @@ mod tests {
     // the lexer caps integer literals at the i64::MAX magnitude, so a
     // literal i64::MIN cannot be written and then negated. the `checked_neg`
     // overflow path in `try_fold_unary` is still exercised by the
-    // ComptimeInterpreter's NEG opcode test in Task 5.)
+    // ComptimeInterpreter's NEG opcode test.)
     #[test]
     fn compile_expr_fold_unary() {
         let (code, consts) = compile_expr_of("fn f() -> bool is pure { !true }", "f");
@@ -3380,7 +3377,7 @@ mod tests {
         assert!(chunk.source_lines.iter().all(|&l| l == 2));
     }
 
-    // ===== Task 3: compound expressions + match ==============================
+    // ===== compound expressions + match ======================================
 
     // Test 1: a simple pipeline `5 |> double` desugars to `double(5)`.
     #[test]
@@ -3719,7 +3716,7 @@ mod tests {
         assert!(ops.contains(&Opcode::Return));
     }
 
-    // ===== Task 4: statements, DCE, defer, six-examples smoke ================
+    // ===== statements, DCE, defer, six-examples smoke ========================
 
     /// the opcodes of the single chunk a one-fn program compiles to.
     fn fn_ops(src: &str, fn_name: &str) -> Vec<Opcode> {
@@ -4154,7 +4151,7 @@ mod tests {
         );
     }
 
-    // ===== Task 5: ComptimeInterpreter =======================================
+    // ===== ComptimeInterpreter ===============================================
 
     /// build a Chunk from a list of (opcode, operands) -- a tiny assembler
     /// for the comptime interpreter unit tests.
